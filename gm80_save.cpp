@@ -742,46 +742,46 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
 // TTreeNode: [vtable:4][f1:4][f2:4][name:4][data:4]
 // TreeNodeData: [unknown:4][rtype:4][kind:4][index:4]  rtype:2=folder, 3=leaf
 
-// Fastcall wrapper: TTreeNode.GetCount(self) → uint32_t
+// GM 8.0 tree functions — IDA verified from sub_59EB64/sub_59EC84
+// sub_497254 (RVA 0x97254): GetCount(node) → child count
+// sub_497178 (RVA 0x97178): GetItem(node, index) → child node
 static uint32_t __fastcall tree_get_count(void* node) {
     if (!node || (uintptr_t)node < 0x10000) return 0;
-    uint32_t result = 0;
-    uint32_t func = (uint32_t)g_save_base + 0xAD490;
+    uint32_t func = (uint32_t)g_save_base + 0x97254;
+    uint32_t out;
     __asm {
         mov eax, node
         call func
-        mov result, eax
+        mov out, eax
     }
-    return result;
+    return out;
 }
-
-// Fastcall wrapper: TTreeNode.GetItem(self, index) → TTreeNode*
 static void* __fastcall tree_get_item(void* node, uint32_t idx) {
-    void* result;
-    uint32_t func = (uint32_t)g_save_base + 0xAD3B4;
+    uint32_t func = (uint32_t)g_save_base + 0x97178;
+    uint32_t out;
     __asm {
         mov eax, node
         mov edx, idx
         call func
-        mov result, eax
+        mov out, eax
     }
-    return result;
+    return (void*)out;
 }
 
 // Read TTreeNode fields (no asm needed)
+// Delphi 7 TTreeNode: +4=FOwner, +8=name(AnsiString), +12=data(ptr)
 static std::string tree_read_name(void* node) {
     if (!node) return "";
-    char** pp = (char**)((uint8_t*)node + 12);
+    char** pp = (char**)((uint8_t*)node + 8);
     char* data = *pp;
+    if (!data) return "";
     uint32_t len = (uint32_t)*(int32_t*)(data - 4);
     if (len > 2000) return "";
     return std::string(data, len);
 }
-
-// Read TreeNodeData pointer from TTreeNode
 static uint32_t* tree_get_data(void* node) {
     if (!node) return nullptr;
-    return *(uint32_t**)((uint8_t*)node + 16);
+    return *(uint32_t**)((uint8_t*)node + 12);
 }
 
 static uint32_t tree_read_rtype(void* node) {
@@ -802,7 +802,6 @@ static uint32_t tree_read_kind(void* node) {
 // Recursive tree writer (static helper, not a lambda)
 static void tree_write_recurse(void* parent, const std::vector<std::string>& names,
                                 std::string& tabs, std::string& out) {
-    if (!parent) return;
     uint32_t cnt = tree_get_count(parent);
     for (uint32_t i = 0; i < cnt; i++) {
         void* child = tree_get_item(parent, i);
@@ -810,6 +809,7 @@ static void tree_write_recurse(void* parent, const std::vector<std::string>& nam
         std::string name = tree_read_name(child);
         uint32_t rtype = tree_read_rtype(child);
         uint32_t index = tree_read_index(child);
+        svlog("Tree: child[%u]=0x%p name='%s' rtype=%u idx=%u", i, child, name.c_str(), rtype, index);
         if (rtype == 2) {
             out += tabs + "+" + name + "\n";
             tabs += "\t";
@@ -963,7 +963,14 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     auto save_tree = [&](const wchar_t* dir, const std::vector<std::string>& names,
                           uint32_t kind) {
         std::string tree;
-        for (auto& n : names) tree += "|" + n + "\n";
+        void* rootNode = tree_get_root(base, kind);
+        svlog("Tree: kind=%u root=0x%p count=%u names=%zu", kind, rootNode,
+              rootNode ? tree_get_count(rootNode) : 0, names.size());
+        if (rootNode) {
+            std::string tabs;
+            tree_write_recurse(rootNode, names, tabs, tree);
+        }
+        if (tree.empty()) { for (auto& n : names) tree += "|" + n + "\n"; }
         wf(sub((std::wstring(dir) + L"\\tree.yyd").c_str()), tree);
     };
 

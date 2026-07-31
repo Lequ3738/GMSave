@@ -4,6 +4,7 @@
 #pragma once
 
 // ==== Delphi RTL (Delphi 7 AnsiString era) ====
+#define ADDR_COMPARETEXT           0x40A0C8   // CompareText — case-insensitive AnsiString compare
 #define ADDR_LSTRASG              0x005528   // @LStrAsg — AnsiString assign
 #define ADDR_LSTRCAT              0x005544   // @LStrCat — AnsiString concat (+0x1C from LStrAsg)
 #define ADDR_LSTRCLR              0x0047E8   // @LStrClr — AnsiString free
@@ -15,6 +16,9 @@
 #define ADDR_SAVE_PROJECT         0x19B620   // Save project to stream (section dispatcher)
 #define ADDR_SAVE_OUTER           0x19BA38   // Save project outer (backup + stream creation)
 #define ADDR_LOAD_PROJECT         0x1D453C   // Load project from stream (section dispatcher)
+#define ADDR_CMPTEXT_SAVE_HOOK    0x1DACEC   // CALL CompareText(ext, ".gmk") — direct save check
+#define ADDR_GMK_STRING_DATA      0x1DAD58   // ".gmk" Delphi AnsiString data ptr for save check
+#define ADDR_DIRECT_SAVE_CALL     0x1DAD19   // CALL sub_59BA38 — direct save (Ctrl+S path)
 #define ADDR_RELOAD_ACTIONS       0x1A93B4   // Reload action libraries (project init hook point)
 #define ADDR_SAVE_PREFERENCES     0x0EC4D8   // Registry write (save preferences)
 #define ADDR_LOAD_PREFERENCES     0x0EC690   // Registry read (load preferences)

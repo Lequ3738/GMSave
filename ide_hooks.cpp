@@ -12,50 +12,72 @@
 #include <exception>
 
 // Verified injection points from IDA:
-//   Save: 0x5DAE36 in sub_5DAD60 — CALL sub_59BA38 (save project to stream)
-//   Save: 0x5DAD19 in sub_5DACB8 — CALL sub_59BA38 (direct save)
-//   Load: 0x5D484A in sub_5D47BC — CALL sub_5D453C (load/open project)
+//   Save: 0x5DAE36 in sub_5DAD60 — CALL sub_59BA38 (dialog save) → save_thunk
+//   Save: 0x5DAD19 in sub_5DACB8 — CALL sub_59BA38 (direct save) → save_thunk
+//   Load: 0x5D484A in sub_5D47BC — CALL sub_5D453C (load/open project) → load_thunk
 //   Load: 0x5D496E in sub_5D489C — CALL sub_5D453C (import/build)
+//   CmpTxt: 0x5DACEC in sub_5DACB8 — CALL CompareText(ext, ".gmk") → gmk_or_gm80_thunk
 
-// File extension filter: 0x5DADB9 — sub_40B0A8(&v11, ".gmk")
-//   We need to also add ".gm80" so the save dialog shows it.
-//   Strategy: hook AFTER this call and add our extension.
+// Extension check strategy (mirrors gm82save's gm81_or_gm82):
+//   1. Hook CompareText call at 0x5DACEC → test BOTH ".gmk" and ".gm80"
+//   2. Hook BOTH save call sites (dialog + direct) → intercept .gm80 saves
+//   This makes Ctrl+S directly save .gm80 without opening the dialog.
 
 static void* g_gm_base = NULL;
-static uint8_t g_orig_save_call[5] = {0};   // bytes at 0x5DAE36
-static uint8_t g_orig_load_call[5] = {0};   // bytes at 0x5D484A
+static uint8_t g_orig_save_call[5] = {0};      // bytes at 0x5DAE36 (dialog save)
+static uint8_t g_orig_direct_save[5] = {0};    // bytes at 0x5DAD19 (direct save)
+static uint8_t g_orig_load_call[5] = {0};      // bytes at 0x5D484A
+static uint8_t g_orig_cmptext_call[5] = {0};   // bytes at 0x5DACEC
 
-// CompareText: eax=dataPtr1, edx=dataPtr2 — Delphi string DATA (length at -4)
-// Returns difference (0 = equal, non-zero = different)
-typedef int (__fastcall *CompareText_t)(void* data1, void* data2);
-static CompareText_t g_real_CompareText = NULL;
+// CompareText hook: makes GM 8.0 recognize .gm80 as valid project extension
+// Installed by patching the CALL CompareText at 0x5DACEC in sub_5DACB8.
+// Strategy mirrors gm82save's gm81_or_gm82_inj: our hook tests BOTH ".gmk" AND ".gm80".
 
-static int __fastcall CompareText_hook(void* d1, void* d2) {
-    __try {
-        auto get_len = [](void* data) -> int {
-            if (!data || (uintptr_t)data < 0x10000) return 0;
-            return *(int*)((uint8_t*)data - 4);
-        };
-        int l1 = get_len(d1), l2 = get_len(d2);
-        // Only intercept if lengths match .gmk (4) and .gm80 (5)
-        if ((l1 == 4 && l2 == 5) || (l1 == 5 && l2 == 4)) {
-            wchar_t buf1[8] = {}, buf2[8] = {};
-            if ((uintptr_t)d1 > 0x10000) memcpy(buf1, d1, (UINT)l1 * 2);
-            if ((uintptr_t)d2 > 0x10000) memcpy(buf2, d2, (UINT)l2 * 2);
-            // Case-insensitive compare against .gmk and .gm80
-            if ((_wcsicmp(buf1, L".gmk") == 0 && _wcsicmp(buf2, L".gm80") == 0) ||
-                (_wcsicmp(buf1, L".gm80") == 0 && _wcsicmp(buf2, L".gmk") == 0))
-                return 0;
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+// Delphi AnsiString for ".gm80" — CompareText reads [ptr-4] for length
+// Layout: [refcount=-1:4][length=4:4][data=".gm80":5+padding]
+#pragma pack(push, 1)
+static const struct {
+    int32_t refcount;
+    uint32_t length;
+    char data[8];
+} s_gm80_delphi_str = { -1, 4, ".gm80" };
+#pragma pack(pop)
+static const char* const s_gm80_ext_ptr = s_gm80_delphi_str.data; // for inline asm
 
-    return g_real_CompareText(d1, d2);
-}
-
-// Variables referenced by naked asm — MUST be declared before use
+// Variables referenced by naked asm — MUST be declared before the thunks that reference them
 void* g_gm_base_ptr = NULL;
 static uint32_t g_save_outer_addr = ADDR_SAVE_OUTER;
 static uint32_t g_load_addr = ADDR_LOAD_PROJECT;
+
+// Naked thunk — replaces "call sub_40A0C8" at 0x5DACEC
+// Tests BOTH ".gmk" and ".gm80" against the project extension.
+// On entry: EAX = extension string data ptr, EDX = ".gmk" string data ptr
+// Must return 0 in EAX if extension matches either ".gmk" or ".gm80"
+__declspec(naked) static void gmk_or_gm80_thunk() {
+    __asm {
+        // Save extension pointer and test against ".gmk" first
+        push ebx
+        mov ebx, eax                    // ebx = extension data ptr
+        // EAX = ext, EDX = ".gmk" (already set by caller)
+        mov ecx, dword ptr [g_gm_base_ptr]
+        add ecx, ADDR_COMPARETEXT
+        call ecx                        // CompareText(ext, ".gmk")
+        test eax, eax
+        jz matched                      // .gmk matched → return 0
+
+        // Test against ".gm80" (in our DLL)
+        mov eax, ebx                    // restore extension
+        mov edx, offset s_gm80_delphi_str
+        add edx, 8                      // skip refcount+length to get to data
+        mov ecx, dword ptr [g_gm_base_ptr]
+        add ecx, ADDR_COMPARETEXT
+        call ecx                        // CompareText(ext, ".gm80")
+
+    matched:
+        pop ebx
+        ret
+    }
+}
 
 // ==== Thunk for save interception ====
 // Replaces the CALL to sub_59BA38 at 0x5DAE36.
@@ -106,16 +128,12 @@ static bool g_is_gm80_save = false;
 static std::wstring g_gm80_save_path;
 
 static int __stdcall check_and_do_gm80_save() {
-    // Always returns 0 so the thunk calls original save.
-    // Sets global flag so do_gm80_save_if_needed() can act AFTER original save.
     g_is_gm80_save = false;
     uint8_t* base = (uint8_t*)g_gm_base;
 
     char** ppProjPath = (char**)(base + 0x1EA27C);
-    if (!ppProjPath || IsBadReadPtr(ppProjPath, 4)) return 0;
+    if (!ppProjPath || !*ppProjPath) return 0;
     char* projPath = *ppProjPath;
-    if (!projPath || IsBadReadPtr(projPath, 1)) return 0;
-
     size_t len = strlen(projPath);
     if (len < 6) return 0;
 
@@ -123,24 +141,31 @@ static int __stdcall check_and_do_gm80_save() {
     if (!is_gm80 && len > 9)
         is_gm80 = (_strnicmp(projPath + len - 9, ".gm80.gmk", 9) == 0);
 
-    if (!is_gm80) {
-        dbg_log("Save: '%s' — normal .gmk", projPath);
-        return 0;
+    if (!is_gm80) return 0;
+
+    // Strip .gmk suffix so title bar shows ".gm80" natively
+    if (_strnicmp(projPath + len - 9, ".gm80.gmk", 9) == 0) {
+        len -= 4;
+        projPath[len] = '\0';
     }
 
-    std::string cleanPath(projPath, len);
-    if (_stricmp(projPath + len - 5, ".gm80") != 0)
-        cleanPath.resize(len - 4); // strip .gmk suffix
-
-    // Convert to wstring WITHOUT embedded null (use exact length, not -1)
-    int cch = MultiByteToWideChar(CP_ACP, 0, cleanPath.c_str(), (int)cleanPath.size(), NULL, 0);
+    int cch = MultiByteToWideChar(CP_ACP, 0, projPath, (int)len, NULL, 0);
     if (cch > 0) {
         g_gm80_save_path.resize(cch);
-        MultiByteToWideChar(CP_ACP, 0, cleanPath.c_str(), (int)cleanPath.size(), &g_gm80_save_path[0], cch);
+        MultiByteToWideChar(CP_ACP, 0, projPath, (int)len, &g_gm80_save_path[0], cch);
     }
     g_is_gm80_save = true;
-    dbg_log("Save: .gm80 detected '%s', will save after original", cleanPath.c_str());
-    return 0; // let original save run first
+    return 1; // no .gmk save needed (we'll delete .gm80.gmk ourselves)
+}
+
+// Delete .gm80.gmk left by GM's save dialog filter
+static void __stdcall cleanup_gm80_gmk() {
+    if (!g_is_gm80_save) return;
+    std::wstring gmkPath = g_gm80_save_path + L".gmk";
+    if (GetFileAttributesW(gmkPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileW(gmkPath.c_str());
+        g_is_gm80_save = false;
+    }
 }
 
 // Read a Delphi AnsiString from a global.
@@ -287,18 +312,13 @@ static void read_ide_project(GMKProject& proj) {
     // Dump first object of each type to discover field layouts
 }
 
-// Called from thunk AFTER original save completes
 static void __stdcall do_gm80_save_if_needed() {
-    if (!g_is_gm80_save) return;
-    g_is_gm80_save = false;
-
-    dbg_log("Save: saving to '%S'", g_gm80_save_path.c_str());
+    dbg_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
     try {
-        // Read directly from Delphi objects (gm82save-compatible approach)
         if (!gm80_save_to_path(g_gm_base, g_gm80_save_path))
-            dbg_log("Save: ERROR — gm80_save_to_path failed");
+            dbg_log("Save: ERROR");
         else
-            dbg_log("Save: .gm80 multi-file save complete");
+            dbg_log("Save: .gm80 complete");
     } catch (std::exception& e) {
         dbg_log("Save: EXCEPTION: %s", e.what());
     } catch (...) {
@@ -363,20 +383,29 @@ static int __stdcall check_and_do_gm80_load() {
 
 __declspec(naked) static void save_thunk() {
     __asm {
-        pushad                          // save all registers
-        call check_and_do_gm80_save     // set flag, returns 0
-        popad                           // restore registers
+        pushad
+        call check_and_do_gm80_save     // returns 1 if .gm80, 0 if normal
+        popad
+        test eax, eax
+        jnz gm80_save
 
-        // Call original save function
+        // Normal .gmk: call original save
         mov ecx, dword ptr [g_gm_base_ptr]
         add ecx, dword ptr [g_save_outer_addr]
         call ecx
+        jmp done
 
-        pushad                          // save again
-        call do_gm80_save_if_needed     // do multi-file save if flagged
+    gm80_save:
+        pushad
+        call do_gm80_save_if_needed      // .gm80 multi-file save
         popad
+        pushad
+        call cleanup_gm80_gmk             // delete .gm80.gmk if present
+        popad
+        xor eax, eax                      // return 0 (success) to GM
 
-        ret                             // return to sub_5DAD60
+    done:
+        ret
     }
 }
 
@@ -416,22 +445,30 @@ bool ide_hooks_install(HMODULE gm_base) {
     g_gm_base_ptr = gm_base;
     uint8_t* base = (uint8_t*)gm_base;
 
-    // Save hook: patch CALL at 0x5DAE36
+    // Save hook 1: patch CALL at 0x5DAE36 (dialog save path in sub_5DAD60)
     void* save_call_addr = base + 0x1DAE36;
     memcpy(g_orig_save_call, save_call_addr, 5);
     patch_call(save_call_addr, (void*)save_thunk);
+
+    // Save hook 2: patch CALL at 0x5DAD19 (direct save path in sub_5DACB8)
+    // This is the path taken when CompareText(ext, ".gmk") returns 0 (Ctrl+S)
+    void* direct_save_addr = base + ADDR_DIRECT_SAVE_CALL;
+    memcpy(g_orig_direct_save, direct_save_addr, 5);
+    patch_call(direct_save_addr, (void*)save_thunk);
 
     // Load hook: patch CALL at 0x5D484A
     void* load_call_addr = base + 0x1D484A;
     memcpy(g_orig_load_call, load_call_addr, 5);
     patch_call(load_call_addr, (void*)load_thunk);
 
-    // NOTE: CompareText hook is NOT safe for inline hooking — it's called
-    // by 40+ code paths during startup. Instead, we handle the extension
-    // in the save/load hooks by detecting ".gm80.gmk" suffix.
+    // CompareText hook: patch CALL at 0x5DACEC in sub_5DACB8
+    // Makes direct save (Ctrl+S) work for .gm80 projects by also testing ".gm80"
+    void* cmptext_call_addr = base + ADDR_CMPTEXT_SAVE_HOOK;
+    memcpy(g_orig_cmptext_call, cmptext_call_addr, 5);
+    patch_call(cmptext_call_addr, (void*)gmk_or_gm80_thunk);
 
-    dbg_log("Hooks installed: save=0x%p load=0x%p",
-        save_call_addr, load_call_addr);
+    dbg_log("Hooks installed: save=0x%p load=0x%p cmptext=0x%p",
+        save_call_addr, load_call_addr, cmptext_call_addr);
 
     return true;
 }
@@ -440,7 +477,9 @@ void ide_hooks_uninstall() {
     uint8_t* base = (uint8_t*)g_gm_base;
     if (base) {
         patch_bytes(base + 0x1DAE36, g_orig_save_call, 5);
+        patch_bytes(base + ADDR_DIRECT_SAVE_CALL, g_orig_direct_save, 5);
         patch_bytes(base + 0x1D484A, g_orig_load_call, 5);
+        patch_bytes(base + ADDR_CMPTEXT_SAVE_HOOK, g_orig_cmptext_call, 5);
         dbg_log("Hooks uninstalled");
     }
 }
