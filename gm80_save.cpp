@@ -10,7 +10,7 @@
 // ==== Delphi object field reading ====
 // These use the offsets verified by IDA analysis of GM 8.0 serializers
 
-static void* g_save_base = nullptr; // GM base address, set at start of save
+static void* g_save_base = nullptr;
 
 static uint32_t R4(void* obj, int off) { return *(uint32_t*)((uint8_t*)obj + off); }
 static int32_t  R4s(void* obj, int off) { return *(int32_t*)((uint8_t*)obj + off); }
@@ -18,46 +18,43 @@ static bool     R1(void* obj, int off) { return *(uint8_t*)((uint8_t*)obj + off)
 static double   R8(void* obj, int off) { return *(double*)((uint8_t*)obj + off); }
 static void*    RP(void* obj, int off) { return *(void**)((uint8_t*)obj + off); }
 
-// Read Delphi AnsiString from object field (offsets from IDA-verified layouts)
+// Read Delphi AnsiString from object field
+// data pointer may be nil for empty strings (matching gm82save UStr::as_slice)
 static std::string RS(void* obj, int off) {
-    if (!obj || (uintptr_t)obj < 0x10000) return "";
     char** pp = (char**)((uint8_t*)obj + off);
+    char* data = *pp;
+    if (!data) return "";
+    uint32_t len = (uint32_t)*(int32_t*)(data - 4);
+    if (len > 2000000) return std::string(data);
+    return std::string(data, len);
+}
+
+// Read global u32/u8
+static uint32_t GU32(uint32_t off) { return *(uint32_t*)((uint8_t*)g_save_base + off); }
+static uint8_t  GU8(uint32_t off)  { return *(uint8_t*)((uint8_t*)g_save_base + off); }
+
+// Read Delphi AnsiString from global
+// data pointer may be nil or sentinel for uninitialized strings
+static std::string GS(uint32_t off) {
+    char** pp = (char**)((uint8_t*)g_save_base + off);
     char* data = *pp;
     if (!data || (uintptr_t)data < 0x10000) return "";
     uint32_t len = (uint32_t)*(int32_t*)(data - 4);
-    if (len == 0) return "";
-    if (len > 2000000) return std::string(data); // C string fallback
+    if (len > 200000) return "";
     return std::string(data, len);
 }
 
-// Read global u32/u8/ptr
-static uint32_t GU32(uint32_t off) { return *(uint32_t*)((uint8_t*)g_save_base + off); }
-static uint8_t  GU8(uint32_t off)  { return *(uint8_t*)((uint8_t*)g_save_base + off); }
-static void*    GP(uint32_t off)   { return *(void**)((uint8_t*)g_save_base + off); }
-
-// Read Delphi AnsiString from global
-static std::string GS(uint32_t off) {
-    char** pp = (char**)((uint8_t*)g_save_base + off);
-    if (!pp || !*pp) return "";
-    char* data = *pp;
-    if ((uintptr_t)data < 0x10000) return "";
-    uint32_t len = (uint32_t)*(int32_t*)(data - 4);
-    if (len == 0 || len > 200000) return "";
-    return std::string(data, len);
-}
-
-// Read names from a DelphiList of Delphi string pointers (global name array)
+// Read names from a DelphiList of Delphi string pointers
 static void read_names_global(uint32_t name_off, uint32_t cnt_off,
                                std::vector<std::string>& out) {
     uint32_t* names = *(uint32_t**)((uint8_t*)g_save_base + name_off);
     uint32_t  cnt   = *(uint32_t*)((uint8_t*)g_save_base + cnt_off);
-    if (!names || !cnt || cnt > 50000) return;
     out.reserve(cnt);
     for (uint32_t i = 0; i < cnt; i++) {
         char* p = (char*)(uintptr_t)names[i];
-        if (!p || (uintptr_t)p < 0x10000) { out.push_back(""); continue; }
+        if (!p) { out.push_back(""); continue; }
         uint32_t len = (uint32_t)*(int32_t*)(p - 4);
-        if (len == 0 || len > 200000) { out.push_back(std::string(p)); continue; }
+        if (len > 200000) { out.push_back(std::string(p)); continue; }
         out.push_back(std::string(p, len));
     }
 }
@@ -274,26 +271,22 @@ static void save_sprite(void* obj, const std::wstring& outPath) {
     L("origin_y", to_str(R4s(obj, 20)));
     // collision shape fields — GM80 uses different names than gm82save
     // but we save in gm82save format for compatibility
-    L("collision_shape", to_str(R4(obj, 44))); // bbox_mode
-    L("alpha_tolerance", "0"); // GM80 doesn't have separate alpha tolerance
-    L("per_frame_colliders", to_str(R1(obj, 24))); // separate_masks
-    L("bbox_type", to_str(R4(obj, 44))); // bbox_mode
-    L("bbox_left", to_str(R4s(obj, 28)));
-    L("bbox_top", to_str(R4s(obj, 32)));
-    L("bbox_right", to_str(R4s(obj, 36)));
-    L("bbox_bottom", to_str(R4s(obj, 40)));
+    // BBox fields verified from GM80_SaveSprite_Individual decompile:
+    // +28=left, +32=top, +36=shape/type, +40=right, +44=bottom
+    L("collision_shape", to_str(R4(obj, 36)));   // +36 = shape/type
+    L("alpha_tolerance", "0");
+    L("per_frame_colliders", to_str(R1(obj, 24)));
+    L("bbox_type", to_str(R4(obj, 36)));
+    L("bbox_left",   to_str(R4s(obj, 28)));
+    L("bbox_top",    to_str(R4s(obj, 32)));
+    L("bbox_right",  to_str(R4s(obj, 40)));
+    L("bbox_bottom", to_str(R4s(obj, 44)));
     wf(outPath + L"\\sprite.txt", t);
 
-    // Frames: read from TList at +48
-    void** framePtrs = nullptr;
-    uint32_t fc = 0;
-    void* framesList = RP(obj, 48);
-    if (framesList) {
-        framePtrs = *(void***)((uint8_t*)framesList + 4);
-        fc = *(uint32_t*)((uint8_t*)framesList + 8);
-    }
-    if (framePtrs && fc > 0 && fc < 10000) {
-        for (uint32_t i = 0; i < fc && i < (uint32_t)frameCount; i++) {
+    // Frames: raw Frame** array at +48 (NOT TList), count from +4
+    void** framePtrs = (void**)RP(obj, 48);
+    if (framePtrs && frameCount > 0 && frameCount < 10000) {
+        for (int i = 0; i < frameCount; i++) {
             void* frame = framePtrs[i];
             if (!frame) continue;
             uint32_t fw = R4(frame, 4);
@@ -415,9 +408,9 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
                          const std::vector<std::string>& objectNames,
                          const std::vector<std::string>& triggerNames,
                          const std::wstring& outPath) {
-    CreateDirectoryW(outPath.c_str(), NULL);
+    
 
-    // object.txt
+    // .txt
     std::string t;
     auto L = [&](const char* k, const std::string& v) { t += k; t += "="; t += v; t += "\n"; };
     int sprIdx = R4s(obj, 4);
@@ -430,25 +423,27 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
     L("depth", to_str(R4s(obj, 12)));
     L("parent", (parentIdx >= 0 && parentIdx < (int)objectNames.size()) ? objectNames[parentIdx] : "");
     L("mask", (maskIdx >= 0 && maskIdx < (int)spriteNames.size()) ? spriteNames[maskIdx] : "");
-    wf(outPath + L"\\object.txt", t);
+    wf(outPath + L".txt", t);
 
-    // object.gml — events
+    // object.gml — events (Delphi dynamic arrays, NOT TList)
     std::string gml;
     const char* evNames[] = {"Create","Destroy","Alarm","Step","Collision",
         "Keyboard","Mouse","Other","Draw","KeyPress","KeyRelease","Trigger"};
     for (int evType = 0; evType < 12; evType++) {
         int listOff = 28 + evType * 4;
-        void* evList = RP(obj, listOff); // TList of Event pointers
-        if (!evList) continue;
-        uint32_t evCount = *(uint32_t*)((uint8_t*)evList + 8);
-        void** events = *(void***)((uint8_t*)evList + 4);
-        if (!events || evCount == 0) continue;
+        // Dynamic array: pointer to first element, length at pointer-4
+        void* evArray = RP(obj, listOff);
+        if (!evArray) continue;
+        uint32_t evCount = *(uint32_t*)((uint8_t*)evArray - 4);
+        void** events = (void**)evArray;
+        if (evCount == 0) continue;
 
         for (uint32_t ei = 0; ei < evCount; ei++) {
             void* ev = events[ei];
             if (!ev) continue;
+            // Event: +4=Action*[] raw array, +8=action_count
             uint32_t actCount = *(uint32_t*)((uint8_t*)ev + 8);
-            void** actions = *(void***)((uint8_t*)ev + 4);
+            void** actions = (void**)*(void**)((uint8_t*)ev + 4);
             if (!actions || actCount == 0) continue;
 
             // Event name
@@ -491,7 +486,7 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
             }
         }
     }
-    wf(outPath + L"\\object.gml", gml);
+    wf(outPath + L".gml", gml);
 }
 
 // -- Room --
@@ -533,6 +528,7 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
         L("bg_tile_v" + si, to_str(R1(obj, bgOff+17)));
         L("bg_hspeed" + si, to_str(R4s(obj, bgOff+20)));
         L("bg_vspeed" + si, to_str(R4s(obj, bgOff+24)));
+        L("bg_stretch" + si, to_str(R1(obj, bgOff+28)));
     }
 
     // views_enabled and 8 views
@@ -578,30 +574,29 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
 
     wf(outPath + L"\\room.txt", t);
 
-    // code.gml
-    std::string code = RS(obj, 748);
-    if (!code.empty())
-        wf(outPath + L"\\code.gml", encode_gml(code));
+    // code.gml — always write (matching gm82save)
+    wf(outPath + L"\\code.gml", encode_gml(RS(obj, 748)));
 
-    // instances.txt
+    // instances.txt — +752=count, +756=Instance[] inline array (24 bytes each)
+    // Serializer: mov edx, [eax+ebp*8+off] where ebp=esi*3 → 24-byte stride
     int instCount = R4s(obj, 752);
-    void** instances = *(void***)((uint8_t*)obj + 756);
-    if (instances && instCount > 0 && instCount < 100000) {
-        // Read from instance TList
-        void* instList = RP(obj, 752); // Actually the instance list pointer
-        if (instList) {
-            instances = *(void***)((uint8_t*)instList + 4);
-            instCount = *(uint32_t*)((uint8_t*)instList + 8);
-        }
+    uint8_t* instData = *(uint8_t**)((uint8_t*)obj + 756);
+    if (instData && instCount > 0 && instCount < 100000) {
         std::string ilines;
-        for (int i = 0; i < instCount && instances && instances[i]; i++) {
-            void* inst = instances[i];
-            int ox = R4s(inst, 0);
-            int oy = R4s(inst, 4);
-            int oid = R4s(inst, 8);
-            int iid = R4s(inst, 12);
-            std::string ccode = RS(inst, 16);
-            bool locked = R1(inst, 20);
+        for (int i = 0; i < instCount; i++) {
+            uint8_t* inst = instData + i * 24;
+            int ox = *(int32_t*)(inst + 0);
+            int oy = *(int32_t*)(inst + 4);
+            int oid = *(int32_t*)(inst + 8);
+            int iid = *(int32_t*)(inst + 12);
+            char* ccodePtr = *(char**)(inst + 16);
+            std::string ccode;
+            if (ccodePtr) {
+                uint32_t len = (uint32_t)*(int32_t*)(ccodePtr - 4);
+                if (len < 2000000) ccode.assign(ccodePtr, len);
+                else ccode = ccodePtr;
+            }
+            bool locked = *(uint8_t*)(inst + 20) != 0;
             std::string oname = (oid >= 0 && oid < (int)objectNames.size()) ? objectNames[oid] : to_str(oid);
             char hexId[16];
             snprintf(hexId, 16, "%08X", (uint32_t)iid);
@@ -611,7 +606,6 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
             ilines += ",1,1,4294967295,0";
             ilines += "," + to_str(!ccode.empty());
             ilines += "\n";
-            // Write per-instance creation code
             if (!ccode.empty()) {
                 wf(outPath + L"\\" + std::wstring(hexId, hexId+8) + L".gml", encode_gml(ccode));
             }
@@ -619,40 +613,29 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
         wf(outPath + L"\\instances.txt", ilines);
     }
 
-    // Tiles
+    // Tiles — +760=count, +764=Tile[] inline array (40 bytes each)
+    // Serializer: lea ebp,[esi+esi*4] → ebp*8=esi*40 stride
     int tileCount = R4s(obj, 760);
-    void** tiles = *(void***)((uint8_t*)obj + 764); // Actually from TList
-    void* tileList = RP(obj, 760); // Actually the tile count followed by tile list pointer
-    if (tileList) {
-        tiles = *(void***)((uint8_t*)tileList + 4);
-        tileCount = *(uint32_t*)((uint8_t*)tileList + 8);
-    }
-    if (tiles && tileCount > 0 && tileCount < 100000) {
-        std::string layers;
-        for (int i = 0; i < tileCount && tiles && tiles[i]; i++) {
-            void* tile = tiles[i];
-            int bgId = R4s(tile, 0);
-            int lx = R4s(tile, 4);
-            int ly = R4s(tile, 8);
-            int tw = R4s(tile, 12);
-            int th = R4s(tile, 16);
-            int tx = R4s(tile, 20);
-            int ty = R4s(tile, 24);
-            int depth = R4s(tile, 28);
-            int tid = R4s(tile, 32);
-            bool locked = R1(tile, 36);
+    uint8_t* tileData = *(uint8_t**)((uint8_t*)obj + 764);
+    if (tileData && tileCount > 0 && tileCount < 100000) {
+        for (int i = 0; i < tileCount; i++) {
+            uint8_t* tile = tileData + i * 40;
+            int bgId = *(int32_t*)(tile + 0);
+            int lx   = *(int32_t*)(tile + 4);
+            int ly   = *(int32_t*)(tile + 8);
+            int tw   = *(int32_t*)(tile + 12);
+            int th   = *(int32_t*)(tile + 16);
+            int tx   = *(int32_t*)(tile + 20);
+            int ty   = *(int32_t*)(tile + 24);
+            int depth = *(int32_t*)(tile + 28);
+            int tid  = *(int32_t*)(tile + 32);
+            bool locked = *(uint8_t*)(tile + 36) != 0;
             std::string bgName = (bgId >=0 && bgId < (int)bgNames.size()) ? bgNames[bgId] : to_str(bgId);
-            // Group tiles by depth
             char buf[256];
             snprintf(buf, 256, "%s,%d,%d,%d,%d,%d,%d,%d,%d,1,1,4294967295\n",
                      bgName.c_str(), lx, ly, tx, ty, tw, th, locked?1:0, depth);
-            // Write to depth file
-            wchar_t dfname[32];
-            swprintf(dfname, 32, L"\\%d.txt", depth);
-            // We'd need to group by depth, but for simplicity write all to one file per depth
-            // This aggregates: store by depth
+            (void)buf; (void)bgName; (void)tid; // TODO: group by depth and write per-layer files
         }
-        // For now: skip detailed tile depth grouping
     }
 }
 
@@ -689,21 +672,16 @@ static void* __fastcall tree_get_item(void* node, uint32_t idx) {
 static std::string tree_read_name(void* node) {
     if (!node) return "";
     char** pp = (char**)((uint8_t*)node + 12);
-    if (!pp || !*pp) return "";
     char* data = *pp;
-    if ((uintptr_t)data < 0x10000 || (uintptr_t)data > 0x7FFFFFFF) return "";
     uint32_t len = (uint32_t)*(int32_t*)(data - 4);
-    if (len == 0 || len > 2000) return "";
+    if (len > 2000) return "";
     return std::string(data, len);
 }
 
-// Safe TreeNodeData reader — validates pointer before dereference
+// Read TreeNodeData pointer from TTreeNode
 static uint32_t* tree_get_data(void* node) {
     if (!node) return nullptr;
-    uint32_t* td = *(uint32_t**)((uint8_t*)node + 16);
-    // Validate: must be a reasonable heap address
-    if (!td || (uintptr_t)td < 0x10000 || (uintptr_t)td > 0x7FFFFFFF) return nullptr;
-    return td;
+    return *(uint32_t**)((uint8_t*)node + 16);
 }
 
 static uint32_t tree_read_rtype(void* node) {
@@ -811,13 +789,13 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         std::string m;
         m += "gm80_version=5\n";
         m += "gameid=" + to_str(GU32(0x1F6218)) + "\n\n";
-        m += "info_author=" + GS(0x1E93F4) + "\n";
-        m += "info_version=" + GS(0x1E93F8) + "\n";
-        m += "info_information=" + encode_delimit(GS(0x1E9400)) + "\n\n";
-        m += "exe_company=" + GS(0x1E9404) + "\n";
-        m += "exe_product=" + GS(0x1E940C) + "\n";
-        m += "exe_copyright=" + GS(0x1E9408) + "\n";
-        m += "exe_description=" + GS(0x1E9410) + "\n";
+        m += "info_author=" + GS(0x1E9430) + "\n";
+        m += "info_version=" + GS(0x1E9434) + "\n";
+        m += "info_information=" + encode_delimit(GS(0x1E9438)) + "\n\n";
+        m += "exe_company=" + GS(0x1E944C) + "\n";
+        m += "exe_product=" + GS(0x1E9450) + "\n";
+        m += "exe_copyright=" + GS(0x1E9454) + "\n";
+        m += "exe_description=" + GS(0x1E9458) + "\n";
         m += "exe_version=1.0.0.0\n\n";
         m += "has_backgrounds=" + to_str(!bgNames.empty()) + "\n";
         m += "has_datafiles=0\n";
@@ -933,7 +911,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     if (!pathNames.empty()) {
         save_index(L"paths", pathNames);
         save_tree(L"paths", pathNames, 8);
-        uint32_t* pObjArr = *(uint32_t**)(base + 0x1E9108);
+        uint32_t* pObjArr = *(uint32_t**)(base + 0x1E92AC);
         if (pObjArr) {
             for (uint32_t i = 0; i < pathCnt && i < (uint32_t)pathNames.size(); i++) {
                 if (pathNames[i].empty()) continue;
@@ -967,7 +945,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     if (!spriteNames.empty()) {
         save_index(L"sprites", spriteNames);
         save_tree(L"sprites", spriteNames, 2);
-        uint32_t* spArr = *(uint32_t**)(base + 0x1E92E8); // sprite array
+        uint32_t* spArr = *(uint32_t**)(base + 0x1E9108); // sprite array
         if (spArr && spriteCnt < 50000) {
             for (uint32_t i = 0; i < spriteCnt && i < (uint32_t)spriteNames.size(); i++) {
                 if (spriteNames[i].empty()) continue;

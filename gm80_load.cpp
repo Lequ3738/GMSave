@@ -336,13 +336,13 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     uint32_t gameId = 0;
     parse_kv(meta, [&](auto& k, auto& v) {
         if (k == "gameid") gameId = (uint32_t)std::stoul(v);
-        else if (k == "info_author") write_glob_str(0x1E93F4, v);
-        else if (k == "info_version") write_glob_str(0x1E93F8, v);
-        else if (k == "info_information") write_glob_str(0x1E9400, decode_delimit(v));
-        else if (k == "exe_company") write_glob_str(0x1E9404, v);
-        else if (k == "exe_copyright") write_glob_str(0x1E9408, v);
-        else if (k == "exe_product") write_glob_str(0x1E940C, v);
-        else if (k == "exe_description") write_glob_str(0x1E9410, v);
+        else if (k == "info_author") write_glob_str(0x1E9430, v);
+        else if (k == "info_version") write_glob_str(0x1E9434, v);
+        else if (k == "info_information") write_glob_str(0x1E9438, decode_delimit(v));
+        else if (k == "exe_company") write_glob_str(0x1E944C, v);
+        else if (k == "exe_copyright") write_glob_str(0x1E9454, v);
+        else if (k == "exe_product") write_glob_str(0x1E9450, v);
+        else if (k == "exe_description") write_glob_str(0x1E9458, v);
     });
     write_glob_u32(0x1F6218, gameId); // Game ID
 

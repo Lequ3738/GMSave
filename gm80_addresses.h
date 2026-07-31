@@ -82,13 +82,14 @@ struct GM80ResourceGlobals {
 #define ADDR_SETTING_CLEAR_COLOR     0x1E93D0   // u32 RGBA
 #define ADDR_SETTING_PRIORITY        0x1E93D4   // u32
 #define ADDR_SETTING_LOADING_BAR     0x1E93D8   // u32
-#define ADDR_SETTING_AUTHOR          0x1E93F4   // Delphi string ptr
-#define ADDR_SETTING_VERSION         0x1E93F8   // Delphi string ptr
-#define ADDR_SETTING_INFO            0x1E9400   // Delphi string ptr
-#define ADDR_SETTING_COMPANY         0x1E9404   // Delphi string ptr
-#define ADDR_SETTING_COPYRIGHT       0x1E9408   // Delphi string ptr
-#define ADDR_SETTING_PRODUCT         0x1E940C   // Delphi string ptr
-#define ADDR_SETTING_DESCRIPTION     0x1E9410   // Delphi string ptr
+// String globals verified from GM80_SaveSettings disasm (0x59E960-0x59EA08)
+#define ADDR_SETTING_AUTHOR          0x1E9430   // dword_5E9430 → sub_4EA9E4
+#define ADDR_SETTING_VERSION         0x1E9434   // off_5E9434 → sub_4EA9E4
+#define ADDR_SETTING_INFO            0x1E9438   // dword_5E9438 → sub_4EA9E4
+#define ADDR_SETTING_COMPANY         0x1E944C   // dword_5E944C → sub_4EA9E4
+#define ADDR_SETTING_PRODUCT         0x1E9450   // dword_5E9450 → sub_4EA9E4
+#define ADDR_SETTING_COPYRIGHT       0x1E9454   // dword_5E9454 → sub_4EA9E4
+#define ADDR_SETTING_DESCRIPTION     0x1E9458   // dword_5E9458 → sub_4EA9E4
 #define ADDR_SETTINGS_TIMESTAMP      0x1E93A4   // double
 
 // ==== Game ID & Global Settings ====
