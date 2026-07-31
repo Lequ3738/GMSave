@@ -1,7 +1,55 @@
-﻿    正在创建库 C:\Project\C++\GMSave\Release\GMSave.lib 和对象 C:\Project\C++\GMSave\Release\GMSave.exp
+﻿  dllmain.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“dllmain.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+C:\Project\C++\GMSave\Librarys\delphi.h(154,9): warning C4405: “out”: 标识符是保留字
+  (编译源文件“dllmain.cpp”)
+  
+  pch.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“pch.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+  ide_hooks.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“GMSave/ide_hooks.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+C:\Project\C++\GMSave\Librarys\delphi.h(154,9): warning C4405: “out”: 标识符是保留字
+  (编译源文件“GMSave/ide_hooks.cpp”)
+  
+  gmk_format.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“GMSave/gmk_format.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+  gm80_load.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“GMSave/gm80_load.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+C:\Project\C++\GMSave\GMSave\gm80_load.cpp(73,9): warning C4405: “out”: 标识符是保留字
+  gm80_save.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“GMSave/gm80_save.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+  project_watcher.cpp
+C:\Project\C++\GMSave\pch.h(3,9): warning C4005: “NOMINMAX”: 宏重定义
+  (编译源文件“GMSave/project_watcher.cpp”)
+      C:\Project\C++\GMSave\pch.h(3,9):
+      之前在命令行上声明的“NOMINMAX”
+  
+    正在创建库 C:\Project\C++\GMSave\Release\GMSave.lib 和对象 C:\Project\C++\GMSave\Release\GMSave.exp
   正在生成代码
-  0 of 1366 functions ( 0.0%) were compiled, the rest were copied from previous compilation.
-    0 functions were new in current compilation
-    0 functions had inline decision re-evaluated but remain unchanged
+  Previous IPDB not found, fall back to full compilation.
+  All 1368 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
   已完成代码的生成
   GMSave.vcxproj -> C:\Project\C++\GMSave\Release\GMSave.dll

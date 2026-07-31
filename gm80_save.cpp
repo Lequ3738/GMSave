@@ -7,6 +7,15 @@
 #include <sstream>
 #include <cstdarg>
 
+static void svlog(const char* fmt, ...) {
+    char path[MAX_PATH], buf[512];
+    GetEnvironmentVariableA("TEMP", path, sizeof(path));
+    strcat_s(path, "\\GMSave.log");
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    FILE* f = fopen(path, "a");
+    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+}
+
 // ==== Delphi object field reading ====
 // These use the offsets verified by IDA analysis of GM 8.0 serializers
 
@@ -118,6 +127,20 @@ static bool wb(const std::wstring& fp, const void* data, size_t len) {
     return true;
 }
 
+// Convert ANSI (CP_ACP / GBK) → UTF-8 for GML output (matching gm82save)
+static std::string ansi_to_utf8(const std::string& ansi) {
+    if (ansi.empty()) return ansi;
+    int wlen = MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), (int)ansi.size(), NULL, 0);
+    if (wlen <= 0) return ansi;
+    std::wstring wide(wlen, 0);
+    MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), (int)ansi.size(), &wide[0], wlen);
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wlen, NULL, 0, NULL, NULL);
+    if (u8len <= 0) return ansi;
+    std::string u8(u8len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wlen, &u8[0], u8len, NULL, NULL);
+    return u8;
+}
+
 static std::string encode_gml(const std::string& gml) {
     std::string out;
     std::istringstream ss(gml);
@@ -125,7 +148,7 @@ static std::string encode_gml(const std::string& gml) {
     while (std::getline(ss, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
             line.pop_back();
-        out += line + "\r\n";
+        out += ansi_to_utf8(line) + "\r\n";
     }
     return out;
 }
@@ -147,32 +170,68 @@ static std::string encode_delimit(const std::string& s) {
     return r;
 }
 
-// ==== BMP writer for frame data (BGRA → BMP) ====
-// Sprites and backgrounds store BGRA8 pixel data in Delphi Frame objects.
-// We save as BMP for reliability; PNG would require external encoder.
+// ==== PNG writer for frame data (BGRA → RGBA PNG via WIC) ====
+#include <wincodec.h>
+#include <shlwapi.h>
+#pragma comment(lib, "windowscodecs.lib")
 
-// Simple BMP writer for BGRA data
-static bool save_bmp_raw(const std::wstring& fp, const uint8_t* bgra, uint32_t w, uint32_t h) {
+static bool save_png(const std::wstring& fp, const uint8_t* bgra, uint32_t w, uint32_t h) {
     if (!bgra || w == 0 || h == 0) return false;
-    uint32_t rowSize = ((w * 32 + 31) / 32) * 4;
-    uint32_t dataSize = rowSize * h;
-    uint32_t fileSize = 54 + dataSize;
-    uint8_t hdr[54] = {};
-    hdr[0]='B'; hdr[1]='M';
-    memcpy(hdr+2, &fileSize, 4);
-    hdr[10]=54; hdr[14]=40;
-    memcpy(hdr+18, &w, 4);
-    memcpy(hdr+22, &h, 4);
-    hdr[26]=1; hdr[28]=32;
-    std::vector<uint8_t> bmp(fileSize);
-    memcpy(bmp.data(), hdr, 54);
-    // Write scanlines bottom-to-top, BGRA→BGRx
-    for (uint32_t y = 0; y < h; y++) {
-        uint8_t* dst = bmp.data() + 54 + (h - 1 - y) * rowSize;
-        const uint8_t* src = bgra + y * w * 4;
-        memcpy(dst, src, w * 4);
-    }
-    return wb(fp, bmp.data(), fileSize);
+
+    // COM init (once)
+    static bool comInit = false;
+    if (!comInit) { (void)CoInitializeEx(NULL, COINIT_MULTITHREADED); comInit = true; }
+
+    IWICImagingFactory* factory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&factory));
+    if (FAILED(hr) || !factory) return false;
+
+    IWICBitmapEncoder* encoder = nullptr;
+    hr = factory->CreateEncoder(GUID_ContainerFormatPng, NULL, &encoder);
+    if (FAILED(hr)) { factory->Release(); return false; }
+
+    IWICStream* stream = nullptr;
+    hr = factory->CreateStream(&stream);
+    if (FAILED(hr)) { encoder->Release(); factory->Release(); return false; }
+
+    hr = stream->InitializeFromFilename(fp.c_str(), GENERIC_WRITE);
+    if (FAILED(hr)) { stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+    if (FAILED(hr)) { stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    hr = encoder->CreateNewFrame(&frame, &props);
+    if (FAILED(hr)) { stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    hr = frame->Initialize(props);
+    if (props) props->Release();
+    if (FAILED(hr)) { frame->Release(); stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    hr = frame->SetSize(w, h);
+    if (FAILED(hr)) { frame->Release(); stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    hr = frame->SetPixelFormat(&format);
+    if (FAILED(hr)) { frame->Release(); stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    // BGRA data already in correct format — write directly
+    UINT stride = w * 4;
+    UINT dataSize = stride * h;
+    hr = frame->WritePixels(h, stride, dataSize, (BYTE*)bgra);
+    if (FAILED(hr)) { frame->Release(); stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    hr = frame->Commit();
+    frame->Release();
+    if (FAILED(hr)) { stream->Release(); encoder->Release(); factory->Release(); return false; }
+
+    hr = encoder->Commit();
+    encoder->Release();
+    stream->Release();
+    factory->Release();
+    return SUCCEEDED(hr);
 }
 
 // ==== Save individual resource types ====
@@ -294,8 +353,8 @@ static void save_sprite(void* obj, const std::wstring& outPath) {
             uint8_t* pix = (uint8_t*)RP(frame, 12);
             if (pix && fw > 0 && fh > 0 && fw < 16384 && fh < 16384) {
                 wchar_t fname[32];
-                swprintf(fname, 32, L"\\%u.bmp", i);
-                save_bmp_raw(outPath + fname, pix, fw, fh);
+                swprintf(fname, 32, L"\\%u.png", i);
+                save_png(outPath + fname, pix, fw, fh);
             }
         }
     }
@@ -316,7 +375,7 @@ static void save_background(void* obj, const std::wstring& outPath) {
 
     // Save image
     if (exists) {
-        save_bmp_raw(outPath + L".bmp", pix, fw, fh);
+        save_png(outPath + L".png", pix, fw, fh);
     }
 
     // bg.txt
@@ -369,33 +428,42 @@ static void save_timeline(void* obj, const std::wstring& outPath) {
         if (!actions || actCount == 0) continue;
 
         gml += "#define " + to_str(step) + "\n";
-        // Write each action
         for (uint32_t a = 0; a < actCount; a++) {
-            gml += "/*\"/*'/**//* YYD ACTION\n";
             void* act = actions[a];
             if (!act) continue;
-            gml += "lib_id=" + to_str(R4(act, 8)) + "\n";   // action id
-            gml += "action_id=" + to_str(R4(act, 8)) + "\n";
-            // action_kind stored at +20 (execution_type)
-            uint32_t exeType = R4(act, 20);
-            if (R1(act, 16)) gml += "relative=1\n";  // relative
-            if (R1(act, 17)) gml += "invert=1\n";    // not flag
-            // applies_to at +4
-            int32_t appliesTo = R4s(act, 4);
-            if (appliesTo == -2) gml += "applies_to=other\n";
-            else if (appliesTo == -1) gml += "applies_to=self\n";
-            else if (appliesTo >= 0) gml += "applies_to=" + to_str(appliesTo) + "\n";
-
-            // Arguments
-            int argCount = R4s(act, 32);
-            for (int j = 0; j < argCount && j < 8; j++) {
-                int av = R4s(act, 36 + j*4);
-                gml += "arg" + to_str(j) + "=" + to_str(av) + "\n";
+            gml += "/*\"/*'/**//* YYD ACTION\n";
+            gml += "lib_id=" + to_str(R4(act, 4)) + "\n";    // +4 = lib_id
+            gml += "action_id=" + to_str(R4(act, 8)) + "\n";  // +8 = action_id
+            uint32_t kind = R4(act, 12); // +12 = action_kind
+            if (R1(act, 16)) // +16 = can_be_relative
+                gml += "relative=" + to_str(R1(act, 72)) + "\n"; // +72 = is_relative
+            if (R1(act, 18)) { // +18 = applies_to_something
+                int32_t at = R4s(act, 68); // +68 = applies_to
+                if (at == -2) gml += "applies_to=other\n";
+                else if (at == -1) gml += "applies_to=self\n";
+                else if (at >= 0) gml += "applies_to=" + to_str(at) + "\n";
+            }
+            int argCount = R4s(act, 32); // +32 = param_count
+            switch (kind) {
+            case 0: // normal — use param_strings (matching gm82save)
+                gml += "invert=" + to_str(R1(act, 108)) + "\n"; // +108 = invert_condition
+                for (int j = 0; j < argCount && j < 8; j++) {
+                    std::string pval = RS(act, 76 + j*4); // +76 = param_strings[j]
+                    gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\n";
+                }
+                break;
+            case 5: // repeat
+                gml += "repeats=" + RS(act, 76) + "\n"; // param_strings[0]
+                break;
+            case 6: // variable
+                gml += "var_name=" + RS(act, 76) + "\n";
+                gml += "var_value=" + RS(act, 80) + "\n"; // param_strings[1]
+                break;
+            // case 7: code — write nothing before */
             }
             gml += "*/\n";
-            // Code action
-            if (exeType == 7) {
-                std::string code = RS(act, 24);
+            if (kind == 7) { // code action
+                std::string code = RS(act, 76); // param_strings[0]
                 if (!code.empty()) gml += encode_gml(code);
             }
         }
@@ -404,10 +472,13 @@ static void save_timeline(void* obj, const std::wstring& outPath) {
 }
 
 // -- Object --
-static void save_object(void* obj, const std::vector<std::string>& spriteNames,
-                         const std::vector<std::string>& objectNames,
-                         const std::vector<std::string>& triggerNames,
-                         const std::wstring& outPath) {
+static void save_object(void* obj,
+    const std::vector<std::string>& spriteNames, const std::vector<std::string>& soundNames,
+    const std::vector<std::string>& bgNames, const std::vector<std::string>& pathNames,
+    const std::vector<std::string>& scriptNames, const std::vector<std::string>& fontNames,
+    const std::vector<std::string>& tlNames, const std::vector<std::string>& objectNames,
+    const std::vector<std::string>& roomNames, const std::vector<std::string>& triggerNames,
+    const std::wstring& outPath) {
     
 
     // .txt
@@ -457,30 +528,56 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
             }
             gml += "#define " + evName + "\n";
 
-            // Write actions
+            // Write actions (matching gm82save save_event exactly)
             for (uint32_t a = 0; a < actCount; a++) {
                 void* act = actions[a];
                 if (!act) continue;
                 gml += "/*\"/*'/**//* YYD ACTION\n";
-                gml += "lib_id=" + to_str(R4(act, 8)) + "\n";
-                gml += "action_id=" + to_str(R4(act, 8)) + "\n";
-                if (R1(act, 16)) gml += "relative=1\n";
-                if (R1(act, 17)) gml += "invert=1\n";
-                int32_t appTo = R4s(act, 4);
-                if (appTo == -2) gml += "applies_to=other\n";
-                else if (appTo == -1) gml += "applies_to=self\n";
-                else if (appTo >= 0 && appTo < (int)objectNames.size())
-                    gml += "applies_to=" + objectNames[appTo] + "\n";
-
-                int argCount = R4s(act, 32);
-                for (int j = 0; j < argCount && j < 8; j++) {
-                    int av = R4s(act, 36 + j*4);
-                    gml += "arg" + to_str(j) + "=" + to_str(av) + "\n";
+                gml += "lib_id=" + to_str(R4(act, 4)) + "\n";    // +4 = lib_id
+                gml += "action_id=" + to_str(R4(act, 8)) + "\n";  // +8 = action_id
+                uint32_t kind = R4(act, 12); // +12 = action_kind
+                if (R1(act, 16)) // +16 = can_be_relative
+                    gml += "relative=" + to_str(R1(act, 72)) + "\n"; // +72 = is_relative
+                if (R1(act, 18)) { // +18 = applies_to_something
+                    int32_t at = R4s(act, 68); // +68 = applies_to
+                    if (at == -2) gml += "applies_to=other\n";
+                    else if (at == -1) gml += "applies_to=self\n";
+                    else if (at >= 0 && at < (int)objectNames.size())
+                        gml += "applies_to=" + objectNames[at] + "\n";
+                }
+                int argCount = R4s(act, 32); // +32 = param_count
+                switch (kind) {
+                case 0: // normal — resolve param_types to resource names
+                    gml += "invert=" + to_str(R1(act, 108)) + "\n"; // +108 = invert_condition
+                    for (int j = 0; j < argCount && j < 8; j++) {
+                        uint32_t ptype = R4(act, 36 + j*4); // +36 = param_types[j]
+                        std::string pval = RS(act, 76 + j*4); // +76 = param_strings[j]
+                        if (ptype >= 5 && ptype <= 14) {
+                            int idx = pval.empty() ? -1 : std::stoi(pval);
+                            if (ptype == 5) pval = (idx>=0&&idx<(int)spriteNames.size())?spriteNames[idx]:"";
+                            else if (ptype == 6) pval = (idx>=0&&idx<(int)soundNames.size())?soundNames[idx]:"";
+                            else if (ptype == 7) pval = (idx>=0&&idx<(int)bgNames.size())?bgNames[idx]:"";
+                            else if (ptype == 8) pval = (idx>=0&&idx<(int)pathNames.size())?pathNames[idx]:"";
+                            else if (ptype == 9) pval = (idx>=0&&idx<(int)scriptNames.size())?scriptNames[idx]:"";
+                            else if (ptype == 10) pval = (idx>=0&&idx<(int)objectNames.size())?objectNames[idx]:"";
+                            else if (ptype == 11) pval = (idx>=0&&idx<(int)roomNames.size())?roomNames[idx]:"";
+                            else if (ptype == 12) pval = (idx>=0&&idx<(int)fontNames.size())?fontNames[idx]:"";
+                            else if (ptype == 14) pval = (idx>=0&&idx<(int)tlNames.size())?tlNames[idx]:"";
+                        }
+                        gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\n";
+                    }
+                    break;
+                case 5: // repeat
+                    gml += "repeats=" + RS(act, 76) + "\n";
+                    break;
+                case 6: // variable
+                    gml += "var_name=" + RS(act, 76) + "\n";
+                    gml += "var_value=" + RS(act, 80) + "\n";
+                    break;
                 }
                 gml += "*/\n";
-                uint32_t exeType = R4(act, 20);
-                if (exeType == 7) {
-                    std::string code = RS(act, 24);
+                if (kind == 7) { // code action
+                    std::string code = RS(act, 76); // param_strings[0]
                     if (!code.empty()) gml += encode_gml(code);
                 }
             }
@@ -503,14 +600,15 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
     L("caption", RS(obj, 4));
     L("width", to_str(R4(obj, 12)));
     L("height", to_str(R4(obj, 16)));
-    L("snap_x", "16");
-    L("snap_y", "16");
+    // snap at +20/+24, clear at +28/+29 — verified from sub_5480A4 room init
+    L("snap_x", to_str(R4(obj, 20)));
+    L("snap_y", to_str(R4(obj, 24)));
     L("isometric", "0");
     L("roomspeed", to_str(R4(obj, 8)));
-    L("roompersistent", to_str(R1(obj, 28)));
+    L("roompersistent", "0");  // TODO: find correct offset
     L("bg_color", to_str(R4(obj, 32)));
-    L("clear_screen", to_str(R1(obj, 29)));
-    L("clear_view", "0");
+    L("clear_screen", to_str(R1(obj, 28)));
+    L("clear_view", to_str(R1(obj, 29)));
 
     // 8 backgrounds
     t += "\n";
@@ -531,11 +629,11 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
         L("bg_stretch" + si, to_str(R1(obj, bgOff+28)));
     }
 
-    // views_enabled and 8 views
+    // views_enabled at +296, 8 views at +300 (56 bytes each) — verified from sub_5480A4
     t += "\n";
-    L("views_enabled", "1");
+    L("views_enabled", to_str(R1(obj, 296)));
     for (int i = 0; i < 8; i++) {
-        int vwOff = 304 + i * 56;
+        int vwOff = 300 + i * 56;
         std::string si = to_str(i);
         L("view_visible" + si, to_str(R1(obj, vwOff)));
         L("view_xview" + si, to_str(R4s(obj, vwOff+4)));
@@ -560,12 +658,13 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
     L("remember", to_str(R1(obj, 772)));
     L("editor_width", to_str(R4(obj, 776)));
     L("editor_height", to_str(R4(obj, 780)));
-    L("show_grid", "1");
-    L("show_objects", "1");
-    L("show_tiles", "1");
-    L("show_backgrounds", "1");
-    L("show_foregrounds", "1");
-    L("show_views", "1");
+    // TODO: read show_* from room object (offsets ~+768..+811 area)
+    L("show_grid", "0");
+    L("show_objects", "0");
+    L("show_tiles", "0");
+    L("show_backgrounds", "0");
+    L("show_foregrounds", "0");
+    L("show_views", "0");
     L("delete_underlying_objects", "0");
     L("delete_underlying_tiles", "0");
     L("tab", "0");
@@ -645,7 +744,8 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
 
 // Fastcall wrapper: TTreeNode.GetCount(self) → uint32_t
 static uint32_t __fastcall tree_get_count(void* node) {
-    uint32_t result;
+    if (!node || (uintptr_t)node < 0x10000) return 0;
+    uint32_t result = 0;
     uint32_t func = (uint32_t)g_save_base + 0xAD490;
     __asm {
         mov eax, node
@@ -723,18 +823,29 @@ static void tree_write_recurse(void* parent, const std::vector<std::string>& nam
 }
 
 // Find TTreeNodes from TTreeView (tries Delphi 7 VCL offsets)
-static void* tree_find_nodes(void* base) {
-    void** mainForm = *(void***)((uint8_t*)base + 0x1F0100);
-    if (!mainForm) return nullptr;
-    void* treeView = *(void**)((uint8_t*)mainForm + 0x3B8);
-    if (!treeView) return nullptr;
-    // Try common Delphi 7 VCL offsets for TTreeView.FTreeNodes
-    uint32_t offs[] = {0x148, 0x144, 0x140, 0x13C, 0x138, 0x2D8};
-    for (int oi = 0; oi < 6; oi++) {
-        void* maybe = *(void**)((uint8_t*)treeView + offs[oi]);
-        if (!maybe || (uintptr_t)maybe < 0x10000) continue;
-        uint32_t cnt = tree_get_count(maybe);
-        if (cnt > 0 && cnt < 30) return maybe;
+// RT_* TTreeNode root pointers — verified from IDA sub_59EC84 switch table
+static uint32_t rt_kind_globals[] = {
+    0x1F6258, // kind 1 = Objects
+    0x1F625C, // kind 2 = Sprites
+    0x1F6260, // kind 3 = Sounds
+    0x1F6264, // kind 4 = Rooms
+    0x1F6268, // kind 6 = Backgrounds
+    0x1F6270, // kind 7 = Scripts
+    0x1F626C, // kind 8 = Paths
+    0x1F6274, // kind 9 = Fonts
+    0x1F6278, // kind 12 = Timelines
+};
+static uint32_t rt_kinds[] = {1,2,3,4,6,7,8,9,12};
+
+// Get the root TTreeNode for a resource type kind
+static void* tree_get_root(void* base, uint32_t kind) {
+    for (int i = 0; i < 9; i++) {
+        if (rt_kinds[i] == kind) {
+            void** ppNode = (void**)((uint8_t*)base + rt_kind_globals[i]);
+            void* node = *ppNode;
+            if (node && (uintptr_t)node > 0x10000 && (uintptr_t)node < 0x7FF00000)
+                return node;
+        }
     }
     return nullptr;
 }
@@ -778,8 +889,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         if (tarr && tcnt && tcnt < 500) {
             for (uint32_t i = 0; i < tcnt; i++) {
                 void* tObj = (void*)(uintptr_t)tarr[i];
-                if (!tObj) continue;
-                triggerNames.push_back(tObj ? RS(tObj, 4) : "");
+                if (!tObj) { triggerNames.push_back(""); continue; }
+                triggerNames.push_back(RS(tObj, 4));
             }
         }
     }
@@ -831,9 +942,9 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         L("f4_fullscreen_toggle", "0"); L("f1_help_menu", "0");
         L("esc_close_game", "1"); L("f5_save_f6_load", "0");
         L("f9_screenshot", "0"); L("treat_close_as_esc", "0");
-        L("priority", to_str((int)GU8(0x1E93D8)));
+        L("priority", to_str((int)GU8(0x1E93D4)));           // GM80_Priority at 0x5E93D4
         L("freeze_on_lose_focus", "0");
-        L("custom_loader", "0"); L("custom_bar", to_str((int)GU8(0x1E93D4)));
+        L("custom_loader", "0"); L("custom_bar", to_str((int)GU8(0x1E93D8))); // GM80_LoadingBar at 0x5E93D8
         L("bar_has_bg", "0"); L("bar_has_fg", "0");
         L("transparent", "1"); L("translucency", "255"); L("scale_progress_bar", "1");
         L("show_error_messages", "1"); L("log_errors", "0");
@@ -852,23 +963,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     auto save_tree = [&](const wchar_t* dir, const std::vector<std::string>& names,
                           uint32_t kind) {
         std::string tree;
-        // Try hierarchical via TTreeNode traversal
-        void* nodes = tree_find_nodes(base);
-        if (nodes) {
-            uint32_t rootCnt = tree_get_count(nodes);
-            for (uint32_t ri = 0; ri < rootCnt; ri++) {
-                void* child = tree_get_item(nodes, ri);
-                if (child && tree_read_kind(child) == kind) {
-                    std::string tabs;
-                    tree_write_recurse(child, names, tabs, tree);
-                    break;
-                }
-            }
-        }
-        // Flat fallback
-        if (tree.empty()) {
-            for (auto& n : names) tree += "|" + n + "\n";
-        }
+        for (auto& n : names) tree += "|" + n + "\n";
         wf(sub((std::wstring(dir) + L"\\tree.yyd").c_str()), tree);
     };
 
@@ -961,7 +1056,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     if (!bgNames.empty()) {
         save_index(L"backgrounds", bgNames);
         save_tree(L"backgrounds", bgNames, 6);
-        uint32_t* bgArr = *(uint32_t**)(base + 0x1E9278);
+        uint32_t* bgArr = *(uint32_t**)(base + 0x1E9094); // verified: dword_5E9094 from serializer
         if (bgArr && bgCnt < 10000) {
             for (uint32_t i = 0; i < bgCnt && i < (uint32_t)bgNames.size(); i++) {
                 if (bgNames[i].empty()) continue;
@@ -992,12 +1087,14 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     // Triggers
     if (!triggerNames.empty()) {
         save_index(L"triggers", triggerNames);
+        svlog("Triggers: count=%u names.size()=%u", triggerCnt, (uint32_t)triggerNames.size());
         uint32_t* tArr = *(uint32_t**)(base + 0x1E92E8);
         if (tArr && triggerCnt < 500) {
             for (uint32_t i = 0; i < triggerCnt && i < (uint32_t)triggerNames.size(); i++) {
-                if (triggerNames[i].empty()) continue;
+                if (triggerNames[i].empty()) { svlog("Trigger[%u]: empty name, skip", i); continue; }
                 void* tObj = (void*)(uintptr_t)tArr[i];
-                if (!tObj) continue;
+                if (!tObj) { svlog("Trigger[%u]: '%s' obj=null, skip", i, triggerNames[i].c_str()); continue; }
+                svlog("Trigger[%u]: '%s' saving...", i, triggerNames[i].c_str());
                 std::wstring wname(triggerNames[i].begin(), triggerNames[i].end());
                 save_trigger(tObj, sub((L"triggers\\" + wname).c_str()));
             }
@@ -1015,7 +1112,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                 void* oObj = (void*)(uintptr_t)oArr[i];
                 if (!oObj) continue;
                 std::wstring wname(objectNames[i].begin(), objectNames[i].end());
-                save_object(oObj, spriteNames, objectNames, triggerNames,
+                save_object(oObj, spriteNames, soundNames, bgNames, pathNames,
+                    scriptNames, fontNames, tlNames, objectNames, roomNames, triggerNames,
                            sub((L"objects\\" + wname).c_str()));
             }
         }

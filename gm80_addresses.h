@@ -105,7 +105,10 @@ struct GM80ResourceGlobals {
 // MainForm pointer stored at base+0x1F0100
 // TMainForm.ResourceTree at MainForm+0x3B8  (verified: same Delphi 7 VCL layout)
 // TMainForm.HelpBtn at MainForm+0x3FC
-#define ADDR_MAINFORM            0x1F0100   // MainForm global pointer
+// MainForm address NOT at 0x1F0100 (runtime null). Need to find via IDA.
+// Try: sub_59ABBC uses Form+0x368 which accesses resource tree component.
+// MainForm might be found via Application.MainForm or at a different RVA.
+//#define ADDR_MAINFORM            0x1F0100   // WRONG — runtime null
 #define OFF_MAINFORM_RESOURCETREE 0x3B8
 #define OFF_MAINFORM_HELPBTN     0x3FC
 #define OFF_MAINFORM_ROOMITEM    0x3B8
