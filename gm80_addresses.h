@@ -94,7 +94,8 @@ struct GM80ResourceGlobals {
 #define ADDR_SETTING_PRODUCT         0x1E9450   // dword_5E9450 → sub_4EA9E4
 #define ADDR_SETTING_COPYRIGHT       0x1E9454   // dword_5E9454 → sub_4EA9E4
 #define ADDR_SETTING_DESCRIPTION     0x1E9458   // dword_5E9458 → sub_4EA9E4
-#define ADDR_SETTINGS_TIMESTAMP      0x1E93A4   // double
+// dbl_5F6240 (verified sub_59DD5C: `dbl_5F6240 = sub_4EA8DC()`)
+#define ADDR_SETTINGS_TIMESTAMP      0x1F6240   // double
 
 // ==== Game ID & Global Settings ====
 #define ADDR_GAME_ID             0x1F6218   // dword_5F6218

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <sstream>
 #include <cstdarg>
+#include <map>
 
 static void svlog(const char* fmt, ...) {
     char path[MAX_PATH], buf[512];
@@ -257,11 +258,9 @@ static void save_path(void* obj, const std::wstring& outPath) {
     // path.txt
     std::string t;
     auto L = [&](const char* k, const std::string& v) { t += k; t += "="; t += v; t += "\n"; };
-    L("connection", to_str(R4(obj, 16)));   // connection kind (0=straight, 1=smooth)
-    L("closed", to_str(R4(obj, 20)));        // closed flag
-    L("precision", to_str(R4(obj, 20)));     // same field? re-check... actually precision at +20 and closed also at +20? Need verification
-    // Actually from IDA: +16=connection kind (byte), +20=precision (int)
-    L("precision", to_str(R4(obj, 20)));
+    L("connection", to_str(R4(obj, 12)));    // +12 connection (sub_5470CC editor copy)
+    L("closed", to_str((uint32_t)*(uint8_t*)((uint8_t*)obj + 16)));  // +16 closed (byte)
+    L("precision", to_str(R4(obj, 20)));     // +20 precision (ctor=4)
     // Room background index
     int roomBg = R4s(obj, 40);
     L("background", roomBg < 0 ? "" : to_str(roomBg));
@@ -385,9 +384,8 @@ static void save_background(void* obj, const std::wstring& outPath) {
     std::string t;
     auto L = [&](const char* k, const std::string& v) { t += k; t += "="; t += v; t += "\n"; };
     L("exists", to_str(exists));
-    // GM80 backgrounds don't have tileset fields like GM81
-    // Default values for tileset (not used in GM80 but needed for format compat)
-    L("tileset", "0");
+    // GM 8.0 does have tileset at +8 (verified sub_5208C4 bg editor copy)
+    L("tileset", to_str((uint32_t)*(uint8_t*)((uint8_t*)obj + 8)));
     L("tile_width", to_str(R4(obj, 12)));
     L("tile_height", to_str(R4(obj, 16)));
     L("tile_hoffset", to_str(R4(obj, 20)));
@@ -412,7 +410,8 @@ static void save_trigger(void* obj, const std::wstring& outPath) {
 }
 
 // -- Timeline --
-static void save_timeline(void* obj, const std::wstring& outPath) {
+static void save_timeline(void* obj, const std::vector<std::string>& objectNames,
+                          const std::wstring& outPath) {
     int momentCount = R4s(obj, 12);
     if (momentCount <= 0 || momentCount > 10000) return;
 
@@ -444,7 +443,8 @@ static void save_timeline(void* obj, const std::wstring& outPath) {
                 int32_t at = R4s(act, 68); // +68 = applies_to
                 if (at == -2) gml += "applies_to=other\n";
                 else if (at == -1) gml += "applies_to=self\n";
-                else if (at >= 0) gml += "applies_to=" + to_str(at) + "\n";
+                else if (at >= 0) gml += "applies_to=" +
+                        ((at < (int)objectNames.size()) ? objectNames[at] : to_str(at)) + "\n";
             }
             int argCount = R4s(act, 32); // +32 = param_count
             switch (kind) {
@@ -606,12 +606,12 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
     // snap at +20/+24, clear at +28/+29 — verified from sub_5480A4 room init
     L("snap_x", to_str(R4(obj, 20)));
     L("snap_y", to_str(R4(obj, 24)));
-    L("isometric", "0");
+    L("isometric", to_str(R1(obj, 28)));      // +28 (verified sub_548360)
     L("roomspeed", to_str(R4(obj, 8)));
-    L("roompersistent", "0");  // TODO: find correct offset
+    L("roompersistent", to_str(R1(obj, 29))); // +29
     L("bg_color", to_str(R4(obj, 32)));
-    L("clear_screen", to_str(R1(obj, 28)));
-    L("clear_view", to_str(R1(obj, 29)));
+    L("clear_screen", to_str(R1(obj, 36)));   // +36
+    L("clear_view", to_str(R1(obj, 37)));     // +37
 
     // 8 backgrounds
     t += "\n";
@@ -716,28 +716,38 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
     }
 
     // Tiles — +760=count, +764=Tile[] inline array (40 bytes each)
-    // Serializer: lea ebp,[esi+esi*4] → ebp*8=esi*40 stride
+    // GM 8.0 Tile layout (GM80_SaveRoom_Individual 0x548C50, 9×u32 + locked byte):
+    //   +0 x, +4 y, +8 source_bg, +12 u, +16 v, +20 width, +24 height,
+    //   +28 depth, +32 id, +36 locked(byte)
+    // Output matches gm82save save_tiles: one <depth>.txt per layer with CSV lines
+    // "bg,x,y,u,v,w,h,locked,1,1,4294967295" + layers.txt (one depth per line).
     int tileCount = R4s(obj, 760);
     uint8_t* tileData = *(uint8_t**)((uint8_t*)obj + 764);
     if (tileData && tileCount > 0 && tileCount < 100000) {
+        std::map<int32_t, std::string> layers; // depth → csv lines
         for (int i = 0; i < tileCount; i++) {
             uint8_t* tile = tileData + i * 40;
-            int bgId = *(int32_t*)(tile + 0);
-            int lx   = *(int32_t*)(tile + 4);
-            int ly   = *(int32_t*)(tile + 8);
-            int tw   = *(int32_t*)(tile + 12);
-            int th   = *(int32_t*)(tile + 16);
-            int tx   = *(int32_t*)(tile + 20);
-            int ty   = *(int32_t*)(tile + 24);
+            int tx    = *(int32_t*)(tile + 0);
+            int ty    = *(int32_t*)(tile + 4);
+            int bgId  = *(int32_t*)(tile + 8);
+            int tu    = *(int32_t*)(tile + 12);
+            int tv    = *(int32_t*)(tile + 16);
+            int tw    = *(int32_t*)(tile + 20);
+            int th    = *(int32_t*)(tile + 24);
             int depth = *(int32_t*)(tile + 28);
-            int tid  = *(int32_t*)(tile + 32);
             bool locked = *(uint8_t*)(tile + 36) != 0;
-            std::string bgName = (bgId >=0 && bgId < (int)bgNames.size()) ? bgNames[bgId] : to_str(bgId);
-            char buf[256];
-            snprintf(buf, 256, "%s,%d,%d,%d,%d,%d,%d,%d,%d,1,1,4294967295\n",
-                     bgName.c_str(), lx, ly, tx, ty, tw, th, locked?1:0, depth);
-            (void)buf; (void)bgName; (void)tid; // TODO: group by depth and write per-layer files
+            std::string bgName = (bgId >= 0 && bgId < (int)bgNames.size()) ? bgNames[bgId] : to_str(bgId);
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%s,%d,%d,%d,%d,%d,%d,%d,1,1,4294967295\n",
+                     bgName.c_str(), tx, ty, tu, tv, tw, th, locked ? 1 : 0);
+            layers[depth] += buf;
         }
+        std::string layerNames;
+        for (auto& kv : layers) {
+            layerNames += to_str(kv.first) + "\n";
+            wf(outPath + L"\\" + std::to_wstring(kv.first) + L".txt", kv.second);
+        }
+        wf(outPath + L"\\layers.txt", layerNames);
     }
 }
 
@@ -931,29 +941,61 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         auto L = [&](const char* k, const std::string& v) { s += std::string(k) + "=" + v + "\n"; };
         L("fullscreen", to_str(GU32(0x1E93B0) != 0));
         L("interpolate_pixels", to_str(GU8(0x1E93B4) != 0));
-        L("dont_draw_border", "0"); L("display_cursor", "1");
+        // GM 8.0 globals verified from GM80_SaveSettings disasm (sub_59E648) +
+        // load sub_59DD5C: B8 border, C0 cursor, E0-E4-E8-EC-F0-F4 bytes,
+        // 9420-942C error/uninit bytes
+        L("dont_draw_border", to_str((unsigned)GU8(0x1E93B8)));
+        L("display_cursor", to_str((unsigned)GU8(0x1E93C0)));
         L("scaling", to_str(GU32(0x1E93CC)));
-        L("allow_resize", "0"); L("window_on_top", "0");
+        L("allow_resize", "0"); L("window_on_top", "0");   // no GM80 global
         L("clear_color", to_str((unsigned)GU8(0x1E93D0)));
-        L("set_resolution", "0");
+        L("set_resolution", "0");                          // no GM80 global
         L("color_depth", to_str(GU32(0x1E93BC)));
         L("resolution", to_str(GU32(0x1E93C4)));
         L("frequency", to_str(GU32(0x1E93C8)));
-        L("dont_show_buttons", "0");
-        L("vsync", "0"); L("swap_creation_events", "0");
-        L("disable_screensaver", "0");
-        L("f4_fullscreen_toggle", "0"); L("f1_help_menu", "0");
-        L("esc_close_game", "1"); L("f5_save_f6_load", "0");
-        L("f9_screenshot", "0"); L("treat_close_as_esc", "0");
-        L("priority", to_str((int)GU8(0x1E93D4)));           // GM80_Priority at 0x5E93D4
-        L("freeze_on_lose_focus", "0");
+        L("dont_show_buttons", to_str((unsigned)GU8(0x1E93E0)));
+        L("vsync", to_str((unsigned)GU8(0x1E93E4)));
+        L("swap_creation_events", "0");                    // no GM80 global
+        L("disable_screensaver", to_str((unsigned)GU8(0x1E93E8)));
+        L("f4_fullscreen_toggle", to_str((unsigned)GU8(0x1E93EC)));
+        L("f1_help_menu", to_str((unsigned)GU8(0x1E93F0)));
+        L("esc_close_game", to_str((unsigned)GU8(0x1E93F4)));
+        L("f5_save_f6_load", "0"); L("f9_screenshot", "0"); // no GM80 globals
+        L("treat_close_as_esc", "0");                      // no GM80 global
+        L("priority", to_str((int)GU8(0x1E93D4)));         // GM80_Priority at 0x5E93D4
+        L("freeze_on_lose_focus", "0");                    // no GM80 global
         L("custom_loader", "0"); L("custom_bar", to_str((int)GU8(0x1E93D8))); // GM80_LoadingBar at 0x5E93D8
         L("bar_has_bg", "0"); L("bar_has_fg", "0");
         L("transparent", "1"); L("translucency", "255"); L("scale_progress_bar", "1");
-        L("show_error_messages", "1"); L("log_errors", "0");
-        L("always_abort", "0"); L("zero_uninitialized_vars", "0");
-        L("error_on_uninitialized_args", "0");
+        L("show_error_messages", to_str((unsigned)GU8(0x1E9420)));
+        L("log_errors", to_str((unsigned)GU8(0x1E9424)));
+        L("always_abort", to_str((unsigned)GU8(0x1E9428)));
+        L("zero_uninitialized_vars", to_str((unsigned)GU8(0x1E942C)));
+        L("error_on_uninitialized_args", "0");             // no GM80 global
         wf(sub(L"settings\\settings.txt"), s);
+
+        // Extensions — settings/extensions.txt (matches gm82save)
+        // GM 8.0 (verified sub_5A80A8/sub_5A7FF0/sub_5A7910):
+        //   0x1E9460 = extension object array (dynamic array), 0x1E9464 = count,
+        //   0x2000BC = loaded flags (dynamic array of bytes — deref the var!);
+        //   extension object +4 = name
+        uint32_t extCnt = *(uint32_t*)((uint8_t*)g_save_base + 0x1E9464);
+        uint32_t* extArr = *(uint32_t**)((uint8_t*)g_save_base + 0x1E9460);
+        uint8_t* extLoaded = *(uint8_t**)((uint8_t*)g_save_base + 0x2000BC);
+        if (extArr && extLoaded && extCnt > 0 && extCnt < 1000) {
+            std::string exts;
+            for (uint32_t i = 0; i < extCnt; i++) {
+                if (extLoaded[i] && extArr[i]) {
+                    char* namePtr = *(char**)((uint8_t*)(uintptr_t)extArr[i] + 4);
+                    if (namePtr) {
+                        uint32_t len = *(uint32_t*)(namePtr - 4);
+                        if (len < 500) exts += std::string(namePtr, len) + "\n";
+                    }
+                }
+            }
+            if (!exts.empty())
+                wf(sub(L"settings\\extensions.txt"), exts);
+        }
     }
 
     // ==== Resource index.yyd + data ====
@@ -1089,7 +1131,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                 void* tlObj = (void*)(uintptr_t)tlArr[i];
                 if (!tlObj) continue;
                 std::wstring wname(tlNames[i].begin(), tlNames[i].end());
-                save_timeline(tlObj, sub((L"timelines\\" + wname + L".gml").c_str()));
+                save_timeline(tlObj, objectNames, sub((L"timelines\\" + wname + L".gml").c_str()));
             }
         }
     }

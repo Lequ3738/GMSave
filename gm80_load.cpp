@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <vector>
+#include <array>
 #include <algorithm>
 
 // PNG decoding via stb_image (single-header, same approach as gm82save's png crate)
@@ -99,7 +100,10 @@ static std::string load_gml(const std::string& code) {
 // Delphi RTL addresses for AnsiString management (verified from IDA)
 #define ADDR_LSTR_FROM_PCHAR_LEN  0x55C4   // sub_4055C4: EAX=output_ptr, EDX=src, ECX=len
 #define ADDR_LSTR_ASG             0x5528   // @LStrAsg: EAX=dest, EDX=src (refcounted assign)
-#define ADDR_LSTR_CLR             0x47E8   // @LStrClr: EAX=ptr_to_string (free)
+#define ADDR_LSTR_CLR             0x54D4   // @LStrClr: EAX=ptr_to_string (free)
+                                           // VERIFIED 0x4054D4: clears *EAX first, then
+                                           // decrements refcount (-1 literal = skip free).
+                                           // (0x4047E8 was a nullsub — never freed!)
 
 // Create Delphi AnsiString from C string using Delphi RTL (@LStrFromPCharLen)
 static char* make_delphi_str(const char* cstr) {
@@ -289,6 +293,10 @@ static void write_glob_str(uint32_t off, const std::string& val) {
 
 // Look up a name in an index map
 static int name_to_index(const std::vector<std::string>& names, const std::string& name) {
+    // Empty name = no reference (GM 8.0 semantics: -1 for "none"). index.yyd may
+    // contain blank lines for empty array slots; matching those would write the
+    // slot index instead of -1 (e.g. objPlayer parent=27 from a blank line).
+    if (name.empty()) return -1;
     for (size_t i = 0; i < names.size(); i++)
         if (names[i] == name) return (int)i;
     return -1;
@@ -322,8 +330,8 @@ static ResInfo s_resInfo[] = {
     {0x1E92D4, 0x1E92DC, 0x1E92E4, 0x159B9C, 0x159C2C, "scripts", 7, 0},
     // kind=9: fonts     arr=0x1E92C0 name=0x1E92C8 cnt=0x1E92D0 off_55742C
     {0x1E92C0, 0x1E92C8, 0x1E92D0, 0x15742C, 0x157A78, "fonts", 9, 0},
-    // kind=12: timelines arr=0x1E9300 name=0x1E9308 cnt=0x1E9310 (VMT/ctor TBD)
-    {0x1E9300, 0x1E9308, 0x1E9310, 0x159B9C, 0x159C2C, "timelines", 12, 0},
+    // kind=12: timelines arr=0x1E9300 name=0x1E9308 cnt=0x1E9310 off_559298
+    {0x1E9300, 0x1E9308, 0x1E9310, 0x159298, 0x1593D4, "timelines", 12, 0},
     // kind=1: objects   arr=0x1E9354 name=0x1E935C cnt=0x1E9364 off_596CE0
     {0x1E9354, 0x1E935C, 0x1E9364, 0x196CE0, 0x196D70, "objects", 1, 0},
     // kind=4: rooms     arr=0x1E9294 name=0x1E929C cnt=0x1E92A4 off_547D00
@@ -540,13 +548,25 @@ static void load_settings(const fs::path& root) {
     parse_kv(txt, [&](auto& k, auto& v) {
         if (k == "fullscreen") write_glob_bool(ADDR_SETTING_FULLSCREEN, v=="1");
         else if (k == "interpolate_pixels") write_glob_bool(ADDR_SETTING_INTERPOLATE, v=="1");
+        else if (k == "dont_draw_border") write_glob_u8(0x1E93B8, (uint8_t)std::stoul(v));   // byte_5E93B8
+        else if (k == "display_cursor") write_glob_u8(0x1E93C0, (uint8_t)std::stoul(v));     // byte_5E93C0
         else if (k == "color_depth") write_glob_u32(ADDR_SETTING_COLOR_DEPTH, (uint32_t)std::stoul(v));
         else if (k == "resolution") write_glob_u32(ADDR_SETTING_RESOLUTION, (uint32_t)std::stoul(v));
         else if (k == "frequency") write_glob_u32(ADDR_SETTING_FREQUENCY, (uint32_t)std::stoul(v));
         else if (k == "scaling") write_glob_i32(ADDR_SETTING_SCALING, std::stoi(v));
         else if (k == "clear_color") write_glob_u8(ADDR_SETTING_CLEAR_COLOR, (uint8_t)std::stoul(v));
+        else if (k == "dont_show_buttons") write_glob_u8(0x1E93E0, (uint8_t)std::stoul(v));  // byte_5E93E0
+        else if (k == "vsync") write_glob_u8(0x1E93E4, (uint8_t)std::stoul(v));              // byte_5E93E4
+        else if (k == "disable_screensaver") write_glob_u8(0x1E93E8, (uint8_t)std::stoul(v));// byte_5E93E8
+        else if (k == "f4_fullscreen_toggle") write_glob_u8(0x1E93EC, (uint8_t)std::stoul(v));// byte_5E93EC
+        else if (k == "f1_help_menu") write_glob_u8(0x1E93F0, (uint8_t)std::stoul(v));       // byte_5E93F0
+        else if (k == "esc_close_game") write_glob_u8(0x1E93F4, (uint8_t)std::stoul(v));     // byte_5E93F4
         else if (k == "priority") write_glob_u8(ADDR_SETTING_PRIORITY, (uint8_t)std::stoul(v));
         else if (k == "loading_bar") write_glob_u8(ADDR_SETTING_LOADING_BAR, (uint8_t)std::stoul(v));
+        else if (k == "show_error_messages") write_glob_u8(0x1E9420, (uint8_t)std::stoul(v));// byte_5E9420
+        else if (k == "log_errors") write_glob_u8(0x1E9424, (uint8_t)std::stoul(v));         // byte_5E9424
+        else if (k == "always_abort") write_glob_u8(0x1E9428, (uint8_t)std::stoul(v));       // byte_5E9428
+        else if (k == "zero_uninitialized_vars") write_glob_u8(0x1E942C, (uint8_t)std::stoul(v)); // byte_5E942C
     });
 
     // Load constants
@@ -573,6 +593,41 @@ static void load_settings(const fs::path& root) {
             for (uint32_t i = 0; i < cnt; i++) {
                 if (nameArr) nameArr[i] = (uint32_t)(uintptr_t)make_delphi_str(names[i]);
                 if (valArr)  valArr[i]  = (uint32_t)(uintptr_t)make_delphi_str(values[i]);
+            }
+        }
+    }
+}
+
+// ==== Load extensions (settings/extensions.txt → loaded flags) ====
+// GM 8.0 (verified sub_5A80A8 name lookup + sub_5A7FF0 loaded check +
+// sub_5A7910 init: SetLength(&0x6000BC, n) → dword_6000BC is a Delphi
+// dynamic array VARIABLE holding the element pointer):
+//   0x1E9460 = extension object array (dynamic array), 0x1E9464 = count,
+//   0x2000BC = loaded flags (dynamic array of bytes)
+// Extension object: +4 = name (AnsiString). Same semantics as gm82save
+// load_extensions: match name → set loaded → GM shows it in the tree.
+static void load_extensions(const fs::path& root) {
+    std::string txt = read_file(root / "settings" / "extensions.txt");
+    if (txt.empty()) return;
+    uint8_t* b = (uint8_t*)g_load_base;
+    uint32_t cnt = *(uint32_t*)(b + 0x1E9464);
+    uint32_t* arr = *(uint32_t**)(b + 0x1E9460);
+    uint8_t* flags = *(uint8_t**)(b + 0x2000BC); // deref the dynamic array var!
+    if (!arr || !flags || cnt == 0 || cnt > 1000) return;
+    std::istringstream ss(txt);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+        for (uint32_t i = 0; i < cnt; i++) {
+            uint32_t obj = arr[i];
+            if (!obj) continue;
+            char* namePtr = *(char**)((uint8_t*)(uintptr_t)obj + 4);
+            if (!namePtr) continue;
+            uint32_t len = *(uint32_t*)(namePtr - 4);
+            if (len > 500) continue;
+            if (std::string(namePtr, len) == line) {
+                flags[i] = 1; // loaded flag
+                break;
             }
         }
     }
@@ -870,9 +925,9 @@ static void* load_bg_obj(const std::string& name, const fs::path& bgDir) {
 }
 
 // ==== Load path ====
-// GM 8.0 layout (verified from sub_5470CC editor copy + GM80_Path_Create):
+// GM 8.0 layout (verified from sub_5470CC editor copy — identical to GM 8.1):
 //   +4 points (DelphiList dynamic array, 24 bytes/point: x/y/speed doubles),
-//   +8 point_count, +12 ?, +16 connection(byte), +20 precision,
+//   +8 point_count, +12 connection(u32), +16 closed(byte), +20 precision,
 //   +40 room_bg (i32, -1), +44 snap_x, +48 snap_y
 // Name lives in the parallel name array (load_assets_simple).
 static void* load_path_obj(const std::string& name, const fs::path& pathDir) {
@@ -887,8 +942,11 @@ static void* load_path_obj(const std::string& name, const fs::path& pathDir) {
     void* pp = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!pp) return nullptr;
 
+    // +12 connection (sub_5470CC: *(a1+12)=*(a2+12)), +16 closed (byte),
+    // +20 precision (ctor=4)
     parse_kv(txt, [&](auto& k, auto& v) {
-        if (k == "connection") set_obj_u32(pp, 16, (uint32_t)std::stoul(v));
+        if (k == "connection") set_obj_u32(pp, 12, (uint32_t)std::stoul(v));
+        else if (k == "closed") set_obj_bool(pp, 16, v == "1");
         else if (k == "precision") set_obj_u32(pp, 20, (uint32_t)std::stoul(v));
         else if (k == "background") set_obj_i32(pp, 40, v.empty() ? -1 : std::stoi(v));
         else if (k == "snap_x") set_obj_u32(pp, 44, (uint32_t)std::stoul(v));
@@ -930,11 +988,338 @@ static void* load_path_obj(const std::string& name, const fs::path& pathDir) {
         }
     }
 
+    // Regenerate the spline table (+24 spline array / +28 count / +32 length):
+    // GM 8.0 loads .gmk paths then calls sub_547030 (RVA 0x147030), which
+    // builds Catmull-Rom (connection=0) or linear (connection=1) spline data
+    // from the points array. Without it the path editor draws no connecting
+    // line (v52 = +32/4 == 0 in sub_555324) and the interpolator sub_547528
+    // always returns the first point. Same call is made by the editor copy
+    // function sub_5470CC, so this must run on the loaded object too.
+    {
+        uint8_t* b = glob_base();
+        uint32_t fn = (uint32_t)b + 0x147030;
+        __asm {
+            mov eax, pp
+            call fn
+        }
+    }
+
     return pp;
 }
 
+static std::vector<std::string> load_names(const fs::path& idxPath); // defined below
+
+// ==== Object events (object.gml → Event/Action Delphi objects) ====
+// GM 8.0 (verified from sub_4F1A18/sub_59713C/GM80_Event_AddAction):
+//   Event: +4 actions (DelphiList), +8 action_count
+//   Event ctor: sub_4F1A18(off_4F1978 value, 1, &tmp)
+//   AddAction: GM80_Event_AddAction(event, 0, 0) — handles SetLength + ctor
+// GM 8.0 Action: +4 lib_id, +8 id, +12 kind, +16 can_be_relative(byte),
+//   +17 is_condition, +18 applies_to_something, +20 execution_type,
+//   +24 fn_name(str), +28 fn_code(str), +32 param_count,
+//   +36..+68 param_types[8], +68 applies_to, +72 is_relative(byte),
+//   +76..+108 param_strings[8], +108 invert_condition(byte)
+static void* make_event() {
+    uint8_t* b = glob_base();
+    uint32_t cls = *(uint32_t*)(b + 0xF1978); // off_4F1978 = Event class ref
+    uint32_t fn = (uint32_t)b + 0xF1A18;      // sub_4F1A18
+    uint32_t tmp = 0;
+    void* ev = nullptr;
+    __asm {
+        mov eax, cls
+        mov edx, 1
+        lea ecx, tmp
+        call fn
+        mov ev, eax
+    }
+    if (!ev || ev == (void*)cls) gm80l_log("make_event FAILED cls=0x%X", cls);
+    return ev;
+}
+
+static void* event_add_action(void* ev) {
+    uint8_t* b = glob_base();
+    uint32_t fn = (uint32_t)b + 0xF1BA4;      // GM80_Event_AddAction
+    void* act = nullptr;
+    __asm {
+        mov eax, ev
+        xor edx, edx
+        xor ecx, ecx
+        call fn
+        mov act, eax
+    }
+    return act;
+}
+
+// YYD ACTION token that separates action blocks (same as save side)
+static const char* const ACTION_TOKEN = "/*\"/*'/**//* YYD ACTION";
+
+// Manual equivalent of GM80_Action_FillIn (0x5A6620): copy the action-library
+// template's defaults into the action. GM's own FillIn is unusable during
+// our load — it raises STATUS_PRIVILEGED_INSTRUCTION (0xC0000096) inside the
+// library search, swallowed by SEH — so replicate its field copies in pure
+// C++. Layouts verified from FillIn's asm: library array at base+0x209D08
+// (array body, count at base+0x1E9468), library object +8 id / +0x2C action
+// count / +0x30 action array, template +8 id / +0x28 kind / +0x32
+// can_be_relative / +0x30 is_condition / +0x31 applies_to_something /
+// +0xB8 execution_type / +0x34 param_count / +0x58+4i param_types.
+// Mirrors gm82save's Action::fill_in — the template's action_kind is
+// authoritative: Execute Code is kind 7 even with empty code.
+static bool gm80_action_fill_in(void* act, uint32_t libId, uint32_t actId) {
+    uint8_t* b = (uint8_t*)g_load_base;
+    if (!b || !act) return false;
+    uint32_t libCnt = *(uint32_t*)(b + 0x1E9468);
+    uint32_t* libs = (uint32_t*)(b + 0x209D08);
+    if (libCnt == 0 || libCnt > 64) return false;
+    for (uint32_t li = 0; li < libCnt; li++) {
+        uint32_t lpv = libs[li];
+        if (!lpv || IsBadReadPtr((void*)lpv, 0x100)) continue;
+        uint8_t* lib = (uint8_t*)(uintptr_t)lpv;
+        if (*(uint32_t*)(lib + 8) != libId) continue;
+        uint32_t acnt = *(uint32_t*)(lib + 44);
+        if (acnt == 0 || acnt > 4096) continue;
+        uint32_t* acts = *(uint32_t**)(lib + 48);
+        if (!acts || IsBadReadPtr(acts, acnt * 4)) continue;
+        for (uint32_t ai = 0; ai < acnt; ai++) {
+            uint8_t* tpl = (uint8_t*)(uintptr_t)acts[ai];
+            if (!tpl || IsBadReadPtr(tpl, 0xC8)) continue;
+            if (*(uint32_t*)(tpl + 8) != actId) continue;
+            // Found — copy the fields FillIn would copy:
+            set_obj_u32(act, 12, *(uint32_t*)(tpl + 40));      // action_kind
+            set_obj_bool(act, 16, *(uint8_t*)(tpl + 50) != 0); // can_be_relative
+            set_obj_bool(act, 17, *(uint8_t*)(tpl + 48) != 0); // is_condition
+            set_obj_bool(act, 18, *(uint8_t*)(tpl + 49) != 0); // applies_to_something
+            set_obj_u32(act, 20, *(uint32_t*)(tpl + 184));     // execution_type
+            set_obj_u32(act, 32, *(uint32_t*)(tpl + 52));      // param_count
+            for (int i = 0; i < 8; i++)
+                set_obj_u32(act, 36 + i * 4, *(uint32_t*)(tpl + 88 + i * 4)); // param_types
+            return true;
+        }
+    }
+    return false;
+}
+
+// SEH wrapper for FillIn — must be its own function: __try cannot coexist
+// with C++ objects needing unwinding. The library-template search AVs when
+// GM hasn't built the library array yet; catch it here so GM's SEH never
+// sees it (it would swallow the whole load as "corrupt file").
+static bool fill_in_safe(void* act, uint32_t libId, uint32_t actId) {
+    __try {
+        return gm80_action_fill_in(act, libId, actId);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gm80l_log("fill_in_safe: AV code=0x%X lib=%u id=%u act=0x%X",
+                  GetExceptionCode(), libId, actId, (uint32_t)act);
+        return false;
+    }
+}
+
+// Dump the action-library state for diagnostics. The library array lives AT
+// base+0x209D08 (sub_5A95C8 walks it with `mov ebx, offset dword_609D08;
+// mov eax, [ebx]` — the array body starts there, NOT a pointer to it).
+static void dump_action_libraries(const char* where) {
+    uint8_t* lb = (uint8_t*)g_load_base;
+    uint32_t libCnt = *(uint32_t*)(lb + 0x1E9468);
+    uint32_t* libs = (uint32_t*)(lb + 0x209D08);
+    gm80l_log("%s: libCnt=%u", where, libCnt);
+    if (libCnt > 0 && libCnt < 64) {
+        for (uint32_t li = 0; li < libCnt && li < 8; li++) {
+            uint32_t lpv = libs[li];
+            if (!lpv || IsBadReadPtr((void*)lpv, 0x100)) {
+                gm80l_log("%s: lib[%u]=0x%X <bad>", where, li, lpv);
+                continue;
+            }
+            uint8_t* lib = (uint8_t*)(uintptr_t)lpv;
+            gm80l_log("%s: lib[%u]=0x%X vmt=0x%X id=%u actCnt=%u",
+                      where, li, lpv, *(uint32_t*)lib, *(uint32_t*)(lib + 8),
+                      *(uint32_t*)(lib + 44));
+        }
+    }
+}
+
+// Parse YYD ACTION blocks from a body string into an Event (shared by
+// objects and timelines). Matches gm82save's load_event + save side format.
+static void parse_actions_into_event(void* ev, const std::string& body,
+                                     const std::vector<std::string>& objectNames) {
+    std::string b = body;
+    size_t pos = 0;
+    while ((pos = b.find(ACTION_TOKEN, pos)) != std::string::npos) {
+        pos += strlen(ACTION_TOKEN);
+        size_t end = b.find("*/\n", pos);
+        std::string block = b.substr(pos, (end == std::string::npos) ? std::string::npos : end - pos);
+        pos = (end == std::string::npos) ? b.size() : end + 3;
+        std::string codeAfter;
+        if (end != std::string::npos) {
+            size_t nl = b.find_first_not_of("\r\n", end + 3);
+            if (nl != std::string::npos) {
+                size_t nextTok = b.find(ACTION_TOKEN, nl);
+                codeAfter = b.substr(nl, (nextTok == std::string::npos) ? std::string::npos : nextTok - nl);
+            }
+        }
+        void* act = event_add_action(ev);
+        gm80l_log("parse_actions: ev=0x%X act=0x%X block='%s'",
+                  (uint32_t)ev, (uint32_t)act,
+                  block.substr(0, 80).c_str());
+        if (!act) continue;
+
+        // Phase 1: lib_id/action_id first, then fill in the action-library
+        // template (gm82save: action.fill_in after action_id is parsed).
+        uint32_t libId = 0, actionId = 0;
+        parse_kv(block, [&](auto& k, auto& v) {
+            if (k == "lib_id") libId = (uint32_t)std::stoul(v);
+            else if (k == "action_id") actionId = (uint32_t)std::stoul(v);
+        });
+        gm80l_log("parse_actions: fill_in(act=0x%X lib=%u id=%u)", (uint32_t)act, libId, actionId);
+        if (libId == 1 && actionId == 603) {
+            dump_action_libraries("lib state @ first 603");
+            // Deep: dump action ids of the first id==1 library's action array
+            // (sub_4EB6F8 reads lib+0x2C count / lib+0x30 array).
+            uint8_t* lb = (uint8_t*)g_load_base;
+            uint32_t* libs = (uint32_t*)(lb + 0x209D08);
+            uint32_t lpv = libs[0];
+            if (lpv && !IsBadReadPtr((void*)lpv, 0x200)) {
+                uint8_t* lib = (uint8_t*)(uintptr_t)lpv;
+                uint32_t acnt = *(uint32_t*)(lib + 44);
+                uint32_t* acts = *(uint32_t**)(lib + 48);
+                std::string ids;
+                for (uint32_t ai = 0; ai < acnt && ai < 60; ai++) {
+                    if (!acts[ai] || IsBadReadPtr((void*)acts[ai], 0x80)) {
+                        ids += " <bad@";
+                        ids += std::to_string(ai);
+                        ids += ">";
+                        continue;
+                    }
+                    ids += std::to_string(*(uint32_t*)((uint8_t*)(uintptr_t)acts[ai] + 8)) + ",";
+                }
+                gm80l_log("lib deep: lib0 actCnt=%u ids=[%s]", acnt, ids.c_str());
+            }
+        }
+        bool templFound = false;
+        if (libId != 0 || actionId != 0) {
+            set_obj_u32(act, 4, libId);
+            set_obj_u32(act, 8, actionId);
+            templFound = fill_in_safe(act, libId, actionId);
+        }
+        gm80l_log("parse_actions: fill_in RET tpl=%d kind=%u pcnt=%u flags=%u,%u,%u",
+                  templFound ? 1 : 0, *(uint32_t*)((uint8_t*)act + 12),
+                  *(uint32_t*)((uint8_t*)act + 32), *(uint8_t*)((uint8_t*)act + 16),
+                  *(uint8_t*)((uint8_t*)act + 17), *(uint8_t*)((uint8_t*)act + 18));
+        // Do NOT run the post-init template param copy (0x5A6714): the
+        // library template's param_strings for unused slots can be garbage,
+        // and GM's action validator (sub_5A6B60, run by the post-load object
+        // refresh) reads every param up to param_count — a copied garbage
+        // pointer crashes it. Match the native .gmk loader instead: write
+        // every slot explicitly, empty when absent. (The raw-constructor init
+        // already set +68=applies_to:self, +72/+108=0 and "0"-default params;
+        // the +72/+108/+68 keys below overwrite their fields as needed.)
+        for (int j = 0; j < 8; j++) set_obj_str(act, 76 + j * 4, "");
+        if (libId == 1 && (actionId == 603 || actionId == 604)) {
+            char* pstr = *(char**)((uint8_t*)act + 76);
+            gm80l_log("parse_actions: after clear p0='%.40s'", pstr ? pstr : "(nil)");
+        }
+
+        // Phase 2: remaining keys override the template defaults, in file
+        // order. can_be_relative / applies_to_something come from the
+        // template (gm82save parity); the keys only touch their own fields.
+        bool hasRepeats = false, hasVar = false;
+        bool pset[8] = { false };
+        std::string pstrs[8];
+        int pcount = 0;
+        parse_kv(block, [&](auto& k, auto& v) {
+            if (k == "lib_id" || k == "action_id") return;
+            if (k == "relative") {
+                set_obj_bool(act, 72, v == "1");
+                if (!templFound) set_obj_bool(act, 16, true);
+            } else if (k == "applies_to") {
+                if (!templFound) set_obj_bool(act, 18, true);
+                if (v == "other") set_obj_i32(act, 68, -2);
+                else if (v == "self") set_obj_i32(act, 68, -1);
+                else if (v.empty()) set_obj_i32(act, 68, -4);
+                else set_obj_i32(act, 68, name_to_index(objectNames, v));
+            } else if (k == "invert") set_obj_bool(act, 108, v == "1");
+            else if (k == "repeats") { hasRepeats = true; pset[0] = true; pstrs[0] = v; if (pcount < 1) pcount = 1; }
+            else if (k == "var_name") { hasVar = true; pset[0] = true; pstrs[0] = v; if (pcount < 1) pcount = 1; }
+            else if (k == "var_value") { pset[1] = true; pstrs[1] = v; if (pcount < 2) pcount = 2; }
+            else if (k.size() >= 3 && k[0] == 'a' && k[1] == 'r' && k[2] == 'g') {
+                int j = std::atoi(k.c_str() + 3);
+                if (j >= 0 && j < 8) { pset[j] = true; pstrs[j] = v; if (j + 1 > pcount) pcount = j + 1; }
+            }
+        });
+        // Write params that appeared in the block — empty values included: an
+        // explicit `arg0=` must override the template default; a missing arg
+        // keeps the template's default (gm82save parity).
+        for (int j = 0; j < 8; j++)
+            if (pset[j]) set_obj_str(act, 76 + j * 4, decode_delimit(pstrs[j]));
+
+        // action_kind: the template's value when the action is known (never
+        // inferred); structural inference only for unknown actions.
+        uint32_t kind;
+        if (templFound) {
+            kind = *(uint32_t*)((uint8_t*)act + 12);
+        } else {
+            kind = hasRepeats ? 5 : hasVar ? 6 : 0;
+            if (kind == 0 && !codeAfter.empty() &&
+                codeAfter.find_first_not_of(" \r\n\t") != std::string::npos)
+                kind = 7;
+            set_obj_u32(act, 12, kind);
+            set_obj_u32(act, 32, (uint32_t)pcount);
+        }
+        // Code actions: the text after `*/` is the code. Always stored, even
+        // when empty — the library default "0" (copied in by the init when no
+        // template matches, and sitting in the template's own code slot
+        // otherwise) would otherwise be compiled as code and fail with
+        // "Variable name expected".
+        if (kind == 7) set_obj_str(act, 76, load_gml(codeAfter));
+        {
+            char* pstr = *(char**)((uint8_t*)act + 76);
+            std::string p0 = (pstr && !IsBadReadPtr(pstr, 4)) ? std::string(pstr) : "<bad>";
+            gm80l_log("parse_actions: action done kind=%u p0='%.40s'", kind, p0.c_str());
+        }
+    }
+}
+
+// Parse "#define EventName_N" → (eventType 0..11, index)
+static int parse_event_header(const std::string& line, int& evIndex) {
+    static const char* evNames[] = {"Create","Destroy","Alarm","Step","Collision",
+        "Keyboard","Mouse","Other","Draw","KeyPress","KeyRelease","Trigger"};
+    std::string hdr = line;
+    size_t p = hdr.find("#define ");
+    if (p == std::string::npos) return -1;
+    std::string evName = hdr.substr(p + 8);
+    // trim \r
+    while (!evName.empty() && (evName.back() == '\r' || evName.back() == ' ')) evName.pop_back();
+    size_t us = evName.find_last_of('_');
+    std::string base = (us == std::string::npos) ? evName : evName.substr(0, us);
+    std::string num  = (us == std::string::npos) ? "" : evName.substr(us + 1);
+    for (int i = 0; i < 12; i++) {
+        if (base == evNames[i]) {
+            evIndex = num.empty() ? 0 : std::atoi(num.c_str());
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Append an Event to the object's event dynamic array at +28 + evType*4.
+// Every slot gets a real Event (GM's own loader fills all slots with
+// sub_4F1A18 — null slots crash the editor's event copy, sub_4F1A98).
+static void obj_add_event(void* obj, int evType, int evIndex, void* ev) {
+    uint32_t off = 28 + evType * 4;
+    void*** arrPtr = (void***)((uint8_t*)obj + off);
+    void** arr = *arrPtr;
+    uint32_t len = arr ? *(uint32_t*)((uint8_t*)arr - 4) : 0;
+    uint32_t need = (uint32_t)(evIndex + 1);
+    uint32_t newLen = (need > len) ? need : len;
+    void* mem = delphi_alloc(8 + newLen * 4);
+    if (!mem) return;
+    *(uint32_t*)mem = 1;
+    *(uint32_t*)((uint8_t*)mem + 4) = newLen;
+    void** dst = (void**)((uint8_t*)mem + 8);
+    for (uint32_t i = 0; i < len; i++) dst[i] = arr[i];
+    for (uint32_t i = len; i < newLen; i++) dst[i] = (i == (uint32_t)evIndex) ? ev : make_event();
+    set_obj_ptr(obj, off, dst);
+}
+
 // ==== Load object ====
-// GM 8.0 layout (verified via save_object):
+// GM 8.0 layout (verified via save_object + sub_596F90):
 //   +4 sprite_idx, +8 solid(byte), +9 visible(byte), +12 depth,
 //   +16 persistent(byte), +20 parent_idx, +24 mask_idx,
 //   +28..+72: 12 event dynamic arrays (one per event type, 4 bytes each)
@@ -947,7 +1332,7 @@ static void* load_object(const std::string& name, const fs::path& objDir,
     if (!ri) return nullptr;
 
     fs::path subDir = objDir / name;
-    fs::path txtPath = subDir / "object.txt";
+    fs::path txtPath = objDir / (name + ".txt");  // flat layout (gm82save: set_extension("txt"))
     std::string txt = read_file(txtPath);
 
     void* obj = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
@@ -963,19 +1348,149 @@ static void* load_object(const std::string& name, const fs::path& objDir,
         else if (k == "mask") set_obj_i32(obj, 24, name_to_index(spriteNames, v));
     });
 
-    // Events (object.gml → Event/Action Delphi objects) — TODO next step:
-    // each event type is a Delphi dynamic array at +28 + evType*4
-    // (ptr to Event*[n], length at ptr-4); Event: +4 Action*[], +8 count.
+    // Events from <name>.gml (save side writes flat objects/<name>.gml)
+    fs::path gmlPath = objDir / (name + ".gml");
+    std::string gml = read_file(gmlPath);
+    if (gml.empty()) return obj;
+
+    // Split into #define sections
+    std::istringstream gss(gml);
+    std::string line, curName;
+    std::vector<std::pair<std::string, std::string>> sections; // (event name, body)
+    std::string curBody;
+    auto flushSection = [&]() {
+        if (!curName.empty()) sections.emplace_back(curName, curBody);
+        curBody.clear();
+    };
+    while (std::getline(gss, line)) {
+        if (line.find("#define ") == 0) {
+            flushSection();
+            curName = line;
+        } else {
+            curBody += line + "\n";
+        }
+    }
+    flushSection();
+
+    for (auto& sec : sections) {
+        int evIndex = 0;
+        int evType = parse_event_header(sec.first, evIndex);
+        if (evType < 0) continue;
+        // For Collision (4) and Trigger (11), the index is an object/trigger
+        // name in save format — resolve to index
+        if (evType == 4) {
+            std::string num = sec.first.substr(sec.first.find("Collision_") + 10);
+            while (!num.empty() && (num.back() == '\r' || num.back() == ' ')) num.pop_back();
+            evIndex = name_to_index(objectNames, num);
+            if (evIndex < 0) evIndex = std::atoi(num.c_str());
+        } else if (evType == 11) {
+            auto trigNames = load_names(objDir.parent_path() / "triggers" / "index.yyd");
+            std::string num = sec.first.substr(sec.first.find("Trigger_") + 8);
+            while (!num.empty() && (num.back() == '\r' || num.back() == ' ')) num.pop_back();
+            evIndex = name_to_index(trigNames, num);
+            if (evIndex < 0) evIndex = std::atoi(num.c_str());
+        }
+
+        void* ev = make_event();
+        if (!ev) continue;
+
+        // Parse YYD ACTION blocks within the section
+        gm80l_log("parse_actions: obj=%s ev=0x%X event='%s' bodyLen=%u",
+                  name.c_str(), (uint32_t)ev, sec.first.c_str(),
+                  (uint32_t)sec.second.size());
+        parse_actions_into_event(ev, sec.second, objectNames);
+
+        // Place event at its index in the type's sparse array
+        obj_add_event(obj, evType, evIndex, ev);
+    }
 
     return obj;
 }
 
+// ==== Load timeline ====
+// GM 8.0 layout (verified from sub_562468 + save side):
+//   +4 moment_events (DelphiList<Event*>), +8 moment_times (DelphiList<u32>),
+//   +12 moment_count. VMT off_559298, ctor sub_5593D4.
+static void* load_timeline(const std::string& name, const fs::path& tlDir) {
+    const ResInfo* ri = find_res("timelines");
+    if (!ri) return nullptr;
+
+    fs::path gmlPath = tlDir / (name + ".gml");
+    std::string gml = read_file(gmlPath);
+
+    void* tl = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
+    if (!tl) return nullptr;
+
+    // Parse "#define <time>" sections (each = one moment with actions)
+    std::vector<uint32_t> times;
+    std::vector<void*> events;
+    std::istringstream ss(gml);
+    std::string line, curBody;
+    uint32_t curTime = 0;
+    bool haveTime = false;
+    auto flushMoment = [&]() {
+        if (!haveTime) return;
+        void* ev = make_event();
+        if (ev) {
+            auto objNames = load_names(tlDir.parent_path() / "objects" / "index.yyd");
+            parse_actions_into_event(ev, curBody, objNames);
+            times.push_back(curTime);
+            events.push_back(ev);
+        }
+        curBody.clear();
+        haveTime = false;
+    };
+    while (std::getline(ss, line)) {
+        if (line.find("#define ") == 0) {
+            flushMoment();
+            curTime = (uint32_t)std::stoul(line.substr(8));
+            haveTime = true;
+        } else {
+            curBody += line + "\n";
+        }
+    }
+    flushMoment();
+
+    if (!times.empty()) {
+        // moments at +8 (DelphiList<u32> with manual header)
+        void* mem = delphi_alloc(8 + times.size() * 4);
+        if (mem) {
+            *(uint32_t*)mem = 1;
+            *(uint32_t*)((uint8_t*)mem + 4) = (uint32_t)times.size();
+            uint32_t* dst = (uint32_t*)((uint8_t*)mem + 8);
+            for (size_t i = 0; i < times.size(); i++) dst[i] = times[i];
+            set_obj_ptr(tl, 8, dst);
+        }
+        // events at +4 (DelphiList<Event*> with manual header)
+        mem = delphi_alloc(8 + events.size() * 4);
+        if (mem) {
+            *(uint32_t*)mem = 1;
+            *(uint32_t*)((uint8_t*)mem + 4) = (uint32_t)events.size();
+            void** dst = (void**)((uint8_t*)mem + 8);
+            for (size_t i = 0; i < events.size(); i++) dst[i] = events[i];
+            set_obj_ptr(tl, 4, dst);
+        }
+        set_obj_u32(tl, 12, (uint32_t)times.size());
+    }
+
+    return tl;
+}
+
+// Fill room instances/tiles after the room object exists
+// (defined before load_room_obj; see below for layout notes)
+static void load_room_instances(void* rm, const fs::path& subDir,
+    const std::vector<std::string>& objectNames,
+    const std::vector<std::string>& bgNames);
+
 // ==== Load room ====
-// GM 8.0 layout (verified via save_room, sub_5480A4):
+// GM 8.0 layout (verified via sub_548360, save_room, sub_5480A4):
 //   +4 caption/name (AnsiString), +8 roomspeed, +12 width, +16 height,
-//   +20 snap_x, +24 snap_y, +28 clear_screen(byte), +29 clear_view(byte),
-//   +32 bg_color, +40..+296: 8×32 RoomBackground, +296 views_enabled(byte),
-//   +300..+748: 8×56 View, +772 remember(byte), +776 editor_width, +780 editor_height
+//   +20/+24 snap, +28 isometric(byte), +29 persistent(byte), +32 bg_color,
+//   +36 clear_screen(byte), +37 clear_view(byte),
+//   +40..+296: 8×32 RoomBackground, +296 views_enabled(byte),
+//   +300..+748: 8×56 View, +752 instance_count, +756 instances array,
+//   +760 tile_count, +764 tiles array, +768 remember(byte),
+//   +772 editor_width, +776 editor_height
 static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     const std::vector<std::string>& objectNames,
     const std::vector<std::string>& bgNames)
@@ -990,16 +1505,21 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     void* rm = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!rm) return nullptr;
 
-    set_obj_str(rm, 4, name); // room name == caption
+    // GM 8.0 layout (verified from sub_548360 loader + GM80_SaveRoom_Individual):
+    // +4 caption, +8 speed, +12 width, +16 height, +20/+24 snap, +28 isometric,
+    // +29 persistent, +32 bg_color, +36 clear_screen, +37 clear_view
     parse_kv(txt, [&](auto& k, auto& v) {
-        if (k == "roomspeed") set_obj_u32(rm, 8, (uint32_t)std::stoul(v));
+        if (k == "caption") set_obj_str(rm, 4, v);
+        else if (k == "roomspeed") set_obj_u32(rm, 8, (uint32_t)std::stoul(v));
         else if (k == "width") set_obj_u32(rm, 12, (uint32_t)std::stoul(v));
         else if (k == "height") set_obj_u32(rm, 16, (uint32_t)std::stoul(v));
         else if (k == "snap_x") set_obj_u32(rm, 20, (uint32_t)std::stoul(v));
         else if (k == "snap_y") set_obj_u32(rm, 24, (uint32_t)std::stoul(v));
-        else if (k == "clear_screen") set_obj_bool(rm, 28, v == "1");
-        else if (k == "clear_view") set_obj_bool(rm, 29, v == "1");
+        else if (k == "isometric") set_obj_bool(rm, 28, v == "1");
+        else if (k == "roompersistent") set_obj_bool(rm, 29, v == "1");
         else if (k == "bg_color") set_obj_u32(rm, 32, (uint32_t)std::stoul(v));
+        else if (k == "clear_screen") set_obj_bool(rm, 36, v == "1");
+        else if (k == "clear_view") set_obj_bool(rm, 37, v == "1");
     });
 
     // 8 room backgrounds at +40, 32 bytes each (see save_room for layout)
@@ -1067,9 +1587,139 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
         });
     }
 
-    // Instances/tiles (instances.txt, layers.txt) — TODO next step
+    // Instances + tiles (instances.txt / layers.txt) — see load_room_instances
+    load_room_instances(rm, subDir, objectNames, bgNames);
 
     return rm;
+}
+
+// Fill room instances/tiles after the room object exists
+// (kept separate to keep load_room_obj readable)
+static void load_room_instances(void* rm, const fs::path& subDir,
+    const std::vector<std::string>& objectNames,
+    const std::vector<std::string>& bgNames)
+{
+    // ==== Instances (instances.txt) ====
+    {
+        fs::path instPath = subDir / "instances.txt";
+        std::string instTxt = read_file(instPath);
+        if (!instTxt.empty()) {
+            struct InstRow { int32_t obj; int32_t x; int32_t y; std::string hash;
+                             bool locked; int32_t xscale, yscale, blend, angle; bool hasCode; };
+            std::vector<InstRow> rows;
+            std::istringstream iss(instTxt);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (line.empty()) continue;
+                std::vector<std::string> cols;
+                size_t s = 0, e;
+                while ((e = line.find(',', s)) != std::string::npos) {
+                    cols.push_back(line.substr(s, e - s));
+                    s = e + 1;
+                }
+                cols.push_back(line.substr(s));
+                if (cols.size() < 5) continue;
+                InstRow r;
+                r.obj = name_to_index(objectNames, cols[0]);
+                r.x = std::stoi(cols[1]);
+                r.y = std::stoi(cols[2]);
+                r.hash = cols[3];
+                r.locked = (cols[4] == "1");
+                r.xscale = cols.size() > 5 ? std::stoi(cols[5]) : 1;
+                r.yscale = cols.size() > 6 ? std::stoi(cols[6]) : 1;
+                r.blend = cols.size() > 7 ? (int32_t)std::stoul(cols[7]) : 0xFFFFFFFF;
+                r.angle = cols.size() > 8 ? std::stoi(cols[8]) : 0;
+                r.hasCode = cols.size() > 9 ? (cols[9] == "1") : !r.hash.empty();
+                rows.push_back(r);
+            }
+            if (!rows.empty()) {
+                void* mem = delphi_alloc(8 + rows.size() * 24);
+                if (mem) {
+                    *(uint32_t*)mem = 1;
+                    *(uint32_t*)((uint8_t*)mem + 4) = (uint32_t)rows.size();
+                    uint8_t* dst = (uint8_t*)mem + 8;
+                    for (size_t i = 0; i < rows.size(); i++) {
+                        uint8_t* inst = dst + i * 24;
+                        // GM 8.0 Instance layout (GM80_SaveRoom_Individual
+                        // 0x548BB7-0x548C1D + save_room): +0 x, +4 y, +8 object,
+                        // +12 id, +16 creation_code (AnsiString), +20 locked
+                        *(int32_t*)(inst + 0) = rows[i].x;
+                        *(int32_t*)(inst + 4) = rows[i].y;
+                        *(int32_t*)(inst + 8) = rows[i].obj;
+                        *(int32_t*)(inst + 12) = rows[i].hash.empty()
+                            ? 0 : (int32_t)std::stoul(rows[i].hash, nullptr, 16);
+                        *(inst + 20) = rows[i].locked ? 1 : 0;
+                        if (rows[i].hasCode && !rows[i].hash.empty()) {
+                            fs::path codePath = subDir / (rows[i].hash + ".gml");
+                            std::string code = read_file(codePath);
+                            if (!code.empty())
+                                *(char**)(inst + 16) = make_delphi_str(load_gml(code));
+                        }
+                    }
+                    set_obj_u32(rm, 752, (uint32_t)rows.size());
+                    set_obj_ptr(rm, 756, dst);
+                }
+            }
+        }
+    }
+
+    // ==== Tiles (layers.txt + %depth%.txt → +760 count / +764 array, 40 bytes) ====
+    // GM 8.0 Tile: +0 x, +4 y, +8 source_bg, +12 u, +16 v, +20 width,
+    // +24 height, +28 depth, +32 id, +36 locked(byte)
+    {
+        fs::path layersPath = subDir / "layers.txt";
+        std::string layersTxt = read_file(layersPath);
+        if (!layersTxt.empty()) {
+            std::vector<std::array<int32_t, 10>> tiles; // x,y,bg,u,v,w,h,depth,id,locked
+            std::istringstream lss(layersTxt);
+            std::string depthLine;
+            while (std::getline(lss, depthLine)) {
+                if (depthLine.empty()) continue;
+                fs::path layerFile = subDir / (depthLine + ".txt");
+                std::string layerTxt = read_file(layerFile);
+                std::istringstream tss(layerTxt);
+                std::string tline;
+                while (std::getline(tss, tline)) {
+                    if (tline.empty()) continue;
+                    std::vector<std::string> cols;
+                    size_t s = 0, e;
+                    while ((e = tline.find(',', s)) != std::string::npos) {
+                        cols.push_back(tline.substr(s, e - s));
+                        s = e + 1;
+                    }
+                    cols.push_back(tline.substr(s));
+                    if (cols.size() < 8) continue;
+                    std::array<int32_t, 10> t = {};
+                    t[0] = std::stoi(cols[1]);               // x
+                    t[1] = std::stoi(cols[2]);               // y
+                    t[2] = name_to_index(bgNames, cols[0]);  // source_bg
+                    t[3] = std::stoi(cols[3]);               // u
+                    t[4] = std::stoi(cols[4]);               // v
+                    t[5] = std::stoi(cols[5]);               // width
+                    t[6] = std::stoi(cols[6]);               // height
+                    t[7] = std::stoi(depthLine);             // depth
+                    t[8] = 0;                                // id
+                    t[9] = (cols.size() > 7 && cols[7] == "1") ? 1 : 0; // locked
+                    tiles.push_back(t);
+                }
+            }
+            if (!tiles.empty()) {
+                void* mem = delphi_alloc(8 + tiles.size() * 40);
+                if (mem) {
+                    *(uint32_t*)mem = 1;
+                    *(uint32_t*)((uint8_t*)mem + 4) = (uint32_t)tiles.size();
+                    uint8_t* dst = (uint8_t*)mem + 8;
+                    for (size_t i = 0; i < tiles.size(); i++) {
+                        uint8_t* tl = dst + i * 40;
+                        for (int j = 0; j < 9; j++) *(int32_t*)(tl + j * 4) = tiles[i][j];
+                        *(tl + 36) = (uint8_t)tiles[i][9];
+                    }
+                    set_obj_u32(rm, 760, (uint32_t)tiles.size());
+                    set_obj_ptr(rm, 764, dst);
+                }
+            }
+        }
+    }
 }
 
 // ==== Load names from index.yyd ====
@@ -1205,17 +1855,20 @@ static bool load_assets_simple(
 
     fs::path resDir = root / dirName;
     bool isSprites = (strcmp(dirName, "sprites") == 0);
+    bool isBg = (strcmp(dirName, "backgrounds") == 0);
     for (uint32_t i = 0; i < cnt; i++) {
         if (names[i].empty()) continue;
         void* obj = loader(names[i], resDir);
         if (obj) {
             newObjs[i] = obj;
             if (newNames) newNames[i] = make_delphi_str(names[i]);
-            // Register 16×16 thumbnail like GM's sprite loader (sub_540108):
-            //   sub_4F959C(sprite) → TBitmap; sub_4F18D0(TBitmap) → index
-            // index stored in the 5th sprite array (0x1E9118)
-            if (isSprites) {
-                uint32_t fnThumb = (uint32_t)base + 0xF959C;
+            // Register 16×16 thumbnail like GM's loaders:
+            //   sprites: sub_4F959C(sprite); bgs: sub_521060(bg)
+            //   then sub_4F18D0(TBitmap) → index → 5th array (0x1E9118 / 0x1E90A4)
+            uint32_t fnThumb = 0, extraArr = 0;
+            if (isSprites) { fnThumb = (uint32_t)base + 0xF959C; extraArr = 0x1E9118; }
+            else if (isBg)  { fnThumb = (uint32_t)base + 0x121060; extraArr = 0x1E90A4; }
+            if (fnThumb) {
                 void* thumb = nullptr;
                 __asm {
                     mov eax, obj
@@ -1231,7 +1884,7 @@ static bool load_assets_simple(
                         call fnReg
                         mov idx, eax
                     }
-                    int32_t* extra = (int32_t*)get_asset_array(0x1E9118);
+                    int32_t* extra = (int32_t*)get_asset_array(extraArr);
                     if (extra) extra[i] = (int32_t)idx;
                     delphi_free(thumb); // GM frees the TBitmap after registering
                 }
@@ -1304,6 +1957,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
 
     // 1b. Cache real VMTs from GM's array objects BEFORE SetLength replaces them
     cache_vmts();
+    dump_action_libraries("lib state @ load start");
 
     // 2. Read root .gm80 metadata
     auto stem = root.filename();
@@ -1331,6 +1985,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
 
     // 3. Load settings + constants
     load_settings(root);
+    load_extensions(root);
 
     // 4. Load triggers (single array, names live inside objects at +4)
     {
@@ -1381,6 +2036,11 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     gm80l_log("Fonts done.");
 
     // 11. Load objects (needs sprite + object name context)
+    // NOTE: the action-library array is only built by GM's sub_5A93B4, which
+    // runs AFTER our parser returns (unconditionally, success or failure) —
+    // calling it from here crashes (wrong environment), so fill_in_safe's
+    // SEH degradation covers the first load; from the second load on the
+    // library is already built and FillIn works normally.
     gm80l_log("Loading objects...");
     {
         auto names = load_names(root / "objects" / "index.yyd");
@@ -1414,13 +2074,54 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     }
     gm80l_log("Resource trees done.");
 
-    // 14. Timelines — SKIPPED for now (VMT/ctor pending)
+    // 14. Load timelines (before objects — they share the Event/Action system)
+    gm80l_log("Loading timelines...");
+    load_assets_simple("timelines", load_timeline, find_res("timelines"), root);
+    gm80l_log("Timelines done.");
 
     // 15. Clear all updated flags
     clear_all_updated_flags();
 
     // 16. Update settings timestamp
     write_glob_f64(ADDR_SETTINGS_TIMESTAMP, 0.0);
+
+    // 17. Working directory: GM launches the compiled game with
+    // lpCurrentDirectory=NULL (CreateProcessA at 0x521DF3), so the game
+    // process inherits the IDE's current directory. For .gmk projects the
+    // cwd ends up at the .gmk file's folder (the open dialog sets it there);
+    // the .gm80 project folder sits one level below, so use the PARENT —
+    // that is where external_define'd DLLs and data files live.
+    {
+        fs::path cwd = root.parent_path();
+        if (cwd.empty()) cwd = root;
+        if (SetCurrentDirectoryW(cwd.c_str())) {
+            gm80l_log("gm80_load_project: cwd set to '%ls'", cwd.c_str());
+        } else {
+            gm80l_log("gm80_load_project: SetCurrentDirectoryW failed err=%u",
+                      (uint32_t)GetLastError());
+        }
+    }
+
+    // 18. GM80_ProjectPath (0x1EA27C): GM sets this to the .gm80 metadata
+    // FILE on drag-drop, so the running game's working_directory (derived
+    // via ExtractFilePath) resolves to the .gm80 folder. Overwrite it with
+    // the .gm80 project FOLDER — ExtractFilePath then yields the folder's
+    // PARENT, the real project root, matching .gmk behaviour. Save
+    // detection (check_and_do_gm80_save checks the ".gm80" suffix) and the
+    // load thunk keep working: the folder name itself ends in ".gm80".
+    {
+        std::wstring wroot = root.wstring();
+        int alen = WideCharToMultiByte(CP_ACP, 0, wroot.c_str(),
+                                       (int)wroot.size(), NULL, 0, NULL, NULL);
+        if (alen > 0) {
+            std::string aroot(alen, '\0');
+            WideCharToMultiByte(CP_ACP, 0, wroot.c_str(), (int)wroot.size(),
+                                &aroot[0], alen, NULL, NULL);
+            write_glob_str(0x1EA27C, aroot);
+            gm80l_log("gm80_load_project: GM80_ProjectPath set to '%s'",
+                      aroot.c_str());
+        }
+    }
 
     gm80l_log("gm80_load_project: SUCCESS, returning true");
     return true;

@@ -12,6 +12,8 @@
 #include <exception>
 #include <mutex>
 #include <string>
+#include <commdlg.h>
+#include <winnt.h>
 
 // ==== CreateFileA Hook — intercepts .gm80 file opens at the OS level ====
 // Trampoline: executes original 5 bytes of CreateFileA, then JMPs to CreateFileA+5
@@ -681,9 +683,9 @@ static int __stdcall check_and_do_gm80_load() {
     // Validate pointer before using it (prevent crash on garbage ptr during startup)
     if (IsBadStringPtrA(projPath, 512)) return 0;
     size_t len = strlen(projPath);
-    if (len < 6) return 0;
+    if (len < 6) { dbg_log("check_gm80: len=%u path='%s' -> 0", (uint32_t)len, projPath); return 0; }
     bool is_gm80 = (_stricmp(projPath + len - 5, ".gm80") == 0);
-    if (!is_gm80) return 0;
+    if (!is_gm80) { dbg_log("check_gm80: not .gm80 path='%s' -> 0", projPath); return 0; }
 
     dbg_log("Load hook: .gm80 detected path='%s'", projPath);
 
@@ -780,11 +782,84 @@ __declspec(naked) static void load_func_hook() {
 // TODO: Read project path from Delphi AnsiString global
 //   global at base+0x1EA27C (dword_5EA27C) contains path or flag
 
+// ==== Save/Open dialog filter hooks ====
+// GM's project dialogs only offer "*.gmk". Patch the IAT entries for
+// GetSaveFileNameA/GetOpenFileNameA so project dialogs also offer .gm80
+// (mirrors gm82save's dialog adaptation; GM 8.1 offers .gm81/.gm82).
+static BOOL (WINAPI* g_real_GetSaveFileNameA)(LPOPENFILENAMEA) = nullptr;
+static BOOL (WINAPI* g_real_GetOpenFileNameA)(LPOPENFILENAMEA) = nullptr;
+
+// OPENFILENAME.lpstrFilter is NUL-separated pairs, double-NUL terminated
+// ("Name\0*.ext\0Name2\0*.ext2\0\0") — NOT Delphi's '|' format.
+static const char k_gm80_filter[] =
+    "GameMaker 8.0 project (*.gm80)\0*.gm80\0"
+    "GameMaker 8.0 files (*.gmk)\0*.gmk\0"
+    "All files (*.*)\0*.*\0\0";
+
+static BOOL WINAPI gm80_get_save_file_name(LPOPENFILENAMEA ofn) {
+    if (ofn && ofn->lpstrFilter &&
+        strstr(ofn->lpstrFilter, "Game Maker")) {
+        ofn->lpstrFilter = k_gm80_filter;
+        if (ofn->lpstrDefExt && ofn->lpstrDefExt[0])
+            ofn->lpstrDefExt = "gm80";
+    }
+    return g_real_GetSaveFileNameA(ofn);
+}
+
+static BOOL WINAPI gm80_get_open_file_name(LPOPENFILENAMEA ofn) {
+    if (ofn && ofn->lpstrFilter &&
+        strstr(ofn->lpstrFilter, "Game Maker")) {
+        ofn->lpstrFilter = k_gm80_filter;
+    }
+    return g_real_GetOpenFileNameA(ofn);
+}
+
+// Patch the comdlg32 IAT entries in the target image.
+static void hook_comdlg32_iat(HMODULE gm_base) {
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)gm_base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((uint8_t*)gm_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    DWORD impRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (!impRva) return;
+    IMAGE_IMPORT_DESCRIPTOR* imp =
+        (IMAGE_IMPORT_DESCRIPTOR*)((uint8_t*)gm_base + impRva);
+    for (; imp->Name; imp++) {
+        const char* dll = (const char*)((uint8_t*)gm_base + imp->Name);
+        if (_stricmp(dll, "comdlg32.dll") != 0) continue;
+        IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)((uint8_t*)gm_base + imp->FirstThunk);
+        IMAGE_THUNK_DATA* orig = (IMAGE_THUNK_DATA*)((uint8_t*)gm_base + imp->OriginalFirstThunk);
+        for (; thunk->u1.AddressOfData; thunk++, orig++) {
+            if (IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal)) continue;
+            IMAGE_IMPORT_BY_NAME* ibn =
+                (IMAGE_IMPORT_BY_NAME*)((uint8_t*)gm_base + orig->u1.AddressOfData);
+            if (strcmp(ibn->Name, "GetSaveFileNameA") == 0 && !g_real_GetSaveFileNameA) {
+                g_real_GetSaveFileNameA = (BOOL(WINAPI*)(LPOPENFILENAMEA))thunk->u1.Function;
+                DWORD oldp;
+                if (VirtualProtect(&thunk->u1.Function, 4, PAGE_READWRITE, &oldp)) {
+                    thunk->u1.Function = (uintptr_t)gm80_get_save_file_name;
+                    VirtualProtect(&thunk->u1.Function, 4, oldp, &oldp);
+                    dbg_log("IAT: GetSaveFileNameA hooked");
+                }
+            } else if (strcmp(ibn->Name, "GetOpenFileNameA") == 0 && !g_real_GetOpenFileNameA) {
+                g_real_GetOpenFileNameA = (BOOL(WINAPI*)(LPOPENFILENAMEA))thunk->u1.Function;
+                DWORD oldp;
+                if (VirtualProtect(&thunk->u1.Function, 4, PAGE_READWRITE, &oldp)) {
+                    thunk->u1.Function = (uintptr_t)gm80_get_open_file_name;
+                    VirtualProtect(&thunk->u1.Function, 4, oldp, &oldp);
+                    dbg_log("IAT: GetOpenFileNameA hooked");
+                }
+            }
+        }
+    }
+}
+
 // ==== Hook installation ====
 bool ide_hooks_install(HMODULE gm_base) {
     g_gm_base = gm_base;
     g_gm_base_ptr = gm_base;
     uint8_t* base = (uint8_t*)gm_base;
+    hook_comdlg32_iat(gm_base);
 
     // Save hook 1: patch CALL at 0x5DAE36 (dialog save path in sub_5DAD60)
     void* save_call_addr = base + 0x1DAE36;
