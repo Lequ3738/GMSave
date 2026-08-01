@@ -269,15 +269,20 @@ static void save_path(void* obj, const std::wstring& outPath) {
     L("snap_y", to_str(R4(obj, 48)));
     wf(outPath + L"\\path.txt", t);
 
-    // points.txt — read from inline arrays
+    // points.txt — read from +4 DelphiList (24 bytes/point: x,y,speed doubles)
     int ptCount = R4s(obj, 8);
     if (ptCount > 256) ptCount = 256;
     std::string pts;
-    for (int i = 0; i < ptCount; i++) {
-        int x = R4s(obj, 24 + i*4);
-        int y = R4s(obj, 1048 + i*4);
-        int spd = R4s(obj, 2072 + i*4);
-        pts += to_str(x) + "," + to_str(y) + "," + to_str(spd) + "\n";
+    if (ptCount > 0) {
+        uint8_t* ptsPtr = (uint8_t*)RP(obj, 4);
+        if (ptsPtr) {
+            for (int i = 0; i < ptCount; i++) {
+                double x = *(double*)(ptsPtr + 24*i);
+                double y = *(double*)(ptsPtr + 24*i + 8);
+                double spd = *(double*)(ptsPtr + 24*i + 16);
+                pts += to_str((int)x) + "," + to_str((int)y) + "," + to_str((int)spd) + "\n";
+            }
+        }
     }
     wf(outPath + L"\\points.txt", pts);
 }
@@ -326,14 +331,12 @@ static void save_sprite(void* obj, const std::wstring& outPath) {
     auto L = [&](const char* k, const std::string& v) { t += k; t += "="; t += v; t += "\n"; };
     int frameCount = R4s(obj, 4);
     L("frames", to_str(frameCount));
-    L("origin_x", to_str(R4s(obj, 16)));
-    L("origin_y", to_str(R4s(obj, 20)));
-    // collision shape fields — GM80 uses different names than gm82save
-    // but we save in gm82save format for compatibility
-    // BBox fields verified from GM80_SaveSprite_Individual decompile:
-    // +28=left, +32=top, +36=shape/type, +40=right, +44=bottom
-    L("collision_shape", to_str(R4(obj, 36)));   // +36 = shape/type
-    L("alpha_tolerance", "0");
+    // GM 8.0 layout (verified from sub_4F8E40 .gmk loader order):
+    // +8 origin_x, +12 origin_y, +16 collision_shape, +20 alpha_tolerance
+    L("origin_x", to_str(R4s(obj, 8)));
+    L("origin_y", to_str(R4s(obj, 12)));
+    L("collision_shape", to_str(R4(obj, 16)));
+    L("alpha_tolerance", to_str(R4(obj, 20)));
     L("per_frame_colliders", to_str(R1(obj, 24)));
     L("bbox_type", to_str(R4(obj, 36)));
     L("bbox_left",   to_str(R4s(obj, 28)));

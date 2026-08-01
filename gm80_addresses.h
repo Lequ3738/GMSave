@@ -4,7 +4,7 @@
 #pragma once
 
 // ==== Delphi RTL (Delphi 7 AnsiString era) ====
-#define ADDR_COMPARETEXT           0x40A0C8   // CompareText — case-insensitive AnsiString compare
+#define ADDR_COMPARETEXT           0xA0C8     // CompareText — case-insensitive AnsiString compare
 #define ADDR_LSTRASG              0x005528   // @LStrAsg — AnsiString assign
 #define ADDR_LSTRCAT              0x005544   // @LStrCat — AnsiString concat (+0x1C from LStrAsg)
 #define ADDR_LSTRCLR              0x0047E8   // @LStrClr — AnsiString free
@@ -99,6 +99,16 @@ struct GM80ResourceGlobals {
 // ==== Game ID & Global Settings ====
 #define ADDR_GAME_ID             0x1F6218   // dword_5F6218
 #define ADDR_GUID_STORAGE        0x1F6220   // 16-byte GUID follows game ID
+
+// ==== Dirty flags cleared by sub_59BA38 after successful save (16 flags) ====
+// These control the '*' in the title bar and "unsaved changes" state
+// Verified: IDA int_convert from off_* pointer values → RVAs
+#define ADDR_DIRTY_FLAGS { \
+    0x1E945C, 0x1F61E8, 0x1EFCE8, 0x1EFCA0, \
+    0x1EFCF4, 0x1EFC38, 0x1EFCFC, 0x1EFD0C, \
+    0x1EFD04, 0x1EFD3C, 0x1F61F8, 0x1F6248, \
+    0x2000B4, 0x1F6210, 0x1EFD14, 0x1F1C98  \
+}
 
 // ==== VCL / IDE UI ====
 #define ADDR_CONTROL_SETTEXT     0x060B90   // TControl.SetText
