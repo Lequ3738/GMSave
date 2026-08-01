@@ -15,90 +15,6 @@
 #include <commdlg.h>
 #include <winnt.h>
 
-// ==== CreateFileA Hook — intercepts .gm80 file opens at the OS level ====
-// Trampoline: executes original 5 bytes of CreateFileA, then JMPs to CreateFileA+5
-static void* g_CAF_trampoline = nullptr;
-static uint8_t g_orig_CAF_bytes[5] = {0};
-static thread_local bool g_inside_caf_hook = false;  // prevent recursion
-
-static HANDLE WINAPI gm80_CreateFileA_hook(
-    LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
-    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
-    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
-{
-    // Guard against recursion: fopen/std::ifstream call CreateFileA internally
-    if (g_inside_caf_hook) {
-        // Use trampoline which calls the real CreateFileA
-        auto realCAF = (decltype(&CreateFileA))g_CAF_trampoline;
-        return realCAF(lpFileName, dwDesiredAccess, dwShareMode,
-            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-    }
-
-    // Only intercept OPEN_EXISTING reads
-    bool isOpenRead = (dwCreationDisposition == OPEN_EXISTING) &&
-                      (dwDesiredAccess & GENERIC_READ) &&
-                      !(dwDesiredAccess & GENERIC_WRITE);
-
-    if (isOpenRead && lpFileName) {
-        const char* dot = strrchr(lpFileName, '.');
-        if (dot && _stricmp(dot, ".gm80") == 0) {
-            g_inside_caf_hook = true;
-
-            int wlen = MultiByteToWideChar(CP_ACP, 0, lpFileName, -1, NULL, 0);
-            if (wlen > 0) {
-                std::wstring wpath(wlen, L'\0');
-                MultiByteToWideChar(CP_ACP, 0, lpFileName, -1, &wpath[0], wlen);
-
-                fs::path filePath(wpath);
-                fs::path dirPath = filePath.parent_path();
-
-                GMKProject proj;
-                if (gm80_load_from_path(proj, dirPath.wstring())) {
-                    std::vector<uint8_t> gmkData = gmk_serialize(proj);
-                    if (!gmkData.empty()) {
-                        char tempPath[MAX_PATH], tempFile[MAX_PATH];
-                        GetTempPathA(sizeof(tempPath), tempPath);
-                        GetTempFileNameA(tempPath, "GM8", 0, tempFile);
-                        std::string gmkPath(tempFile);
-                        gmkPath = gmkPath.substr(0, gmkPath.size() - 4) + ".gmk";
-
-                        FILE* f = fopen(gmkPath.c_str(), "wb");
-                        if (f) {
-                            fwrite(gmkData.data(), 1, gmkData.size(), f);
-                            fclose(f);
-
-                            auto realCAF = (decltype(&CreateFileA))g_CAF_trampoline;
-                            HANDLE h = realCAF(gmkPath.c_str(), dwDesiredAccess, dwShareMode,
-                                lpSecurityAttributes, dwCreationDisposition,
-                                dwFlagsAndAttributes, hTemplateFile);
-
-                            // Update project path in GM globals
-                            {
-                                HMODULE gmBase = GetModuleHandle(NULL);
-                                if (gmBase && h != INVALID_HANDLE_VALUE) {
-                                    static char gmkPathBuf[MAX_PATH];
-                                    strcpy_s(gmkPathBuf, gmkPath.c_str());
-                                    char** pp = (char**)((uint8_t*)gmBase + 0x1EA27C);
-                                    *pp = gmkPathBuf;
-                                }
-                            }
-
-                            g_inside_caf_hook = false;
-                            return h;
-                        }
-                    }
-                }
-            }
-            g_inside_caf_hook = false;
-        }
-    }
-
-    // Pass through
-    auto realCAF = (decltype(&CreateFileA))g_CAF_trampoline;
-    return realCAF(lpFileName, dwDesiredAccess, dwShareMode,
-        lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-}
-
 // Verified injection points from IDA:
 //   Save: 0x5DAE36 in sub_5DAD60 — CALL sub_59BA38 (dialog save) → save_thunk
 //   Save: 0x5DAD19 in sub_5DACB8 — CALL sub_59BA38 (direct save) → save_thunk
@@ -117,9 +33,7 @@ static uint8_t g_orig_direct_save[5] = {0};     // bytes at 0x5DAD19 (direct sav
 static uint8_t g_orig_load_call[5] = {0};       // bytes at 0x5D484A
 static uint8_t g_orig_cmptext_call[5] = {0};    // bytes at 0x5DACEC
 static uint8_t g_orig_sub_5D453C[6] = {0};      // first 6 bytes of sub_5D453C
-static uint8_t g_orig_sub_5D418C[6] = {0};      // first 6 bytes of sub_5D418C (file reader)
 static void*  g_trampoline_5D453C = nullptr;    // trampoline: orig 6 bytes + JMP back
-static void*  g_trampoline_5D418C = nullptr;    // trampoline for sub_5D418C
 
 // CompareText hook: makes GM 8.0 recognize .gm80 as valid project extension
 // Installed by patching the CALL CompareText at 0x5DACEC in sub_5DACB8.
@@ -150,17 +64,18 @@ static uint32_t g_load_addr = ADDR_LOAD_PROJECT;
 // Forward decl for debug logging (defined later in this file)
 static void dbg_log(const char* fmt, ...);
 static int  __stdcall check_and_do_gm80_load();
-extern void* g_trampoline_5D418C;
 
-// CompareText hook — tests BOTH ".gm80" (now in patched binary string) and
-// ".gmk" (from our DLL) for backward compatibility with old .gmk projects
+// CompareText hook — tests BOTH ".gm80" (our own constant; the binary string
+// patch is disabled) and ".gmk" (backward compatibility with old .gmk
+// projects). NOTE: this is what keeps Ctrl+S on a .gm80 project on the
+// direct-save path (sub_5DACB8 compares the extension at 0x5DACEC and falls
+// back to the save dialog when it doesn't match).
 static int __stdcall gmk_or_gm80_hook(void* ext_data) {
-    void* gm80_str = (uint8_t*)g_gm_base + ADDR_GMK_STRING_DATA; // now ".gm80" after patching
     int result;
-    // Test ".gm80" first (the patched native extension)
+    // Test ".gm80" first
     __asm {
         mov eax, ext_data
-        mov edx, gm80_str
+        mov edx, dword ptr [s_gm80_ext_ptr]
         mov ecx, dword ptr [g_gm_base_ptr]
         add ecx, ADDR_COMPARETEXT
         call ecx
@@ -269,6 +184,21 @@ static int __stdcall check_and_do_gm80_save() {
     if (cch > 0) {
         g_gm80_save_path.resize(cch);
         MultiByteToWideChar(CP_ACP, 0, projPath, (int)len, &g_gm80_save_path[0], cch);
+    }
+    // GM80_ProjectPath carries the metadata FILE path (…\folder.gm80\name.gm80)
+    // since that's GM's project-file semantics, but the save target is the
+    // project FOLDER — normalize (…\X.gm80\Y.gm80 → …\X.gm80) so the save
+    // doesn't silently write into the metadata file treated as a directory.
+    {
+        fs::path sp(g_gm80_save_path);
+        std::wstring fn = sp.filename().wstring();
+        std::wstring pn = sp.parent_path().filename().wstring();
+        if (fn.size() > 5 && fn.compare(fn.size() - 5, 5, L".gm80") == 0 &&
+            pn.size() > 5 && pn.compare(pn.size() - 5, 5, L".gm80") == 0) {
+            g_gm80_save_path = sp.parent_path().wstring();
+            dbg_log("Save: normalized save path to folder '%S'",
+                    g_gm80_save_path.c_str());
+        }
     }
     g_is_gm80_save = true;
     return 1; // no .gmk save needed (we'll delete .gm80.gmk ourselves)
@@ -454,8 +384,14 @@ static void clear_updated_flags() {
     }
 }
 
+static void gm80_progress_show();
+static void gm80_progress_step(int pos);
+static void gm80_progress_close();
+
 static void __stdcall do_gm80_save_if_needed() {
     dbg_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
+    gm80_progress_show();
+    gm80_progress_step(25);
     try {
         if (!gm80_save_to_path(g_gm_base, g_gm80_save_path))
             dbg_log("Save: ERROR");
@@ -468,19 +404,161 @@ static void __stdcall do_gm80_save_if_needed() {
     } catch (...) {
         dbg_log("Save: UNKNOWN EXCEPTION");
     }
+    gm80_progress_step(100);
+    gm80_progress_close();
 }
+// .gmk save prep: GM's save inner writes via RELATIVE paths (it relies on
+// the open dialog having set the cwd to the project folder — verified: the
+// save failure surfaces as a Delphi EFCreateError caught by Outer's SEH →
+// "cannot create file"). Set the cwd to the project file's folder before
+// handing control back to GM, and log the context.
+static void __stdcall log_gmk_save_ctx() {
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(sizeof(cwd), cwd);
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    char** pp = (char**)(base + 0x1EA27C);
+    dbg_log("GMK save ctx: cwd='%s' projPath='%s'",
+            cwd, (pp && *pp && !IsBadStringPtrA(*pp, 1024)) ? *pp : "(null/bad)");
+    if (pp && *pp && !IsBadStringPtrA(*pp, 1024)) {
+        char dir[MAX_PATH];
+        strcpy_s(dir, *pp);
+        char* slash = strrchr(dir, '\\');
+        if (slash) {
+            *slash = '\0';
+            if (SetCurrentDirectoryA(dir))
+                dbg_log("GMK save ctx: cwd set to '%s'", dir);
+        }
+        DWORD attrs = GetFileAttributesA(*pp);
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            dbg_log("GMK save ctx: target file attrs FAIL err=%u", GetLastError());
+        } else {
+            dbg_log("GMK save ctx: target attrs=0x%X readonly=%d",
+                    attrs, (attrs & FILE_ATTRIBUTE_READONLY) ? 1 : 0);
+        }
+    }
+}
+
+// Progress form helpers (GM 8.0): sub_599620 shows the form + sets title +
+// resets the bar; sub_5996B8 steps it; sub_5996D8 closes it.
+static void gm80_progress_show() {
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    uint32_t fn = (uint32_t)base + 0x199620;
+    uint32_t title = (uint32_t)base + 0x19BCD0;  // GM's save title string var
+    __asm {
+        mov eax, title
+        call fn
+    }
+}
+static void gm80_progress_step(int pos) {
+    // Position is passed in EAX (PBM_SETPOS via sub_49C530).
+    if (pos < 0) pos = 0;
+    if (pos > 100) pos = 100;
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    uint32_t fn = (uint32_t)base + 0x1996B8;
+    __asm {
+        mov eax, pos
+        call fn
+    }
+}
+static void gm80_progress_close() {
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    uint32_t fn = (uint32_t)base + 0x1996D8;
+    __asm { call fn }
+}
+
+// gm82save-style .gmk save: create the stream the same way Outer does
+// (ClassCreate on off_4EA854), run GM's save Inner on it, then dump the
+// stream memory to the project file. Bypasses Outer entirely — its SEH
+// turns exceptions from the post-Inner backup-file handling (which gets a
+// NULL path argument on our call path) into the "cannot create file" dialog.
+// Verified: Inner alone returns 1 with a full 0xACC54-byte stream.
+static void __stdcall do_gmk_save_direct() {
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    if (!base) return;
+    char** pp = (char**)(base + 0x1EA27C);
+    if (!pp || !*pp || IsBadStringPtrA(*pp, 1024)) {
+        dbg_log("GMK direct save: no project path");
+        return;
+    }
+    const char* gmkPath = *pp;
+
+    gm80_progress_show();               // "saving" progress form
+    uint32_t cls = *(uint32_t*)(base + 0xEA854);
+    if (cls < 0x400000) cls = *(uint32_t*)(base + 0xEA8A0);
+    void* stream = nullptr;
+    __asm {
+        mov dl, 1
+        mov eax, cls
+        mov ecx, 0x404560               // @ClassCreate
+        call ecx
+        mov stream, eax
+    }
+    if (!stream) {
+        dbg_log("GMK direct save: stream create failed");
+        gm80_progress_close();
+        return;
+    }
+    gm80_progress_step(30);
+    int ok = 0;
+    __try {
+        __asm {
+            mov eax, stream
+            mov ecx, 0x59B620           // GM80_SaveProject_Inner
+            call ecx
+            mov ok, eax
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        dbg_log("GMK direct save: Inner exception code=0x%X",
+                GetExceptionCode());
+        gm80_progress_close();
+        return;
+    }
+    if (!ok) {
+        dbg_log("GMK direct save: Inner returned 0");
+        gm80_progress_close();
+        return;
+    }
+    // Stream layout (verified by probing for the .gmk magic 0x12D591):
+    // +0 vtable, +4 FMemory (data pointer), +8 FSize.
+    uint8_t* mem = *(uint8_t**)((uint8_t*)stream + 4);    // FMemory
+    uint32_t size = *(uint32_t*)((uint8_t*)stream + 8);   // FSize
+    dbg_log("GMK direct save: stream mem=0x%X size=%u", (uint32_t)mem, size);
+    if (!mem || size == 0 || size > 64 * 1024 * 1024) {
+        dbg_log("GMK direct save: bad stream content");
+        gm80_progress_close();
+        return;
+    }
+    gm80_progress_step(60);
+    FILE* f = fopen(gmkPath, "wb");
+    if (!f) {
+        dbg_log("GMK direct save: fopen fail err=%u", GetLastError());
+        gm80_progress_close();
+        return;
+    }
+    size_t w = fwrite(mem, 1, size, f);
+    fclose(f);
+    gm80_progress_step(90);
+    gm80_progress_close();
+    dbg_log("GMK direct save: wrote %u bytes to '%s'", (uint32_t)w, gmkPath);
+    if (w == size) {
+        clear_updated_flags();
+    }
+}
+
 __declspec(naked) static void save_thunk() {
     __asm {
         pushad
         call check_and_do_gm80_save     // returns 1 if .gm80, 0 if normal
+        mov dword ptr [esp+28], eax     // stash result in pushad's EAX slot
         popad
         test eax, eax
         jnz gm80_save
 
-        // Normal .gmk: call original save
-        mov ecx, dword ptr [g_gm_base_ptr]
-        add ecx, dword ptr [g_save_outer_addr]
-        call ecx
+        // Normal .gmk: gm82save-style direct save (bypasses Outer's SEH trap)
+        pushad
+        call log_gmk_save_ctx
+        call do_gmk_save_direct
+        popad
         jmp done
 
     gm80_save:
@@ -721,27 +799,11 @@ static int __stdcall check_and_do_gm80_load() {
     return 0;
 }
 
-// ==== Minimal hook for sub_5D418C — ALWAYS passes through after logging ====
-__declspec(naked) static void load_418C_hook() {
-    __asm {
-        push eax
-        push ecx
-        push edx
-        mov g_load_file_path, eax       // Log what file is being loaded
-        pushad
-        call check_and_do_gm80_load     // Will log "Load hook fired"
-        popad
-        pop edx
-        pop ecx
-        pop eax
-        // Always execute original code via trampoline
-        jmp dword ptr [g_trampoline_5D418C]
-    }
-}
-
 // ==== Function-level hook for sub_5D453C (load project) ====
 // Hooks the FUNCTION ENTRY itself, catching ALL call paths to sub_5D453C
-// Trampoline: executes original first 6 bytes, then JMPs back to sub_5D453C+6
+// (both open-project and compile). For .gm80 projects it routes to our
+// loader; otherwise the trampoline runs the original function.
+// Trampoline: executes original first 6 bytes, then JMPs back to sub_5D453C+6.
 __declspec(naked) static void load_func_hook() {
     __asm {
         // On entry: [esp]=ret_addr, EAX=path, EDX=arg1, ECX=arg2
@@ -759,10 +821,10 @@ __declspec(naked) static void load_func_hook() {
         test eax, eax                   // Handled?
         jnz handled
 
-        // Not handled: discard old EAX, load updated path, jump to trampoline
+        // Not handled: jump to the trampoline with the original registers.
         pop eax                         // Discard original file path
-        mov eax, dword ptr [g_load_file_path]  // EAX = updated path (temp .gmk)
-        // EAX=updated_path, EDX=arg1, ECX=arg2, [esp]=ret_addr — perfect for trampoline
+        mov eax, dword ptr [g_load_file_path]  // EAX = path (a1)
+        // EAX=path, EDX=arg1, ECX=arg2, [esp]=ret_addr — perfect for trampoline
         jmp dword ptr [g_trampoline_5D453C]
 
     handled:
@@ -772,15 +834,51 @@ __declspec(naked) static void load_func_hook() {
     }
 }
 
+// Compile-time project path override. sub_5DBEAC's run-game flow loads the
+// project path with `mov eax, GM80_ProjectPath` at 0x5DBF14 (compile, feeds
+// the exe) and 0x5DBF2B (game command-line arg, from which the running game
+// derives working_directory — verified: double-clicking the exe with no
+// argument makes working_directory = exe folder). Both call sites are
+// patched to `call compile_path_eax`, which returns the .gm80 FOLDER for
+// .gm80 projects (…\X.gm80 instead of the metadata file …\X.gm80\Y.gm80)
+// so the game resolves the project root. 0x1EA27C itself is never modified
+// — IDE semantics (history, open, save) stay on the metadata-file path.
+// The embed flow reads the path as a Delphi AnsiString (length at [ptr-4]),
+// so the returned pointer MUST be a real Delphi string — a bare C buffer
+// makes the embed read garbage and the game falls back to the exe folder.
+static const char* __stdcall get_compile_folder() {
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    static struct { int32_t refcount; uint32_t length; char data[MAX_PATH + 8]; } s_str = { -1, 0, "" };
+    if (!base) return s_str.data;
+    char** pp = (char**)(base + 0x1EA27C);
+    if (!pp || !*pp || IsBadStringPtrA(*pp, 1024)) return s_str.data;
+    strcpy_s(s_str.data, *pp);
+    char* slash = strrchr(s_str.data, '\\');
+    if (slash) {
+        *slash = '\0';
+        const char* leaf = strrchr(s_str.data, '\\');
+        leaf = leaf ? leaf + 1 : s_str.data;
+        if (!(strlen(leaf) > 5 && _stricmp(leaf + strlen(leaf) - 5, ".gm80") == 0)) {
+            // not a .gm80 folder — keep the original path (.gmk etc.)
+            strcpy_s(s_str.data, *pp);
+        }
+    }
+    s_str.length = (uint32_t)strlen(s_str.data);
+    dbg_log("compile eax: project path -> '%s'", s_str.data);
+    return s_str.data;
+}
+
+__declspec(naked) static void compile_path_eax() {
+    __asm {
+        pushad
+        call get_compile_folder
+        mov dword ptr [esp+28], eax
+        popad
+        ret
+    }
+}
+
 // g_gm_base_ptr and address variables are declared at the top of this file
-
-// Project path global — stored by GM after save/load dialog
-// In Delphi 7, the project path is accessed through TMainForm or a global string.
-// We can find it by looking at what sub_59BA38 reads.
-// For now, we use a backup approach: read from Delphi's global state.
-
-// TODO: Read project path from Delphi AnsiString global
-//   global at base+0x1EA27C (dword_5EA27C) contains path or flag
 
 // ==== Save/Open dialog filter hooks ====
 // GM's project dialogs only offer "*.gmk". Patch the IAT entries for
@@ -877,28 +975,13 @@ bool ide_hooks_install(HMODULE gm_base) {
     // The actual load function is GM80_LoadRecentProject (RVA 0x19B860).
     // Hook TBD via call-site patches at 0x5DAB0C, 0x5D9A19 etc.
 
-    // Patch ALL 4 ".gmk" Delphi AnsiStrings → ".gm80" in the binary
-    // Mirrors gm82save's patch(0x6dfbec, &[b'2']) which changes ".gm81" → ".gm82"
-    // These 4 strings are used for:
-    //   0x1DAD58 — direct save extension check (sub_5DACB8)
-    //   0x1DAE90 — save dialog filter (sub_5DAD60)
-    //   0x1DA590 — open dialog extension check (sub_5DA2C0 area)
-    //   0x1DACB0 — drag-drop extension check (sub_5DAB40 area)
-    {
-        DWORD oldProt;
-        struct { uint32_t rva; } strs[] = {
-            {0x1DAD50}, {0x1DAE88}, {0x1DA588}, {0x1DACA8}
-        };
-        for (auto& s : strs) {
-            uint32_t* len = (uint32_t*)(base + s.rva + 4);
-            char*     data = (char*)(base + s.rva + 8);
-            VirtualProtect(len, 12, PAGE_EXECUTE_READWRITE, &oldProt);
-            *len = 5;                       // length 4 → 5
-            memcpy(data, ".gm80", 5);       // ".gmk" → ".gm80"
-            VirtualProtect(len, 12, oldProt, &oldProt);
-        }
-        dbg_log("Patched 4 .gmk strings → .gm80");
-    }
+    // NOTE: the 4 ".gmk"→".gm80" string patches are DISABLED — they broke
+    // .gmk saving (GM's save path reads these strings and misbehaves with
+    // ".gm80" content). Their functions are fully covered by other hooks:
+    //   0x1DAD58 direct-save check  → CompareText hook (gmk_or_gm80_hook)
+    //   0x1DAE90 save dialog filter → IAT hook (GetSaveFileNameA)
+    //   0x1DA590 open dialog check  → IAT hook (GetOpenFileNameA)
+    //   0x1DACB0 drag-drop check    → thunk (check_and_do_gm80_load)
 
     // CompareText hooks: patch ALL extension-check call sites
     // Each site now tests ".gm80" (patched) AND ".gmk" (our DLL) for backward compat
@@ -913,6 +996,53 @@ bool ide_hooks_install(HMODULE gm_base) {
         patch_call(call_addr, (void*)gmk_or_gm80_thunk);
     }
     dbg_log("CompareText hooks installed at %u sites", (uint32_t)(sizeof(cmptext_sites)/sizeof(cmptext_sites[0])));
+
+    // ==== Hook sub_5D453C entry (load project AND compile core) ====
+    // sub_5D453C is both the open-project loader and the compile core
+    // (sub_5D489C calls it with EAX=.exe output, EDX=project path which gets
+    // embedded into the exe). load_func_hook fixes EDX to the .gm80 FOLDER
+    // for .gm80 projects so the running game's working_directory
+    // (ExtractFilePath of the embedded path) resolves to the project root.
+    {
+        void* fn453C = base + 0x1D453C;
+        memcpy(g_orig_sub_5D453C, fn453C, 6);
+        g_trampoline_5D453C = VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE,
+                                           PAGE_EXECUTE_READWRITE);
+        if (g_trampoline_5D453C) {
+            uint8_t* t = (uint8_t*)g_trampoline_5D453C;
+            memcpy(t, g_orig_sub_5D453C, 6);
+            t[6] = 0xE9;
+            int32_t rel = (int32_t)((uint8_t*)fn453C + 6 - (t + 11));
+            memcpy(t + 7, &rel, 4);
+        }
+        patch_jmp(fn453C, (void*)load_func_hook);
+        FlushInstructionCache(GetCurrentProcess(), fn453C, 6);
+        dbg_log("Hooked sub_5D453C entry (load + compile)");
+    }
+
+    // ==== Patch `mov eax, GM80_ProjectPath` at 0x5DBF14 / 0x5DBF2B ====
+    // (run-game flow, sub_5DBEAC). Replaced with `call compile_path_eax` —
+    // EAX gets the .gm80 FOLDER for .gm80 projects instead of the metadata
+    // FILE path. 0x5DBF14 feeds the compile (embedded into the exe);
+    // 0x5DBF2B feeds the game's command-line argument, from which the game
+    // derives working_directory (verified: double-clicking the exe with no
+    // argument makes working_directory = exe folder). 0x1EA27C itself keeps
+    // the metadata-file path for IDE semantics.
+    {
+        void* dest = base + 0x1DBF14;
+        patch_call(dest, (void*)compile_path_eax);
+        dbg_log("Patched 0x5DBF14 (compile project path -> folder)");
+    }
+    {
+        void* dest = base + 0x1DBF2B;
+        patch_call(dest, (void*)compile_path_eax);
+        dbg_log("Patched 0x5DBF2B (run command-line project path -> folder)");
+    }
+
+    // NOTE: hooking sub_521D84 (game launch) crashed Softwrap.dll (GM 8.0's
+    // DRM DLL watches process creation) — do NOT inline-hook that function.
+    // The .gm80 game cwd is instead set during compile (see
+    // fix_compile_project_path), which is on our existing hook path.
 
     // ==== Hook sub_59B28C call at 0x59B91B (INSIDE GM80_LoadRecentProject) ====
     // At this point: InitializeProject has run, MM is ready, stream loaded.

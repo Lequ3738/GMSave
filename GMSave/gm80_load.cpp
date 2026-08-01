@@ -1098,6 +1098,23 @@ static bool gm80_action_fill_in(void* act, uint32_t libId, uint32_t actId) {
     return false;
 }
 
+// Advance GM's progress bar (sub_5996B8) to an ABSOLUTE position 0..100 —
+// the position is passed in EAX (sub_5996B8 forwards it to PBM_SETPOS via
+// sub_49C530; GM's own callers do `mov eax, N; call sub_5996B8`). The
+// progress form is shown by GM80_LoadRecentProject before our hook runs.
+void gm80_progress_step(int pos) {
+    if (pos < 0) pos = 0;
+    if (pos > 100) pos = 100;
+    uint8_t* b = (uint8_t*)g_load_base;
+    if (!b) b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return;
+    uint32_t fn = (uint32_t)b + 0x1996B8;
+    __asm {
+        mov eax, pos
+        call fn
+    }
+}
+
 // SEH wrapper for FillIn — must be its own function: __try cannot coexist
 // with C++ objects needing unwinding. The library-template search AVs when
 // GM hasn't built the library array yet; catch it here so GM's SEH never
@@ -1962,10 +1979,12 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     // 2. Read root .gm80 metadata
     auto stem = root.filename();
     std::string projName = "";
+    fs::path metaFile;   // the .gm80 metadata FILE inside the project folder
     // Find the .gm80 metadata file
     for (auto& entry : fs::directory_iterator(root)) {
         auto ext = entry.path().extension().string();
         if (ext == ".gm80" || entry.path().filename().string().find(".gm80") != std::string::npos) {
+            metaFile = entry.path();
             std::string meta = read_file(entry.path());
             if (!meta.empty()) {
                 parse_kv(meta, [&](auto& k, auto& v) {
@@ -2009,31 +2028,37 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     gm80l_log("Loading sounds...");
     load_assets_simple("sounds", load_sound, find_res("sounds"), root);
     gm80l_log("Sounds done.");
+    gm80_progress_step(10);
 
     // 6. Load sprites
     gm80l_log("Loading sprites...");
     load_assets_simple("sprites", load_sprite_obj, find_res("sprites"), root);
     gm80l_log("Sprites done.");
+    gm80_progress_step(20);
 
     // 7. Load backgrounds
     gm80l_log("Loading backgrounds...");
     load_assets_simple("backgrounds", load_bg_obj, find_res("backgrounds"), root);
     gm80l_log("Backgrounds done.");
+    gm80_progress_step(30);
 
     // 8. Load paths
     gm80l_log("Loading paths...");
     load_assets_simple("paths", load_path_obj, find_res("paths"), root);
     gm80l_log("Paths done.");
+    gm80_progress_step(40);
 
     // 9. Load scripts
     gm80l_log("Loading scripts...");
     load_assets_simple("scripts", load_script, find_res("scripts"), root);
     gm80l_log("Scripts done.");
+    gm80_progress_step(50);
 
     // 10. Load fonts
     gm80l_log("Loading fonts...");
     load_assets_simple("fonts", load_font, find_res("fonts"), root);
     gm80l_log("Fonts done.");
+    gm80_progress_step(60);
 
     // 11. Load objects (needs sprite + object name context)
     // NOTE: the action-library array is only built by GM's sub_5A93B4, which
@@ -2048,6 +2073,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         load_assets_ctx("objects", load_object, find_res("objects"), root, names, sprites);
     }
     gm80l_log("Objects done.");
+    gm80_progress_step(70);
 
     // 12. Load rooms (needs object + background name context)
     gm80l_log("Loading rooms...");
@@ -2058,6 +2084,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         load_assets_ctx("rooms", load_room_obj, find_res("rooms"), root, objs, bgs);
     }
     gm80l_log("Rooms done.");
+    gm80_progress_step(80);
 
     // 13. Resource tree (tree.yyd per type) — needed for the IDE to display assets
     gm80l_log("Loading resource trees...");
@@ -2073,11 +2100,13 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         }
     }
     gm80l_log("Resource trees done.");
+    gm80_progress_step(90);
 
     // 14. Load timelines (before objects — they share the Event/Action system)
     gm80l_log("Loading timelines...");
     load_assets_simple("timelines", load_timeline, find_res("timelines"), root);
     gm80l_log("Timelines done.");
+    gm80_progress_step(100);
 
     // 15. Clear all updated flags
     clear_all_updated_flags();
@@ -2102,24 +2131,23 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         }
     }
 
-    // 18. GM80_ProjectPath (0x1EA27C): GM sets this to the .gm80 metadata
-    // FILE on drag-drop, so the running game's working_directory (derived
-    // via ExtractFilePath) resolves to the .gm80 folder. Overwrite it with
-    // the .gm80 project FOLDER — ExtractFilePath then yields the folder's
-    // PARENT, the real project root, matching .gmk behaviour. Save
-    // detection (check_and_do_gm80_save checks the ".gm80" suffix) and the
-    // load thunk keep working: the folder name itself ends in ".gm80".
+    // 18. GM80_ProjectPath (0x1EA27C): GM's project-path semantics are the
+    // FILE path (a .gmk file; for .gm80 the metadata FILE inside the project
+    // folder — matching gm82save's PROJECT_PATH = folder\folder.gm82). This
+    // is what Recent Projects stores and what the open/load flows use, so
+    // set it to the metadata file path, not the folder.
     {
-        std::wstring wroot = root.wstring();
-        int alen = WideCharToMultiByte(CP_ACP, 0, wroot.c_str(),
-                                       (int)wroot.size(), NULL, 0, NULL, NULL);
+        fs::path projFile = metaFile.empty() ? (root / stem) : metaFile;
+        std::wstring wproj = projFile.wstring();
+        int alen = WideCharToMultiByte(CP_ACP, 0, wproj.c_str(),
+                                       (int)wproj.size(), NULL, 0, NULL, NULL);
         if (alen > 0) {
-            std::string aroot(alen, '\0');
-            WideCharToMultiByte(CP_ACP, 0, wroot.c_str(), (int)wroot.size(),
-                                &aroot[0], alen, NULL, NULL);
-            write_glob_str(0x1EA27C, aroot);
+            std::string aproj(alen, '\0');
+            WideCharToMultiByte(CP_ACP, 0, wproj.c_str(), (int)wproj.size(),
+                                &aproj[0], alen, NULL, NULL);
+            write_glob_str(0x1EA27C, aproj);
             gm80l_log("gm80_load_project: GM80_ProjectPath set to '%s'",
-                      aroot.c_str());
+                      aproj.c_str());
         }
     }
 
