@@ -94,6 +94,19 @@ static std::string to_str(unsigned v) { return std::to_string(v); }
 static std::string to_str(double v) { char b[64]; snprintf(b, 64, "%.17g", v); return b; }
 
 // ==== File output via Win32 ====
+// Read a whole file (ANSI path) as bytes — for included-file source copies
+static std::string read_file_ansi(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return "";
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string r;
+    if (sz > 0 && sz < 64 * 1024 * 1024) { r.resize((size_t)sz); fread(&r[0], 1, (size_t)sz, f); }
+    fclose(f);
+    return r;
+}
+
 static bool wf(const std::wstring& fp, const std::string& content) {
     auto lp = fp.find_last_of(L"\\/");
     if (lp != std::wstring::npos) {
@@ -898,6 +911,44 @@ static void* tree_get_root(void* base, uint32_t kind) {
     return nullptr;
 }
 
+// Extract the F1 help text from the GameInfo RichEdit control.
+// Chain: [0x5EAEE8] → [p] → +0x360 → +0x298 → vtable+0x78 (SaveToStream).
+// __try lives here in a POD-only frame (no C++ object unwinding).
+static bool extract_richtext(uint8_t* b, std::string* out) {
+    out->clear();
+    __try {
+        uint32_t p = *(uint32_t*)(b + 0x1EAEE8);
+        uint32_t obj = p ? *(uint32_t*)p : 0;
+        uint32_t sub = obj ? *(uint32_t*)(obj + 0x360) : 0;
+        uint32_t re = sub ? *(uint32_t*)(sub + 0x298) : 0;
+        if (!(re && re >= 0x10000)) return false;
+        uint32_t streamCls = *(uint32_t*)(b + 0xEA854);
+        if (streamCls < 0x400000) streamCls = *(uint32_t*)(b + 0xEA8A0);
+        void* stream = nullptr;
+        __asm {
+            mov dl, 1
+            mov eax, streamCls
+            mov ecx, 0x404560
+            call ecx
+            mov stream, eax
+        }
+        if (!stream) return false;
+        __asm {
+            mov eax, re
+            mov edx, stream
+            mov ecx, [eax]
+            call dword ptr [ecx+0x78]   // RichEdit.SaveToStream
+        }
+        uint8_t* mem = *(uint8_t**)((uint8_t*)stream + 4);
+        uint32_t size = *(uint32_t*)((uint8_t*)stream + 8);
+        if (mem && size > 0 && size < 64 * 1024 * 1024) {
+            out->assign((char*)mem, size);
+            return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
 // ==== Main save function ====
 bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     g_save_base = gm_base;
@@ -960,7 +1011,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         m += "exe_version=" + to_str(GU32(0x1E943C)) + "." + to_str(GU32(0x1E9440)) +
              "." + to_str(GU32(0x1E9444)) + "." + to_str(GU32(0x1E9448)) + "\n\n";
         m += "has_backgrounds=" + to_str(!bgNames.empty()) + "\n";
-        m += "has_datafiles=0\n";
+        m += "has_datafiles=" + to_str(*(uint32_t*)((uint8_t*)g_save_base + 0x1E9398) > 0) + "\n";
         m += "has_fonts=" + to_str(!fontNames.empty()) + "\n";
         m += "has_objects=" + to_str(!objectNames.empty()) + "\n";
         m += "has_paths=" + to_str(!pathNames.empty()) + "\n";
@@ -1021,6 +1072,63 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         L("error_on_uninitialized_args", "0");             // no GM80 global
         wf(sub(L"settings\\settings.txt"), s);
 
+        // Constants — settings/constants.txt (gm82save parity; was never saved).
+        // GM 8.0 lists (verified GM80_SaveConstants 0x573618): names 0x1F1C90,
+        // values 0x1F1C94 (arrays of AnsiString data ptrs), count 0x1E932C.
+        {
+            uint8_t* b = (uint8_t*)g_save_base;
+            uint32_t cnt = *(uint32_t*)(b + 0x1E932C); // GM80_Count_Constants
+            if (cnt > 0 && cnt < 10000) {
+                uint32_t* nameArr = *(uint32_t**)(b + 0x1F1C90);
+                uint32_t* valArr  = *(uint32_t**)(b + 0x1F1C94);
+                if (nameArr && valArr) {
+                    std::string c;
+                    for (uint32_t i = 0; i < cnt; i++) {
+                        const char* n = nameArr[i] ? (const char*)(uintptr_t)nameArr[i] : "";
+                        const char* v = valArr[i]  ? (const char*)(uintptr_t)valArr[i]  : "";
+                        c += std::string(n) + "=" + std::string(v) + "\n";
+                    }
+                    wf(sub(L"settings\\constants.txt"), c);
+                }
+            }
+        }
+
+        // Game Information — GM80_SaveGameInfo 0x5991A0. Fields:
+        //   caption 0x1E936C (off_5E936C), window pos/size dwords 0x1E9370/74/78/7C,
+        //   flags byte_5E9368 + byte_5E9380/84/88/8C.
+        // The F1 help TEXT lives in a RichEdit control, reached via
+        //   [0x5EAEE8] → [p] → +0x360 → +0x298 → vtable+0x78 (SaveToStream).
+        {
+            uint8_t* b = (uint8_t*)g_save_base;
+            std::string g;
+            auto GL = [&](const char* k, const std::string& v) { g += std::string(k) + "=" + v + "\n"; };
+            // Background colour: editor = [[0x5EAEE8]+0x360]. GM80_SaveGameInfo
+            // reads [editor+0x70] (verified 0xFF = user-set red, not the
+            // [obj+0x47C] field). Load restores it via sub_460D00 (SetColor).
+            {
+                uint32_t p = *(uint32_t*)(b + 0x1EAEE8);
+                uint32_t obj = p ? *(uint32_t*)p : 0;
+                uint32_t ed = obj ? *(uint32_t*)(obj + 0x360) : 0;
+                GL("color", to_str(ed && ed >= 0x10000 ? *(uint32_t*)(ed + 0x70) : 0));
+            }
+            GL("caption", encode_delimit(GS(0x1E936C)));
+            GL("byte_9368", to_str((unsigned)*(uint8_t*)(b + 0x1E9368)));
+            GL("left", to_str(*(uint32_t*)(b + 0x1E9370)));
+            GL("top", to_str(*(uint32_t*)(b + 0x1E9374)));
+            GL("width", to_str(*(uint32_t*)(b + 0x1E9378)));
+            GL("height", to_str(*(uint32_t*)(b + 0x1E937C)));
+            GL("byte_9380", to_str((unsigned)*(uint8_t*)(b + 0x1E9380)));
+            GL("byte_9384", to_str((unsigned)*(uint8_t*)(b + 0x1E9384)));
+            GL("byte_9388", to_str((unsigned)*(uint8_t*)(b + 0x1E9388)));
+            GL("byte_938C", to_str((unsigned)*(uint8_t*)(b + 0x1E938C)));
+            wf(sub(L"settings\\gameinfo.txt"), g);
+
+            // F1 help text (RichEdit content) → gameinfo.rtf
+            std::string rtf;
+            if (extract_richtext(b, &rtf) && !rtf.empty())
+                wf(sub(L"settings\\gameinfo.rtf"), rtf);
+        }
+
         // NOTE: absolute paths via sub() — relative paths would land in the
         // process cwd (outside the .gm80 project folder).
         save_bitmap_to_file(*(uint32_t*)((uint8_t*)g_save_base + 0x1E940C), sub(L"settings\\back.bmp").c_str());
@@ -1050,6 +1158,61 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
             }
             if (!exts.empty())
                 wf(sub(L"settings\\extensions.txt"), exts);
+        }
+    }
+
+    // ==== Included files (datafiles/) — gm82save format ====
+    // GM 8.0 (verified GM80_SaveIncludedFiles 0x59AE20): count 0x1E9398,
+    // object array 0x1E9390, timestamps 0x1E9394. IncludedFile object:
+    // +4 file_name, +8 source_path, +12 data_exists, +16 source_length,
+    // +20 stored_in_gmk, +24 data (TMemoryStream*), +28 export_setting,
+    // +32 export_custom_folder, +36 overwrite, +37 free, +38 remove_at_end.
+    {
+        uint8_t* b = (uint8_t*)g_save_base;
+        uint32_t ifCnt = *(uint32_t*)(b + 0x1E9398);
+        uint32_t* ifArr = *(uint32_t**)(b + 0x1E9390);
+        if (ifCnt > 0 && ifCnt < 10000 && ifArr) {
+            CreateDirectoryW(sub(L"datafiles").c_str(), NULL);
+            CreateDirectoryW(sub(L"datafiles\\include").c_str(), NULL);
+            std::string index;
+            for (uint32_t i = 0; i < ifCnt; i++) {
+                void* f = (void*)(uintptr_t)ifArr[i];
+                if (!f) continue;
+                std::string name = RS(f, 4);
+                if (name.empty()) continue;
+                std::wstring wname(name.begin(), name.end());
+                index += name + "\n";
+                bool dataExists = *(uint8_t*)((uint8_t*)f + 12) != 0;
+                bool storedInGmk = *(uint8_t*)((uint8_t*)f + 20) != 0;
+                if (dataExists) {
+                    std::string content;
+                    if (storedInGmk) {
+                        uint8_t* stream = *(uint8_t**)((uint8_t*)f + 24);
+                        if (stream) {
+                            uint8_t* mem = *(uint8_t**)(stream + 4);
+                            uint32_t size = *(uint32_t*)(stream + 8);
+                            if (mem && size > 0 && size < 64 * 1024 * 1024)
+                                content.assign((char*)mem, size);
+                        }
+                    } else {
+                        std::string src = RS(f, 8);
+                        if (!src.empty()) content = read_file_ansi(src);
+                    }
+                    if (!content.empty())
+                        wf(sub((L"datafiles\\include\\" + wname).c_str()), content);
+                }
+                std::string meta;
+                auto ML = [&](const char* k, const std::string& v) { meta += std::string(k) + "=" + v + "\n"; };
+                ML("store", to_str(storedInGmk ? 1 : 0));
+                ML("free", to_str((unsigned)*(uint8_t*)((uint8_t*)f + 37)));
+                ML("overwrite", to_str((unsigned)*(uint8_t*)((uint8_t*)f + 36)));
+                ML("remove", to_str((unsigned)*(uint8_t*)((uint8_t*)f + 38)));
+                uint32_t exportSetting = R4(f, 28);
+                ML("export", to_str(exportSetting));
+                if (exportSetting == 3) ML("export_folder", RS(f, 32));
+                wf(sub((L"datafiles\\" + wname + L".txt").c_str()), meta);
+            }
+            wf(sub(L"datafiles\\index.yyd"), index);
         }
     }
 
@@ -1189,7 +1352,9 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                 void* tlObj = (void*)(uintptr_t)tlArr[i];
                 if (!tlObj) continue;
                 std::wstring wname(tlNames[i].begin(), tlNames[i].end());
-                save_timeline(tlObj, objectNames, sub((L"timelines\\" + wname + L".gml").c_str()));
+                // save_timeline appends ".gml" itself (like scripts/conditions).
+                // Was "...+wname+L".gml"" → double ".gml.gml" filename.
+                save_timeline(tlObj, objectNames, sub((L"timelines\\" + wname).c_str()));
             }
         }
     }

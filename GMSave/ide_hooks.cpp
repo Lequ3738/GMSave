@@ -4,7 +4,6 @@
 #include "gm80_addresses.h"
 #include "delphi.h"
 #include "gm80_save.h"
-#include "gmk_format.h"
 #include "gm80_load.h"
 #include <cstdarg>
 #include <ctime>
@@ -220,105 +219,6 @@ static void read_name_array(uint8_t* base, uint32_t name_off, uint32_t cnt_off,
         if (len == 0 || len > 200000) { out.push_back(std::string(p)); continue; }
         out.push_back(std::string(p, len));
     }
-}
-
-// Populate GMKProject from IDE globals
-static void read_ide_project(GMKProject& proj) {
-    uint8_t* base = (uint8_t*)g_gm_base;
-    proj.game_id = *(uint32_t*)(base + ADDR_GAME_ID);
-
-    // Settings verified from GM80_SaveSettings/LoadSettings disasm (2026-08-02):
-    // fullscreen=0x1E93A0(byte), scaling=0x1E93B0(i32), clear_color=0x1E93BC(u32),
-    // priority=0x1E93F8(u32), loading_bar=0x1E93FC(u32). Previously all shifted.
-    auto u32 = [&](uint32_t off) -> uint32_t { return *(uint32_t*)(base + off); };
-    auto u8  = [&](uint32_t off) -> uint32_t { return *(uint8_t*)(base + off); };
-    proj.settings.fullscreen         = u8(ADDR_SETTING_FULLSCREEN) != 0;
-    proj.settings.interpolate_pixels = u8(ADDR_SETTING_INTERPOLATE) != 0;
-    proj.settings.color_depth        = u32(ADDR_SETTING_COLOR_DEPTH);
-    proj.settings.resolution         = u32(ADDR_SETTING_RESOLUTION);
-    proj.settings.frequency          = u32(ADDR_SETTING_FREQUENCY);
-    proj.settings.scaling            = (int32_t)u32(ADDR_SETTING_SCALING);
-    proj.settings.clear_color        = u32(ADDR_SETTING_CLEAR_COLOR);
-    proj.settings.loading_bar        = u32(ADDR_SETTING_LOADING_BAR);
-    proj.settings.priority           = u32(ADDR_SETTING_PRIORITY);
-
-    // Read resource counts
-    proj.trigger_count = *(uint32_t*)(base + 0x1E92EC);
-    proj.sound_count   = *(uint32_t*)(base + 0x1E9288);
-    proj.sprite_count  = *(uint32_t*)(base + 0x1E911C);
-    proj.bg_count      = *(uint32_t*)(base + 0x1E90A8);
-    proj.path_count    = *(uint32_t*)(base + 0x1E92BC);
-    proj.script_count  = *(uint32_t*)(base + 0x1E92E4);
-    proj.font_count    = *(uint32_t*)(base + 0x1E92D0);
-    proj.tl_count      = *(uint32_t*)(base + 0x1E9310);
-    proj.object_count  = *(uint32_t*)(base + 0x1E9364);
-    proj.room_count    = *(uint32_t*)(base + 0x1E92A4);
-
-    // Read resource names and populate vectors
-    // Resource names from verified parallel name arrays (all at obj_array+8)
-    read_name_array(base, 0x1E9110, 0x1E911C, proj.sprite_names);
-    read_name_array(base, 0x1E92DC, 0x1E92E4, proj.script_names);
-    read_name_array(base, 0x1E935C, 0x1E9364, proj.object_names);
-    read_name_array(base, 0x1E929C, 0x1E92A4, proj.room_names);
-    read_name_array(base, 0x1E92B4, 0x1E92BC, proj.path_names);
-    read_name_array(base, 0x1E909C, 0x1E90A8, proj.bg_names);
-    // Triggers: names in object at +4 (different from other resources)
-    read_name_array(base, 0x1E92C8, 0x1E92D0, proj.font_names);
-    read_name_array(base, 0x1E9308, 0x1E9310, proj.tl_names); // triggers use object array as name source
-    // Triggers: names are inside objects at +4
-    {
-        uint32_t* arr = *(uint32_t**)(base + 0x1E92E8);
-        uint32_t cnt  = *(uint32_t*)(base + 0x1E92EC);
-        if (arr && cnt && cnt < 500) {
-            for (uint32_t i = 0; i < cnt; i++) {
-                void* obj = (void*)(uintptr_t)arr[i];
-                std::string name = obj ? obj_str(obj, 4) : "";
-                proj.trigger_names.push_back(name);
-            }
-        }
-    }
-
-    // Script sources from object+4
-    {
-        uint32_t* arr = *(uint32_t**)(base + 0x1E92D4);
-        uint32_t cnt  = *(uint32_t*)(base + 0x1E92E4);
-        if (arr && cnt && cnt < 50000) {
-            proj.script_sources.reserve(cnt);
-            for (uint32_t i = 0; i < cnt; i++) {
-                void* obj = (void*)(uintptr_t)arr[i];
-                std::string src = obj ? obj_str(obj, 4) : "";
-                proj.script_sources.push_back(src);
-            }
-        }
-    }
-
-    {
-        uint32_t* tarr = *(uint32_t**)(base + 0x1E92E8);
-        uint32_t tcnt = *(uint32_t*)(base + 0x1E92EC);
-        if (tarr && tcnt && tcnt < 500) {
-            proj.trigger_conditions.reserve(tcnt);
-            proj.trigger_constants.reserve(tcnt);
-            for (uint32_t i = 0; i < tcnt; i++) {
-                void* o = (void*)(uintptr_t)tarr[i];
-                if (o) {
-                    proj.trigger_conditions.push_back(obj_str(o, 8));
-                    proj.trigger_constants.push_back(obj_str(o, 12));
-                } else {
-                    proj.trigger_conditions.push_back("");
-                    proj.trigger_constants.push_back("");
-                }
-            }
-        }
-    }
-    proj.object_count  = *(uint32_t*)(base + 0x1E9364); // 126
-    proj.room_count    = *(uint32_t*)(base + 0x1E92A4); // 16
-
-    dbg_log(" IDE resources: trig=%u snd=%u sp=%u bg=%u pth=%u sc=%u fn=%u tl=%u obj=%u rm=%u",
-        proj.trigger_count, proj.sound_count, proj.sprite_count, proj.bg_count,
-        proj.path_count, proj.script_count, proj.font_count, proj.tl_count,
-        proj.object_count, proj.room_count);
-
-    // Dump first object of each type to discover field layouts
 }
 
 // Clear the 16 "updated/dirty" 1-byte bool flags that sub_59BA38 clears after save.
@@ -537,7 +437,6 @@ __declspec(naked) static void save_thunk() {
 
 // Static to pass file path from naked thunk to C function
 static const char* g_load_file_path = nullptr;
-static void* g_lrp_trampoline = nullptr;
 static void* g_msg_trampoline = nullptr;          // trampoline for ShowMessage hook
 static const char* g_msg_text = nullptr;          // EAX passed to ShowMessage
 
@@ -610,100 +509,6 @@ __declspec(naked) static void parse_gmk_or_gm80_thunk() {
     }
 }
 
-// OLD: SAFE entry hook for GM80_LoadRecentProject — replaced by call-site hook above
-__declspec(naked) static void lrp_safe_thunk() {
-    __asm {
-        cmp eax, 0x10000                // Reject low addresses (invalid ptrs)
-        jb pass_through
-        cmp eax, 0x80000000             // Reject kernel addresses
-        ja pass_through
-        push eax
-        mov g_load_file_path, eax
-        pushad
-        call check_and_do_gm80_load     // Safe: checks IsBadStringPtrA first
-        popad
-        pop eax                         // EAX = result (0=not handled, 1=handled)
-        cmp eax, 0
-        je pass_through
-        // Handled: g_load_file_path has temp .gmk, update EAX and jump to trampoline
-        mov eax, dword ptr [g_load_file_path]
-        jmp dword ptr [g_lrp_trampoline]
-    pass_through:
-        jmp dword ptr [g_lrp_trampoline]  // Same trampoline, original EAX preserved
-    }
-}
-
-// Call-site hook for "call GM80_LoadRecentProject" at 0x5DAB0C (drag-drop path)
-// On entry: EAX = project path. Returns AL = load success (0/1)
-// If .gm80 detected: generates temp .gmk, updates path global, calls original loader
-__declspec(naked) static void lrp_call_thunk() {
-    __asm {
-        cmp eax, 0
-        je call_original
-        push eax
-        mov g_load_file_path, eax
-        pushad
-        call check_and_do_gm80_load     // Returns 1 if .gm80 handled (temp .gmk created)
-        mov [esp+28], eax               // Store result in pushad EAX slot
-        popad
-        pop eax                         // EAX = original path
-        cmp eax, 0                      // Was it handled?
-        je call_original
-
-        // .gm80 handled: update EAX to temp .gmk path, call original, then restore
-        push ebx
-        push esi
-        mov esi, eax                    // save original path
-        mov eax, dword ptr [g_load_file_path]  // EAX = temp .gmk path
-        // Update GM80_ProjectPath global to temp .gmk
-        mov ebx, dword ptr [g_gm_base_ptr]
-        mov dword ptr [ebx + 0x1EA27C], eax
-        // Call original GM80_LoadRecentProject(temp .gmk path)
-        add ebx, 0x19B860              // GM80_LoadRecentProject RVA
-        call ebx                        // Load the temp .gmk!
-        // Save result, restore original .gm80 path
-        push eax                        // save AL result
-        mov eax, esi                    // restore original .gm80 path
-        mov ebx, dword ptr [g_gm_base_ptr]
-        mov dword ptr [ebx + 0x1EA27C], eax
-        pop eax                         // restore AL result
-        pop esi
-        pop ebx
-        ret
-
-    call_original:
-        // Not .gm80: call original GM80_LoadRecentProject(EAX) directly
-        push ecx
-        mov ecx, dword ptr [g_gm_base_ptr]
-        add ecx, 0x19B860
-        call ecx
-        pop ecx
-        ret
-    }
-}
-
-// OLD: Dedicated thunk for GM80_LoadRecentProject (0x59B860) — kept for reference
-__declspec(naked) static void lrp_thunk() {
-    __asm {
-        push eax                        // Save original path
-        mov g_load_file_path, eax       // Pass to C function
-        push ecx
-        push edx
-        pushad
-        call check_and_do_gm80_load     // Will detect .gm80 and create temp .gmk
-        popad
-        pop edx
-        pop ecx
-        pop eax                         // Original path back in EAX (will be overwritten if .gm80)
-        // If check_and_do_gm80_load handled it, use the updated path
-        push eax
-        mov eax, dword ptr [g_load_file_path]  // Get possibly-updated file path
-        mov [esp], eax                  // Store on stack
-        pop eax                         // EAX = updated path
-        // Jump to trampoline which runs orig function with updated EAX
-        jmp dword ptr [g_lrp_trampoline]
-    }
-}
 
 // Check if the file path (passed in EAX to sub_5D453C) is a .gm80 project
 static int __stdcall check_and_do_gm80_load() {
@@ -730,12 +535,6 @@ static int __stdcall check_and_do_gm80_load() {
         loadPath = loadPath.parent_path();
     }
     std::wstring dirPath = loadPath.wstring();
-
-    GMKProject proj;
-    if (!gm80_load_from_path(proj, dirPath)) {
-        dbg_log("Load: failed to parse .gm80");
-        return 0;
-    }
 
     // Direct Delphi object creation via gm80_load_project
     // (Delphi MM is ready — InitializeProject already ran at this point)

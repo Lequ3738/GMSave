@@ -3,7 +3,6 @@
 #include "pch.h"
 #include "gm80_load.h"
 #include "gm80_addresses.h"
-#include "gmk_format.h"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -798,16 +797,232 @@ static void load_settings(const fs::path& root) {
         }
         uint32_t cnt = (uint32_t)names.size();
         if (cnt > 0) {
-            // Resize constant arrays (same pattern as DelphiList)
-            write_glob_u32(0x1E91D8, cnt); // count
-            uint32_t* nameArr = *(uint32_t**)((uint8_t*)g_load_base + 0x1E91C8);
-            uint32_t* valArr  = *(uint32_t**)((uint8_t*)g_load_base + 0x1E91CC);
+            // GM 8.0 constant lists (verified GM80_LoadConstants 0x573514):
+            //   names array 0x1F1C90, values array 0x1F1C94 (Delphi dynamic
+            //   arrays via @DynArraySetLength), count 0x1E932C (GM80_Count_Constants),
+            //   timestamp 0x1F1CA0. Type infos off_57346C (UStr name) / 573494.
+            // The previous 0x1E91C8/0x1E91CC/0x1E91D8 had NO xrefs — wrong.
+            uint8_t* b = (uint8_t*)g_load_base;
+            uint32_t fn = (uint32_t)b + 0x6A38; // @DynArraySetLength (ADDR_DYN_ARRAY_SETLENGTH, defined later)
+            for (int which = 0; which < 2; which++) {
+                uint32_t arrAddr = (uint32_t)b + (which ? 0x1F1C94 : 0x1F1C90);
+                uint32_t ti = *(uint32_t*)(b + (which ? 0x173494 : 0x17346C));
+                uint32_t* cur = *(uint32_t**)arrAddr;
+                if (cur == (uint32_t*)-1) *(uint32_t**)arrAddr = nullptr;
+                __asm {
+                    mov eax, arrAddr
+                    mov edx, ti
+                    mov ecx, 1
+                    push cnt
+                    call fn
+                    add esp, 4
+                }
+            }
+            write_glob_u32(0x1E932C, cnt); // GM80_Count_Constants
+            uint32_t* nameArr = *(uint32_t**)(b + 0x1F1C90);
+            uint32_t* valArr  = *(uint32_t**)(b + 0x1F1C94);
             for (uint32_t i = 0; i < cnt; i++) {
                 if (nameArr) nameArr[i] = (uint32_t)(uintptr_t)make_delphi_str(names[i]);
                 if (valArr)  valArr[i]  = (uint32_t)(uintptr_t)make_delphi_str(values[i]);
             }
         }
     }
+}
+
+// Load Game Information (settings/gameinfo.txt → 0x1E936C text + byte flags).
+// Mirrors GM80_SaveGameInfo 0x5991A0 fields: off_5E936C = the F1 help text,
+// byte_5E9368 / byte_5E9380/84/88/8C = window flags.
+static void* make_memory_stream(const std::string& data);
+
+// Restore the F1 help text into the GameInfo RichEdit control.
+// Chain: [0x5EAEE8] → [p] → +0x360 → +0x298 → vtable+0x6C (LoadFromStream).
+// __try lives here in a POD-only frame (no C++ object unwinding).
+static void restore_richtext(uint8_t* b, const uint8_t* data, uint32_t len) {
+    __try {
+        uint32_t p = *(uint32_t*)(b + 0x1EAEE8);
+        uint32_t obj = p ? *(uint32_t*)p : 0;
+        uint32_t sub = obj ? *(uint32_t*)(obj + 0x360) : 0;
+        uint32_t re = sub ? *(uint32_t*)(sub + 0x298) : 0;
+        if (!(re && re >= 0x10000) || !data || len == 0) return;
+        uint32_t streamCls = *(uint32_t*)(b + 0xEA854);
+        if (streamCls < 0x400000) streamCls = *(uint32_t*)(b + 0xEA8A0);
+        void* stream = nullptr;
+        __asm {
+            mov dl, 1
+            mov eax, streamCls
+            mov ecx, 0x404560
+            call ecx
+            mov stream, eax
+        }
+        if (!stream) return;
+        char* bufPtr = (char*)data;
+        uint32_t bufLen = len;
+        __asm {
+            mov eax, stream
+            mov edx, bufPtr
+            mov ecx, bufLen
+            mov ebx, 0x41F8E8
+            call ebx
+        }
+        *(uint32_t*)((uint8_t*)stream + 12) = 0; // FPosition
+        __asm {
+            mov eax, re
+            mov edx, stream
+            mov ecx, [eax]
+            call dword ptr [ecx+0x6C]   // RichEdit.LoadFromStream
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Apply the game info background colour via sub_460D00 (SetColor: writes
+// [editor+0x70], clears [editor+0x5A], redraws). __try in a POD-only frame.
+static void restore_gameinfo_color(uint8_t* b, uint32_t color) {
+    __try {
+        uint32_t p = *(uint32_t*)(b + 0x1EAEE8);
+        uint32_t obj = p ? *(uint32_t*)p : 0;
+        uint32_t ed = obj ? *(uint32_t*)(obj + 0x360) : 0;
+        if (!(ed && ed >= 0x10000)) return;
+        uint32_t fn = (uint32_t)b + 0x60D00; // sub_460D00 = TControl.SetColor
+        __asm {
+            mov eax, ed
+            mov edx, color
+            mov ebx, fn
+            call ebx
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void load_gameinfo(const fs::path& root) {
+    uint8_t* b = (uint8_t*)g_load_base;
+    std::string txt = read_file(root / "settings" / "gameinfo.txt");
+    if (!txt.empty()) {
+        parse_kv(txt, [&](auto& k, auto& v) {
+            if (k == "color") restore_gameinfo_color(b, (uint32_t)std::stoul(v));
+            else if (k == "caption" || k == "text") write_glob_str(0x1E936C, decode_delimit(v));
+            else if (k == "byte_9368") *(uint8_t*)(b + 0x1E9368) = (uint8_t)std::stoul(v);
+            else if (k == "left") *(uint32_t*)(b + 0x1E9370) = (uint32_t)std::stoul(v);
+            else if (k == "top") *(uint32_t*)(b + 0x1E9374) = (uint32_t)std::stoul(v);
+            else if (k == "width") *(uint32_t*)(b + 0x1E9378) = (uint32_t)std::stoul(v);
+            else if (k == "height") *(uint32_t*)(b + 0x1E937C) = (uint32_t)std::stoul(v);
+            else if (k == "byte_9380") *(uint8_t*)(b + 0x1E9380) = (uint8_t)std::stoul(v);
+            else if (k == "byte_9384") *(uint8_t*)(b + 0x1E9384) = (uint8_t)std::stoul(v);
+            else if (k == "byte_9388") *(uint8_t*)(b + 0x1E9388) = (uint8_t)std::stoul(v);
+            else if (k == "byte_938C") *(uint8_t*)(b + 0x1E938C) = (uint8_t)std::stoul(v);
+        });
+    }
+    // F1 help text (RichEdit content) from settings/gameinfo.rtf.
+    std::string rtf = read_file(root / "settings" / "gameinfo.rtf");
+    if (!rtf.empty())
+        restore_richtext(b, (const uint8_t*)rtf.data(), (uint32_t)rtf.size());
+}
+
+// Create a TMemoryStream filled with data (FPosition=0). Same class chain as
+// the icon/loading-bar load (off_4EA854 → 0x4EA8A0).
+static void* make_memory_stream(const std::string& data) {
+    if (data.empty()) return nullptr;
+    uint8_t* base = (uint8_t*)g_load_base;
+    uint32_t streamCls = *(uint32_t*)(base + 0xEA854);
+    if (streamCls < 0x400000) streamCls = *(uint32_t*)(base + 0xEA8A0);
+    void* stream = nullptr;
+    __asm {
+        mov dl, 1
+        mov eax, streamCls
+        mov ecx, 0x404560
+        call ecx
+        mov stream, eax
+    }
+    if (!stream) return nullptr;
+    char* bufPtr = (char*)data.data();
+    uint32_t bufLen = (uint32_t)data.size();
+    __asm {
+        mov eax, stream
+        mov edx, bufPtr
+        mov ecx, bufLen
+        mov ebx, 0x41F8E8
+        call ebx
+    }
+    *(uint32_t*)((uint8_t*)stream + 12) = 0; // FPosition
+    return stream;
+}
+
+// Load included files (datafiles/) — gm82save format.
+// GM 8.0 (verified GM80_LoadIncludedFiles 0x59ADA4): count 0x1E9398, object
+// array 0x1E9390 (SetLength via off_59AC58 type info), timestamps 0x1E9394
+// (off_59AC80). Object ctor GM80_IncludedFile_Create (0x5997B8), class ref
+// [0x599714]=0x5993E0. Fields: +4 name, +8 source_path, +12 data_exists,
+// +16 source_length, +20 stored_in_gmk, +24 data TMemoryStream*,
+// +28 export_setting, +32 export_folder, +36 overwrite, +37 free, +38 remove.
+static void load_included_files(const fs::path& root) {
+    std::string idx = read_file(root / "datafiles" / "index.yyd");
+    if (idx.empty()) return;
+    std::vector<std::string> names;
+    std::istringstream ss(idx);
+    std::string line;
+    while (std::getline(ss, line)) if (!line.empty()) names.push_back(line);
+    uint32_t cnt = (uint32_t)names.size();
+    if (cnt == 0 || cnt > 10000) return;
+    uint8_t* b = (uint8_t*)g_load_base;
+    // SetLength object + timestamp arrays
+    uint32_t fn = (uint32_t)b + 0x6A38; // @DynArraySetLength
+    for (int which = 0; which < 2; which++) {
+        uint32_t arrAddr = (uint32_t)b + (which ? 0x1E9394 : 0x1E9390);
+        uint32_t ti = *(uint32_t*)(b + (which ? 0x19AC80 : 0x19AC58));
+        uint32_t* cur = *(uint32_t**)arrAddr;
+        if (cur == (uint32_t*)-1) *(uint32_t**)arrAddr = nullptr;
+        __asm {
+            mov eax, arrAddr
+            mov edx, ti
+            mov ecx, 1
+            push cnt
+            call fn
+            add esp, 4
+        }
+    }
+    write_glob_u32(0x1E9398, cnt);
+    uint32_t* objArr = *(uint32_t**)(b + 0x1E9390);
+    uint32_t cls = *(uint32_t*)(b + 0x199714); // [0x599714] = IncludedFile class ref
+    for (uint32_t i = 0; i < cnt; i++) {
+        void* f = nullptr;
+        __asm {
+            mov eax, cls
+            mov dl, 1
+            xor ecx, ecx
+            mov ebx, 0x5997B8          // GM80_IncludedFile_Create
+            call ebx
+            mov f, eax
+        }
+        if (!f || f == (void*)cls) continue;
+        std::string meta = read_file(root / "datafiles" / (names[i] + ".txt"));
+        bool stored = false, overwrite = false, freeMem = false, removeAtEnd = false;
+        uint32_t exportSetting = 0;
+        std::string exportFolder;
+        parse_kv(meta, [&](auto& k, auto& v) {
+            if (k == "store") stored = (v == "1");
+            else if (k == "overwrite") overwrite = (v == "1");
+            else if (k == "free") freeMem = (v == "1");
+            else if (k == "remove") removeAtEnd = (v == "1");
+            else if (k == "export") exportSetting = (uint32_t)std::stoul(v);
+            else if (k == "export_folder") exportFolder = v;
+        });
+        set_obj_str(f, 4, names[i]);
+        set_obj_str(f, 8, (root / "datafiles" / "include" / names[i]).string());
+        set_obj_u32(f, 28, exportSetting);
+        if (!exportFolder.empty()) set_obj_str(f, 32, exportFolder);
+        *(uint8_t*)((uint8_t*)f + 36) = overwrite ? 1 : 0;
+        *(uint8_t*)((uint8_t*)f + 37) = freeMem ? 1 : 0;
+        *(uint8_t*)((uint8_t*)f + 38) = removeAtEnd ? 1 : 0;
+        std::string content = read_file(root / "datafiles" / "include" / names[i]);
+        if (stored && !content.empty()) {
+            *(uint8_t*)((uint8_t*)f + 12) = 1;   // data_exists
+            set_obj_u32(f, 16, (uint32_t)content.size()); // source_length
+            *(uint8_t*)((uint8_t*)f + 20) = 1;   // stored_in_gmk
+            set_obj_ptr(f, 24, make_memory_stream(content));
+        } else {
+            *(uint8_t*)((uint8_t*)f + 20) = stored ? 1 : 0;
+        }
+        if (objArr) objArr[i] = (uint32_t)(uintptr_t)f;
+    }
+    *(uint8_t*)(b + 0x1F6210) = 0; // clear updated flag
 }
 
 // ==== Load extensions (settings/extensions.txt → loaded flags) ====
@@ -904,10 +1119,15 @@ static void* load_font(const std::string& name, const fs::path& fontDir) {
     void* font = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!font) return nullptr;
 
-    set_obj_str(font, 4, name);
+    // +4 = sys_name (font FAMILY name, e.g. "Arial"), NOT the resource name.
+    // The resource name goes to the parallel names array (load_assets_simple);
+    // overwriting +4 here with the resource name made the font unrenderable.
+    // Verified: GM's font load (sub_557B2C) stores the stream string at [font+4];
+    // gm82save Font { vmt, sys_name: UStr, size, bold, italic, ... }.
     parse_kv(txt, [&](auto& k, auto& v) {
         // GM 8.0 has no charset/aa_level fields (save side hardcodes 0)
-        if (k == "size") set_obj_u32(font, 8, (uint32_t)std::stoul(v));
+        if (k == "name") set_obj_str(font, 4, v);
+        else if (k == "size") set_obj_u32(font, 8, (uint32_t)std::stoul(v));
         else if (k == "bold") set_obj_bool(font, 12, v == "1");
         else if (k == "italic") set_obj_bool(font, 13, v == "1");
         else if (k == "range_start") set_obj_u32(font, 16, (uint32_t)std::stoul(v));
@@ -1340,6 +1560,20 @@ static bool fill_in_safe(void* act, uint32_t libId, uint32_t actId) {
 }
 
 
+// Resource name → index maps for action parameters (gm82save parity: a
+// resource-typed action param stores the INDEX in param_strings, converted
+// from the name in the file. The save side reverses it via stoi → name).
+struct AssetNameMaps {
+    std::vector<std::string> sprites, sounds, bgs, paths, scripts,
+                             objects, rooms, fonts, timelines;
+    static int find(const std::vector<std::string>& v, const std::string& name) {
+        for (size_t i = 0; i < v.size(); i++) if (v[i] == name) return (int)i;
+        return -1;
+    }
+};
+// Populated once per load in gm80_load_project before objects/timelines load.
+static AssetNameMaps g_action_names;
+
 // Parse YYD ACTION blocks from a body string into an Event (shared by
 // objects and timelines). Matches gm82save's load_event + save side format.
 static void parse_actions_into_event(void* ev, const std::string& body,
@@ -1415,8 +1649,34 @@ static void parse_actions_into_event(void* ev, const std::string& body,
         // Write params that appeared in the block — empty values included: an
         // explicit `arg0=` must override the template default; a missing arg
         // keeps the template's default (gm82save parity).
-        for (int j = 0; j < 8; j++)
-            if (pset[j]) set_obj_str(act, 76 + j * 4, decode_delimit(pstrs[j]));
+        // Resource-typed params (param_types[j] in 5..14, except 13) store the
+        // resource INDEX in param_strings (gm82save load.rs does the same
+        // name→index conversion). The file has the name ("arg0=fMain"); convert
+        // it here so the save side's stoi round-trips instead of throwing
+        // "invalid stoi argument" on a non-numeric name.
+        for (int j = 0; j < 8; j++) {
+            if (!pset[j]) continue;
+            std::string pv = decode_delimit(pstrs[j]);
+            uint32_t ptype = *(uint32_t*)((uint8_t*)act + 36 + j * 4); // param_types[j]
+            if (ptype >= 5 && ptype <= 14 && ptype != 13) {
+                int idx = -1;
+                if (!pv.empty()) {
+                    switch (ptype) {
+                        case 5:  idx = AssetNameMaps::find(g_action_names.sprites, pv); break;
+                        case 6:  idx = AssetNameMaps::find(g_action_names.sounds, pv); break;
+                        case 7:  idx = AssetNameMaps::find(g_action_names.bgs, pv); break;
+                        case 8:  idx = AssetNameMaps::find(g_action_names.paths, pv); break;
+                        case 9:  idx = AssetNameMaps::find(g_action_names.scripts, pv); break;
+                        case 10: idx = AssetNameMaps::find(g_action_names.objects, pv); break;
+                        case 11: idx = AssetNameMaps::find(g_action_names.rooms, pv); break;
+                        case 12: idx = AssetNameMaps::find(g_action_names.fonts, pv); break;
+                        case 14: idx = AssetNameMaps::find(g_action_names.timelines, pv); break;
+                    }
+                }
+                pv = std::to_string(idx);
+            }
+            set_obj_str(act, 76 + j * 4, pv);
+        }
 
         // action_kind: the template's value when the action is known (never
         // inferred); structural inference only for unknown actions.
@@ -1750,6 +2010,14 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
 
     // Instances + tiles (instances.txt / layers.txt) — see load_room_instances
     load_room_instances(rm, subDir, objectNames, bgNames);
+
+    // Creation code (code.gml, saved by save_room from +748; matches gm82save
+    // Room.creation_code which sits after the 8 views at 300+8*56=748).
+    {
+        fs::path codePath = subDir / "code.gml";
+        std::string code = read_file(codePath);
+        if (!code.empty()) set_obj_str(rm, 748, load_gml(code));
+    }
 
     return rm;
 }
@@ -2149,8 +2417,11 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     // 3. Load settings + constants
     load_settings(root);
     gm80l_log("Load: settings done");
+    load_gameinfo(root);
     load_extensions(root);
     gm80l_log("Load: extensions done");
+    load_included_files(root);
+    gm80l_log("Load: included files done");
 
     // 4. Load triggers (single array, names live inside objects at +4)
     {
@@ -2213,6 +2484,18 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     // calling it from here crashes (wrong environment), so fill_in_safe's
     // SEH degradation covers the first load; from the second load on the
     // library is already built and FillIn works normally.
+    // 11b. Action-param name maps (all resource types): action params that
+    // reference a resource store the INDEX in memory; the file has the NAME.
+    g_action_names.sprites   = load_names(root / "sprites" / "index.yyd");
+    g_action_names.sounds    = load_names(root / "sounds" / "index.yyd");
+    g_action_names.bgs       = load_names(root / "backgrounds" / "index.yyd");
+    g_action_names.paths     = load_names(root / "paths" / "index.yyd");
+    g_action_names.scripts   = load_names(root / "scripts" / "index.yyd");
+    g_action_names.objects   = load_names(root / "objects" / "index.yyd");
+    g_action_names.rooms     = load_names(root / "rooms" / "index.yyd");
+    g_action_names.fonts     = load_names(root / "fonts" / "index.yyd");
+    g_action_names.timelines = load_names(root / "timelines" / "index.yyd");
+
     gm80l_log("Loading objects...");
     {
         auto names = load_names(root / "objects" / "index.yyd");
@@ -2315,90 +2598,3 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     return true;
 }
 
-// ==== Fallback: .gm80 → GMKProject → .gmk → GM loader ====
-// Kept for backward compatibility
-bool gm80_load_from_path(GMKProject& proj, const std::wstring& wpath) {
-    fs::path root(wpath);
-    if (!fs::is_directory(root)) return false;
-
-    // Read root .gm80 metadata
-    for (auto& entry : fs::directory_iterator(root)) {
-        auto ext = entry.path().extension().string();
-        if (ext == ".gm80" || entry.path().filename().string().find(".gm80") != std::string::npos) {
-            std::string meta = read_file(entry.path());
-            if (!meta.empty()) {
-                parse_kv(meta, [&](auto& k, auto& v) {
-                    if (k == "gameid") proj.game_id = (uint32_t)std::stoul(v);
-                    else if (k == "info_author") proj.settings.author = v;
-                    else if (k == "info_version") proj.settings.version_str = v;
-                    else if (k == "info_information") proj.settings.info = decode_delimit(v);
-                    else if (k == "exe_company") proj.settings.company = v;
-                    else if (k == "exe_copyright") proj.settings.copyright = v;
-                    else if (k == "exe_product") proj.settings.product = v;
-                    else if (k == "exe_description") proj.settings.description = v;
-                });
-                break;
-            }
-        }
-    }
-
-    // Read settings
-    std::string settxt = read_file(root / "settings" / "settings.txt");
-    parse_kv(settxt, [&](auto& k, auto& v) {
-        if (k == "fullscreen") proj.settings.fullscreen = (v == "1");
-        else if (k == "interpolate_pixels") proj.settings.interpolate_pixels = (v == "1");
-        else if (k == "scaling") proj.settings.scaling = (int32_t)std::stoul(v); // signed; stoi throws on u32-encoded -1
-        else if (k == "clear_color") proj.settings.clear_color = (uint32_t)std::stoul(v);
-        else if (k == "color_depth") proj.settings.color_depth = (uint32_t)std::stoul(v);
-        else if (k == "resolution") proj.settings.resolution = (uint32_t)std::stoul(v);
-        else if (k == "frequency") proj.settings.frequency = (uint32_t)std::stoul(v);
-    });
-
-    // Read resource names
-    auto load_n = [&](const char* dir, std::vector<std::string>& out) {
-        out = load_names(root / dir / "index.yyd");
-    };
-    load_n("scripts", proj.script_names);
-    load_n("sprites", proj.sprite_names);
-    load_n("backgrounds", proj.bg_names);
-    load_n("paths", proj.path_names);
-    load_n("objects", proj.object_names);
-    load_n("rooms", proj.room_names);
-    load_n("fonts", proj.font_names);
-    load_n("triggers", proj.trigger_names);
-
-    // Read script sources
-    for (auto& name : proj.script_names) {
-        if (name.empty()) { proj.script_sources.push_back(""); continue; }
-        std::string src = read_file(root / "scripts" / (name + ".gml"));
-        proj.script_sources.push_back(load_gml(src));
-    }
-
-    // Read trigger conditions
-    for (auto& name : proj.trigger_names) {
-        if (name.empty()) {
-            proj.trigger_conditions.push_back("");
-            proj.trigger_constants.push_back("");
-            continue;
-        }
-        std::string txt = read_file(root / "triggers" / (name + ".txt"));
-        std::string cnst;
-        parse_kv(txt, [&](auto& k, auto& v) {
-            if (k == "constant") cnst = v;
-        });
-        std::string gml = read_file(root / "triggers" / (name + ".gml"));
-        proj.trigger_conditions.push_back(load_gml(gml));
-        proj.trigger_constants.push_back(cnst);
-    }
-
-    proj.sprite_count  = (uint32_t)proj.sprite_names.size();
-    proj.script_count  = (uint32_t)proj.script_names.size();
-    proj.bg_count      = (uint32_t)proj.bg_names.size();
-    proj.path_count    = (uint32_t)proj.path_names.size();
-    proj.object_count  = (uint32_t)proj.object_names.size();
-    proj.room_count    = (uint32_t)proj.room_names.size();
-    proj.font_count    = (uint32_t)proj.font_names.size();
-    proj.trigger_count = (uint32_t)proj.trigger_names.size();
-
-    return true;
-}

@@ -14,7 +14,6 @@
     <ClInclude Include="pch.h"><Filter>头文件\Project</Filter></ClInclude>
     <ClInclude Include="Librarys\delphi.h"><Filter>头文件\Project</Filter></ClInclude>
     <ClInclude Include="GMSave\ide_hooks.h"><Filter>头文件\Project</Filter></ClInclude>
-    <ClInclude Include="GMSave\gmk_format.h"><Filter>头文件\Format</Filter></ClInclude>
     <ClInclude Include="GMSave\gm80_load.h"><Filter>头文件\Format</Filter></ClInclude>
     <ClInclude Include="GMSave\gm80_save.h"><Filter>头文件\Format</Filter></ClInclude>
     <ClInclude Include="GMSave\project_watcher.h"><Filter>头文件\Project</Filter></ClInclude>
@@ -23,7 +22,6 @@
     <ClCompile Include="dllmain.cpp"><Filter>源文件\Core</Filter></ClCompile>
     <ClCompile Include="pch.cpp"><Filter>源文件\Core</Filter></ClCompile>
     <ClCompile Include="GMSave\ide_hooks.cpp"><Filter>源文件\IDE Hooks</Filter></ClCompile>
-    <ClCompile Include="GMSave\gmk_format.cpp"><Filter>源文件\Format</Filter></ClCompile>
     <ClCompile Include="GMSave\gm80_load.cpp"><Filter>源文件\Format</Filter></ClCompile>
     <ClCompile Include="GMSave\gm80_save.cpp"><Filter>源文件\Format</Filter></ClCompile>
     <ClCompile Include="GMSave\project_watcher.cpp"><Filter>源文件\Core</Filter></ClCompile>

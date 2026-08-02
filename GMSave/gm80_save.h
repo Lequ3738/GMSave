@@ -6,7 +6,4 @@
 // Save project to .gm80 directory
 // gm_base: GetModuleHandle(NULL) of GameMaker.exe
 // path: full path to .gm80 file (e.g. "C:\project.gm80")
-// GMKProject version kept for backward compatibility
-#include "gmk_format.h"
-bool gm80_save_to_path(const GMKProject& proj, const std::wstring& path);
 bool gm80_save_to_path(void* gm_base, const std::wstring& path);
