@@ -704,23 +704,28 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
         L("view_fol_target" + si, objName);
     }
 
-    // Editor state
+    // Editor state (verified GM80_SaveRoom_Individual 0x54898c 2026-08-02):
+    //   +768 remember(byte), +772 editor_width, +776 editor_height,
+    //   +780..787 show_grid/show_objects/show_tiles/show_backgrounds/
+    //   show_foregrounds/show_views/delete_underlying_objects/
+    //   delete_underlying_tiles (bytes), +788 tab, +792 editor_x, +796 editor_y.
+    // (Was +4-shifted: remember read +772, editor_x read +788, show_*/tab
+    //  hardcoded 0 — wrong values written to the file.)
     t += "\n";
-    L("remember", to_str(R1(obj, 772)));
-    L("editor_width", to_str(R4(obj, 776)));
-    L("editor_height", to_str(R4(obj, 780)));
-    // TODO: read show_* from room object (offsets ~+768..+811 area)
-    L("show_grid", "0");
-    L("show_objects", "0");
-    L("show_tiles", "0");
-    L("show_backgrounds", "0");
-    L("show_foregrounds", "0");
-    L("show_views", "0");
-    L("delete_underlying_objects", "0");
-    L("delete_underlying_tiles", "0");
-    L("tab", "0");
-    L("editor_x", to_str(R4(obj, 788)));
-    L("editor_y", to_str(R4(obj, 792)));
+    L("remember", to_str(R1(obj, 768)));
+    L("editor_width", to_str(R4(obj, 772)));
+    L("editor_height", to_str(R4(obj, 776)));
+    L("show_grid", to_str(R1(obj, 780)));
+    L("show_objects", to_str(R1(obj, 781)));
+    L("show_tiles", to_str(R1(obj, 782)));
+    L("show_backgrounds", to_str(R1(obj, 783)));
+    L("show_foregrounds", to_str(R1(obj, 784)));
+    L("show_views", to_str(R1(obj, 785)));
+    L("delete_underlying_objects", to_str(R1(obj, 786)));
+    L("delete_underlying_tiles", to_str(R1(obj, 787)));
+    L("tab", to_str(R4(obj, 788)));
+    L("editor_x", to_str(R4s(obj, 792)));
+    L("editor_y", to_str(R4s(obj, 796)));
 
     wf(outPath + L"\\room.txt", t);
 

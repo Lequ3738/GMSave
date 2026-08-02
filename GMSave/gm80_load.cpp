@@ -2019,6 +2019,29 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
         if (!code.empty()) set_obj_str(rm, 748, load_gml(code));
     }
 
+    // Editor state (verified sub_548360 + GM80_SaveRoom_Individual 0x54898c):
+    //   +768 remember(byte), +772 editor_width, +776 editor_height,
+    //   +780..787 show_*/delete_underlying_* (bytes), +788 tab,
+    //   +792 editor_x, +796 editor_y.
+    // (2026-08-02: previously load ignored these entirely and save wrote
+    //  +4-shifted offsets — editor state was lost on round-trip.)
+    parse_kv(txt, [&](auto& k, auto& v) {
+        if      (k == "remember") set_obj_bool(rm, 768, v == "1");
+        else if (k == "editor_width") set_obj_u32(rm, 772, (uint32_t)std::stoul(v));
+        else if (k == "editor_height") set_obj_u32(rm, 776, (uint32_t)std::stoul(v));
+        else if (k == "show_grid") set_obj_bool(rm, 780, v == "1");
+        else if (k == "show_objects") set_obj_bool(rm, 781, v == "1");
+        else if (k == "show_tiles") set_obj_bool(rm, 782, v == "1");
+        else if (k == "show_backgrounds") set_obj_bool(rm, 783, v == "1");
+        else if (k == "show_foregrounds") set_obj_bool(rm, 784, v == "1");
+        else if (k == "show_views") set_obj_bool(rm, 785, v == "1");
+        else if (k == "delete_underlying_objects") set_obj_bool(rm, 786, v == "1");
+        else if (k == "delete_underlying_tiles") set_obj_bool(rm, 787, v == "1");
+        else if (k == "tab") set_obj_u32(rm, 788, (uint32_t)std::stoul(v));
+        else if (k == "editor_x") set_obj_i32(rm, 792, std::stoi(v));
+        else if (k == "editor_y") set_obj_i32(rm, 796, std::stoi(v));
+    });
+
     return rm;
 }
 
