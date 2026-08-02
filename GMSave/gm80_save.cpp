@@ -22,6 +22,51 @@ static void svlog(const char* fmt, ...) {
 
 static void* g_save_base = nullptr;
 
+// ==== Smart save state ====
+// A resource is re-written on save only when its Delphi timestamp is newer than
+// the last save (LAST_SAVE). Type name/index structure changes (add/delete/
+// rename/reorder) are detected via an FNV-1a hash of the index.yyd names and
+// force a full re-save of the affected type(s). Type indices match the order in
+// gm80_save_to_path's per-type blocks:
+//   0 sprites, 1 sounds, 2 backgrounds, 3 paths, 4 scripts, 5 fonts,
+//   6 timelines, 7 objects, 8 rooms, 9 triggers
+static double   g_last_save = 0.0;
+static uint64_t g_last_names_hash[10] = {0};
+static bool     g_has_last_names[10] = {false};
+// Included files have their own name-space (index.yyd); track it separately.
+static uint64_t g_last_data_hash = 0;
+static bool     g_has_last_data = false;
+
+// Delphi Now() → TDateTime in ST(0) (sub_40CF18). Same clock GM uses for the
+// per-resource timestamps, so ts[i] and LAST_SAVE are directly comparable.
+static double now_t() {
+    double r = 0.0;
+    uint32_t fn = (uint32_t)g_save_base + 0xCF18;
+    __asm {
+        call fn
+        fstp qword ptr [r]
+    }
+    return r;
+}
+
+// FNV-1a 64 over the index.yyd names (incl. empty slots → structure-sensitive).
+static uint64_t names_hash(const std::vector<std::string>& names) {
+    uint64_t h = 14695981039346656037ULL;
+    for (auto& n : names) {
+        for (unsigned char c : n) { h ^= c; h *= 1099511628211ULL; }
+        h ^= 0xFF; h *= 1099511628211ULL; // separator
+    }
+    return h;
+}
+
+// Delphi timestamp array (double*) for a resource type. Returns nullptr when the
+// array is absent (null or the 0xFFFFFFFF "uninitialized dynamic array" sentinel).
+static double* ts_ptr(uint32_t tsOff) {
+    void* p = *(void**)((uint8_t*)g_save_base + tsOff);
+    if (!p || (uintptr_t)p == 0xFFFFFFFF) return nullptr;
+    return (double*)p;
+}
+
 static uint32_t R4(void* obj, int off) { return *(uint32_t*)((uint8_t*)obj + off); }
 static int32_t  R4s(void* obj, int off) { return *(int32_t*)((uint8_t*)obj + off); }
 static bool     R1(void* obj, int off) { return *(uint8_t*)((uint8_t*)obj + off) != 0; }
@@ -999,6 +1044,41 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         }
     }
 
+    // ==== Smart save decision ====
+    // changed[t] = type t needs a FULL re-save (its name/index structure changed,
+    // or it depends on a type whose structure changed). Otherwise per-resource
+    // timestamps decide what is rewritten.
+    enum { T_SPR = 0, T_SND, T_BG, T_PAT, T_SCR, T_FNT, T_TLN, T_OBJ, T_ROM, T_TRG };
+    const uint64_t curHash[10] = {
+        names_hash(spriteNames), names_hash(soundNames), names_hash(bgNames),
+        names_hash(pathNames), names_hash(scriptNames), names_hash(fontNames),
+        names_hash(tlNames), names_hash(objectNames), names_hash(roomNames),
+        names_hash(triggerNames),
+    };
+    bool changed[10];
+    bool anyChanged = false;
+    for (int t = 0; t < 10; t++) {
+        changed[t] = !g_has_last_names[t] || g_last_names_hash[t] != curHash[t];
+        if (changed[t]) anyChanged = true;
+    }
+    // Clock went backwards → timestamps untrustworthy → full save everything.
+    if (now_t() < g_last_save) {
+        for (int t = 0; t < 10; t++) changed[t] = true;
+        anyChanged = true;
+    }
+    // Dependency closure (matches gm82save's dependency checks, more conservative):
+    // objects & timelines reference every type via action parameters; rooms
+    // reference objects+backgrounds; paths reference rooms. A structure change
+    // anywhere forces these dependents to be re-saved so index→name references
+    // stay correct.
+    if (anyChanged) { changed[T_OBJ] = true; changed[T_TLN] = true; }
+    if (changed[T_OBJ] || changed[T_BG]) changed[T_ROM] = true;
+    if (changed[T_ROM]) changed[T_PAT] = true;
+    bool smart = (g_last_save != 0.0); // we have saved at least once before
+    svlog("SmartSave: anyChanged=%d full=[%d%d%d%d%d%d%d%d%d%d] smart=%d",
+          anyChanged, changed[0],changed[1],changed[2],changed[3],changed[4],
+          changed[5],changed[6],changed[7],changed[8],changed[9], smart);
+
     // ==== Root .gm80 metadata ====
     {
         std::string m;
@@ -1172,10 +1252,24 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     // +4 file_name, +8 source_path, +12 data_exists, +16 source_length,
     // +20 stored_in_gmk, +24 data (TMemoryStream*), +28 export_setting,
     // +32 export_custom_folder, +36 overwrite, +37 free, +38 remove_at_end.
+    uint64_t dataHash = 0;
     {
         uint8_t* b = (uint8_t*)g_save_base;
         uint32_t ifCnt = *(uint32_t*)(b + 0x1E9398);
         uint32_t* ifArr = *(uint32_t**)(b + 0x1E9390);
+        double* ifTs = *(double**)(b + 0x1E9394);
+        // Included-file name-space hash → add/remove/rename forces a full re-write.
+        std::vector<std::string> dataNames;
+        if (ifCnt > 0 && ifCnt < 10000 && ifArr) {
+            dataNames.reserve(ifCnt);
+            for (uint32_t i = 0; i < ifCnt; i++) {
+                void* f = (void*)(uintptr_t)ifArr[i];
+                dataNames.push_back(f ? RS(f, 4) : std::string());
+            }
+        }
+        dataHash = names_hash(dataNames);
+        bool dataFull = !g_has_last_data || g_last_data_hash != dataHash;
+        svlog("SmartSave: included files dataFull=%d (count=%u)", dataFull, ifCnt);
         if (ifCnt > 0 && ifCnt < 10000 && ifArr) {
             CreateDirectoryW(sub(L"datafiles").c_str(), NULL);
             CreateDirectoryW(sub(L"datafiles\\include").c_str(), NULL);
@@ -1187,6 +1281,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                 if (name.empty()) continue;
                 std::wstring wname(name.begin(), name.end());
                 index += name + "\n";
+                if (!dataFull && smart && ifTs && ifTs[i] <= g_last_save) continue; // smart skip
+
                 bool dataExists = *(uint8_t*)((uint8_t*)f + 12) != 0;
                 bool storedInGmk = *(uint8_t*)((uint8_t*)f + 20) != 0;
                 if (dataExists) {
@@ -1248,9 +1344,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_tree(L"scripts", scriptNames, 7);
         uint32_t* scripts = *(uint32_t**)(base + 0x1E92D4);
         uint32_t scCnt = *(uint32_t*)(base + 0x1E92E4);
+        double* scrTs = ts_ptr(0x1E92E0);
         if (scripts && scCnt < 50000) {
             for (uint32_t i = 0; i < scCnt && i < (uint32_t)scriptNames.size(); i++) {
                 if (scriptNames[i].empty()) continue;
+                if (!changed[T_SCR] && scrTs && scrTs[i] <= g_last_save) continue; // smart skip
                 void* scObj = (void*)(uintptr_t)scripts[i];
                 if (!scObj) continue;
                 std::string src = scObj ? RS(scObj, 4) : "";
@@ -1266,9 +1364,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_tree(L"fonts", fontNames, 9);
         uint32_t* fObjArr = *(uint32_t**)(base + 0x1E92C0); // font object array
         uint32_t fCnt = *(uint32_t*)(base + 0x1E92D0);
+        double* fntTs = ts_ptr(0x1E92CC);
         if (fObjArr && fCnt < 10000) {
             for (uint32_t i = 0; i < fCnt && i < (uint32_t)fontNames.size(); i++) {
                 if (fontNames[i].empty()) continue;
+                if (!changed[T_FNT] && fntTs && fntTs[i] <= g_last_save) continue; // smart skip
                 void* fObj = (void*)(uintptr_t)fObjArr[i];
                 if (!fObj) continue;
                 std::wstring wname(fontNames[i].begin(), fontNames[i].end());
@@ -1282,9 +1382,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"paths", pathNames);
         save_tree(L"paths", pathNames, 8);
         uint32_t* pObjArr = *(uint32_t**)(base + 0x1E92AC);
+        double* patTs = ts_ptr(0x1E92B8);
         if (pObjArr) {
             for (uint32_t i = 0; i < pathCnt && i < (uint32_t)pathNames.size(); i++) {
                 if (pathNames[i].empty()) continue;
+                if (!changed[T_PAT] && patTs && patTs[i] <= g_last_save) continue; // smart skip
                 void* pObj = (void*)(uintptr_t)pObjArr[i];
                 if (!pObj) continue;
                 std::wstring wname(pathNames[i].begin(), pathNames[i].end());
@@ -1303,9 +1405,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"sounds", sndNames);
         save_tree(L"sounds", sndNames, 3);   // was missing → no tree.yyd → empty IDE tree
         uint32_t* sndArr = *(uint32_t**)(base + 0x1E9278);
+        double* sndTs = ts_ptr(0x1E9284);
         if (sndArr) {
             for (uint32_t i = 0; i < soundCnt && i < (uint32_t)sndNames.size(); i++) {
                 if (sndNames[i].empty()) continue;
+                if (!changed[T_SND] && sndTs && sndTs[i] <= g_last_save) continue; // smart skip
                 void* sObj = (void*)(uintptr_t)sndArr[i];
                 if (!sObj) continue;
                 std::wstring wname(sndNames[i].begin(), sndNames[i].end());
@@ -1319,9 +1423,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"sprites", spriteNames);
         save_tree(L"sprites", spriteNames, 2);
         uint32_t* spArr = *(uint32_t**)(base + 0x1E9108); // sprite array
+        double* sprTs = ts_ptr(0x1E9114);
         if (spArr && spriteCnt < 50000) {
             for (uint32_t i = 0; i < spriteCnt && i < (uint32_t)spriteNames.size(); i++) {
                 if (spriteNames[i].empty()) continue;
+                if (!changed[T_SPR] && sprTs && sprTs[i] <= g_last_save) continue; // smart skip
                 void* spObj = (void*)(uintptr_t)spArr[i];
                 if (!spObj) continue;
                 std::wstring wname(spriteNames[i].begin(), spriteNames[i].end());
@@ -1335,9 +1441,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"backgrounds", bgNames);
         save_tree(L"backgrounds", bgNames, 6);
         uint32_t* bgArr = *(uint32_t**)(base + 0x1E9094); // verified: dword_5E9094 from serializer
+        double* bgTs = ts_ptr(0x1E90A0);
         if (bgArr && bgCnt < 10000) {
             for (uint32_t i = 0; i < bgCnt && i < (uint32_t)bgNames.size(); i++) {
                 if (bgNames[i].empty()) continue;
+                if (!changed[T_BG] && bgTs && bgTs[i] <= g_last_save) continue; // smart skip
                 void* bgObj = (void*)(uintptr_t)bgArr[i];
                 if (!bgObj) continue;
                 std::wstring wname(bgNames[i].begin(), bgNames[i].end());
@@ -1351,9 +1459,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"timelines", tlNames);
         save_tree(L"timelines", tlNames, 12);
         uint32_t* tlArr = *(uint32_t**)(base + 0x1E9300);
+        double* tlTs = ts_ptr(0x1E930C);
         if (tlArr && tlCnt < 10000) {
             for (uint32_t i = 0; i < tlCnt && i < (uint32_t)tlNames.size(); i++) {
                 if (tlNames[i].empty()) continue;
+                if (!changed[T_TLN] && tlTs && tlTs[i] <= g_last_save) continue; // smart skip
                 void* tlObj = (void*)(uintptr_t)tlArr[i];
                 if (!tlObj) continue;
                 std::wstring wname(tlNames[i].begin(), tlNames[i].end());
@@ -1386,9 +1496,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"objects", objectNames);
         save_tree(L"objects", objectNames, 1);
         uint32_t* oArr = *(uint32_t**)(base + 0x1E9354);
+        double* objTs = ts_ptr(0x1E9360);
         if (oArr && objectCnt < 50000) {
             for (uint32_t i = 0; i < objectCnt && i < (uint32_t)objectNames.size(); i++) {
                 if (objectNames[i].empty()) continue;
+                if (!changed[T_OBJ] && objTs && objTs[i] <= g_last_save) continue; // smart skip
                 void* oObj = (void*)(uintptr_t)oArr[i];
                 if (!oObj) continue;
                 std::wstring wname(objectNames[i].begin(), objectNames[i].end());
@@ -1404,9 +1516,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         save_index(L"rooms", roomNames);
         save_tree(L"rooms", roomNames, 4);
         uint32_t* rArr = *(uint32_t**)(base + 0x1E9294);
+        double* romTs = ts_ptr(0x1E92A0);
         if (rArr && roomCnt < 10000) {
             for (uint32_t i = 0; i < roomCnt && i < (uint32_t)roomNames.size(); i++) {
                 if (roomNames[i].empty()) continue;
+                if (!changed[T_ROM] && romTs && romTs[i] <= g_last_save) continue; // smart skip
                 void* rObj = (void*)(uintptr_t)rArr[i];
                 if (!rObj) continue;
                 std::wstring wname(roomNames[i].begin(), roomNames[i].end());
@@ -1415,6 +1529,18 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
             }
         }
     }
+
+    // ==== Update smart-save baseline ====
+    // (Names arrays are re-hashed after the save; stored hash == what we just wrote,
+    // so a subsequent unchanged save skips everything.)
+    g_last_save = now_t();
+    for (int t = 0; t < 10; t++) {
+        g_last_names_hash[t] = curHash[t];
+        g_has_last_names[t] = true;
+    }
+    g_last_data_hash = dataHash;
+    g_has_last_data = true;
+    svlog("SmartSave: LAST_SAVE=%f", g_last_save);
 
     return true;
 }
