@@ -138,19 +138,6 @@ static std::string read_delphi_str(void** ppStr) {
     return std::string(data, len);
 }
 
-// Dump a memory region as hex
-static std::string hex_dump(void* addr, size_t len) {
-    if (IsBadReadPtr(addr, (UINT)len)) return "(unreadable)";
-    std::string r;
-    char buf[8];
-    unsigned char* p = (unsigned char*)addr;
-    for (size_t i = 0; i < len; i++) {
-        snprintf(buf, sizeof(buf), "%02X ", p[i]);
-        r += buf;
-    }
-    return r;
-}
-
 // Called on every save attempt. Returns 1 if we handled it.
 // Flag set by check_* before original save runs
 static bool g_is_gm80_save = false;
@@ -264,18 +251,20 @@ static void read_ide_project(GMKProject& proj) {
     uint8_t* base = (uint8_t*)g_gm_base;
     proj.game_id = *(uint32_t*)(base + ADDR_GAME_ID);
 
-    // Settings verified from GM80_SaveSettings disasm (many are bytes, not u32!)
+    // Settings verified from GM80_SaveSettings/LoadSettings disasm (2026-08-02):
+    // fullscreen=0x1E93A0(byte), scaling=0x1E93B0(i32), clear_color=0x1E93BC(u32),
+    // priority=0x1E93F8(u32), loading_bar=0x1E93FC(u32). Previously all shifted.
     auto u32 = [&](uint32_t off) -> uint32_t { return *(uint32_t*)(base + off); };
     auto u8  = [&](uint32_t off) -> uint32_t { return *(uint8_t*)(base + off); };
-    proj.settings.fullscreen         = u32(0x1E93B0) != 0;
-    proj.settings.interpolate_pixels = u8(0x1E93B4) != 0;
-    proj.settings.color_depth        = u32(0x1E93BC);
-    proj.settings.resolution         = u32(0x1E93C4);
-    proj.settings.frequency          = u32(0x1E93C8);
-    proj.settings.scaling            = (int32_t)u32(0x1E93CC);
-    proj.settings.clear_color        = u8(0x1E93D0);
-    proj.settings.loading_bar        = u8(0x1E93D4);
-    proj.settings.priority           = u8(0x1E93D8);
+    proj.settings.fullscreen         = u8(ADDR_SETTING_FULLSCREEN) != 0;
+    proj.settings.interpolate_pixels = u8(ADDR_SETTING_INTERPOLATE) != 0;
+    proj.settings.color_depth        = u32(ADDR_SETTING_COLOR_DEPTH);
+    proj.settings.resolution         = u32(ADDR_SETTING_RESOLUTION);
+    proj.settings.frequency          = u32(ADDR_SETTING_FREQUENCY);
+    proj.settings.scaling            = (int32_t)u32(ADDR_SETTING_SCALING);
+    proj.settings.clear_color        = u32(ADDR_SETTING_CLEAR_COLOR);
+    proj.settings.loading_bar        = u32(ADDR_SETTING_LOADING_BAR);
+    proj.settings.priority           = u32(ADDR_SETTING_PRIORITY);
 
     // Read resource counts
     proj.trigger_count = *(uint32_t*)(base + 0x1E92EC);
@@ -308,7 +297,6 @@ static void read_ide_project(GMKProject& proj) {
             for (uint32_t i = 0; i < cnt; i++) {
                 void* obj = (void*)(uintptr_t)arr[i];
                 std::string name = obj ? obj_str(obj, 4) : "";
-                if (i < 2) dbg_log(" trigger[%u] obj=0x%p name='%s'", i, obj, name.c_str());
                 proj.trigger_names.push_back(name);
             }
         }
@@ -323,7 +311,6 @@ static void read_ide_project(GMKProject& proj) {
             for (uint32_t i = 0; i < cnt; i++) {
                 void* obj = (void*)(uintptr_t)arr[i];
                 std::string src = obj ? obj_str(obj, 4) : "";
-                if (i < 2) dbg_log(" script[%u] obj=0x%p src_len=%zu", i, obj, src.size());
                 proj.script_sources.push_back(src);
             }
         }
@@ -613,11 +600,6 @@ __declspec(naked) static void msg_hook_thunk() {
     }
 }
 
-// Minimal log-only function for the thunk
-static void __stdcall lrp_log_only() {
-    dbg_log("LRP CALL THUNK FIRED! path=%s", g_load_file_path ? g_load_file_path : "(null)");
-}
-
 // Called at 0x59B91B (replaces call sub_59B28C).
 // At this point: InitializeProject has run, Delphi MM is ready.
 // EAX = TStream containing loaded file data.
@@ -687,10 +669,6 @@ __declspec(naked) static void lrp_call_thunk() {
         je call_original
         push eax
         mov g_load_file_path, eax
-        // UNCONDITIONAL log
-        pushad
-        call lrp_log_only
-        popad
         pushad
         call check_and_do_gm80_load     // Returns 1 if .gm80 handled (temp .gmk created)
         mov [esp+28], eax               // Store result in pushad EAX slot
@@ -764,8 +742,6 @@ static int __stdcall check_and_do_gm80_load() {
     if (len < 6) { dbg_log("check_gm80: len=%u path='%s' -> 0", (uint32_t)len, projPath); return 0; }
     bool is_gm80 = (_stricmp(projPath + len - 5, ".gm80") == 0);
     if (!is_gm80) { dbg_log("check_gm80: not .gm80 path='%s' -> 0", projPath); return 0; }
-
-    dbg_log("Load hook: .gm80 detected path='%s'", projPath);
 
     dbg_log("Load: .gm80 detected '%s'", projPath);
 
@@ -890,8 +866,8 @@ static BOOL (WINAPI* g_real_GetOpenFileNameA)(LPOPENFILENAMEA) = nullptr;
 // OPENFILENAME.lpstrFilter is NUL-separated pairs, double-NUL terminated
 // ("Name\0*.ext\0Name2\0*.ext2\0\0") — NOT Delphi's '|' format.
 static const char k_gm80_filter[] =
-    "GameMaker 8.0 project (*.gm80)\0*.gm80\0"
     "GameMaker 8.0 files (*.gmk)\0*.gmk\0"
+    "GameMaker 8.0 project (*.gm80)\0*.gm80\0"
     "All files (*.*)\0*.*\0\0";
 
 static BOOL WINAPI gm80_get_save_file_name(LPOPENFILENAMEA ofn) {

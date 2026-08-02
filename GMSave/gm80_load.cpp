@@ -182,19 +182,6 @@ __declspec(naked) static void* delphi_ctor(uint32_t class_ref, uint32_t ctor_add
     }
 }
 
-// Debug wrapper: logs VMT info then calls delphi_ctor
-static void* make_obj_debug(uint32_t vmt_rva, uint32_t ctor_rva, const char* name) {
-    uint8_t* b = glob_base();
-    uint32_t class_ref = *(uint32_t*)(b + vmt_rva);
-    uint32_t instSize = *(uint32_t*)(b + vmt_rva - 40); // VMT[-40] = instance size
-    gm80l_log("make_obj %s: vmt_rva=0x%X class_ref=0x%X instSize=%u (0x%X)",
-        name, vmt_rva, class_ref, instSize, instSize);
-    if (class_ref < 0x400000) { gm80l_log("  -> class_ref<0x400000, returning NULL"); return nullptr; }
-    void* obj = delphi_ctor(class_ref, (uint32_t)b + ctor_rva);
-    gm80l_log("  -> ctor returned 0x%p (class_ref=0x%X)", obj, class_ref);
-    if (obj == (void*)class_ref) { gm80l_log("  -> obj==class_ref, allocation failed, returning NULL"); return nullptr; }
-    return obj;
-}
 
 // Allocate memory using Delphi's memory manager
 static void* delphi_alloc(uint32_t sz) {
@@ -257,7 +244,10 @@ static void* make_obj_with_arr(uint32_t arrObjOff, uint32_t vmt_rva, uint32_t ct
 //   +0 vmt, +4 memory, +8 size, +12 position, +16 capacity
 // VMT read from off_4EA854 (mov eax, ds:off_4EA854 before sub_404560 call),
 // ctor sub_404560 = standard NewInstance+InitInstance (empty body).
-#define ADDR_TSTREAM_VMT_DATA 0x4EA854
+// NOTE: 0x4EA854 is the ABSOLUTE address (base 0x400000 + RVA 0xEA854); the code
+// adds g_load_base, so the macro must be the RVA. (Was wrongly 0x4EA854 → read
+// 0x8EA854 → access violation. Fixed 2026-08-02.)
+#define ADDR_TSTREAM_VMT_DATA 0xEA854
 #define ADDR_TSTREAM_CREATE   0x4560
 static void* make_delphi_stream(const void* data, uint32_t size) {
     uint8_t* base = glob_base();
@@ -320,8 +310,10 @@ struct ResInfo {
 static ResInfo s_resInfo[] = {
     // kind=2: sprites   arr=0x1E9108 name=0x1E9110 cnt=0x1E911C off_4F8508
     {0x1E9108, 0x1E9110, 0x1E911C, 0xF8508,  0xF8930,  "sprites", 2, 0},
-    // kind=3: sounds    arr=0x1E92FC name=0x1E932C cnt=0x1E9288 off_544660
-    {0x1E92FC, 0x1E932C, 0x1E9288, 0x144660, 0x144768, "sounds", 3, 0},
+    // kind=3: sounds    arr=0x1E9278 name=0x1E9280 cnt=0x1E9288 off_544660
+    // (corrected 2026-08-02: was 0x1E92FC/0x1E932C, which are CONSTANTS globals;
+    //  real sound array/names verified from GM80_SaveSounds/LoadSounds)
+    {0x1E9278, 0x1E9280, 0x1E9288, 0x144660, 0x144768, "sounds", 3, 0},
     // kind=6: backgrounds arr=0x1E9094 name=0x1E909C cnt=0x1E90A8 off_5207B4
     {0x1E9094, 0x1E909C, 0x1E90A8, 0x1207B4, 0x12084C, "backgrounds", 6, 0},
     // kind=8: paths     arr=0x1E92AC name=0x1E92B4 cnt=0x1E92BC off_54695C
@@ -479,6 +471,11 @@ static void load_resource_tree(
     if (names.empty()) return;
     auto treePath = root / dirName / "tree.yyd";
     std::string txt = read_file(treePath);
+    if (txt.empty()) {
+        // No tree.yyd (older .gm80 files saved before sounds got tree.yyd):
+        // build a flat tree from the index names so the IDE tree still shows them.
+        for (auto& n : names) { if (!n.empty()) txt += "|" + n + "\n"; }
+    }
     if (txt.empty()) return;
 
     uint8_t* base = (uint8_t*)g_load_base;
@@ -540,34 +537,246 @@ static void init_project() {
 }
 
 // ==== Load settings ====
+// Loading-bar bitmaps + icon: read a Delphi image file (BMP/ICO) into a
+// TMemoryStream, create the image object (TBitmap from off_42D15C /
+// TIcon from off_42D248) and LoadFromStream (vtable+0x54 — verified from
+// sub_59DCD0). Target globals: dword_5E940C back / 5E9408 front /
+// 5E9404 loader / 5E941C icon.
+// Read a Delphi image file (BMP/ICO) into a TMemoryStream, create the image
+// object and LoadFromStream (vtable+0x54 — verified from sub_59DCD0).
+// NOTE: inline asm must reference only LOCAL variables — MSVC misreads
+// function parameters inside __asm blocks.
+static void load_image_file_core(const fs::path& root, const char* fname,
+                                 uint32_t globOff, uint32_t imgCls) {
+    std::string data = read_file(root / "settings" / fname);
+    if (data.empty()) return;
+    uint8_t* base = (uint8_t*)g_load_base;
+    // TMemoryStream (same class chain as GM's Outer: off_4EA854 → 0x4EA8A0)
+    uint32_t streamCls = *(uint32_t*)(base + 0xEA854);
+    if (streamCls < 0x400000) streamCls = *(uint32_t*)(base + 0xEA8A0);
+    void* stream = nullptr;
+    __asm {
+        mov dl, 1
+        mov eax, streamCls
+        mov ecx, 0x404560
+        call ecx
+        mov stream, eax
+    }
+    if (!stream) return;
+    // TStream.WriteBuffer (sub_41F8E8: eax=stream, edx=buf, ecx=len)
+    char* bufPtr = (char*)data.data();
+    uint32_t bufLen = (uint32_t)data.size();
+    __asm {
+        mov eax, stream
+        mov edx, bufPtr
+        mov ecx, bufLen
+        mov ebx, 0x41F8E8
+        call ebx
+    }
+    // Image object ctor (eax=class ref, dl=1 allocate) — local copies only.
+    // GM loads the class-ref VALUE at the global (sub_59DCD0: `mov eax, ds:off_42D15C`),
+    // NOT the global's address. imgCls is the absolute addr of the class-ref global.
+    void* img = nullptr;
+    uint32_t imgClsVal = *(uint32_t*)((uint8_t*)g_load_base + (imgCls - 0x400000));
+    __asm {
+        mov eax, imgClsVal
+        mov dl, 1
+        xor ecx, ecx
+        mov ebx, 0x434230          // GM80_TBitmap_Create
+        call ebx
+        mov img, eax
+    }
+    if (!img) return;
+    // Rewind the stream to the start — WriteBuffer left the Position at the
+    // end; LoadFromStream reads from the current position.
+    // Direct FPosition write (+12, per sub_41FD90 = TStream.Read which uses
+    // a1+8=Size / a1+12=Position). The vtable+0x18 "Seek" was WRONG — that
+    // slot is SetSize (sub_41F840) whose Int64 range check raised a Delphi
+    // exception on our garbage args.
+    *(uint32_t*)((uint8_t*)stream + 12) = 0;
+    // LoadFromStream(stream) — vtable+0x54 (verified sub_59DCD0)
+    __asm {
+        mov eax, img
+        mov edx, stream
+        mov ecx, [eax]
+        call dword ptr [ecx+0x54]
+    }
+    *(uint32_t*)(base + globOff) = (uint32_t)img;
+    gm80l_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
+}
+
+// TIcon variant — same but the icon ctor (0x435F68, class ref off_42D248).
+static void load_icon_file(const fs::path& root, const char* fname,
+                           uint32_t globOff) {
+    std::string data = read_file(root / "settings" / fname);
+    if (data.empty()) return;
+    uint8_t* base = (uint8_t*)g_load_base;
+    uint32_t streamCls = *(uint32_t*)(base + 0xEA854);
+    if (streamCls < 0x400000) streamCls = *(uint32_t*)(base + 0xEA8A0);
+    void* stream = nullptr;
+    __asm {
+        mov dl, 1
+        mov eax, streamCls
+        mov ecx, 0x404560
+        call ecx
+        mov stream, eax
+    }
+    if (!stream) return;
+    char* bufPtr = (char*)data.data();
+    uint32_t bufLen = (uint32_t)data.size();
+    __asm {
+        mov eax, stream
+        mov edx, bufPtr
+        mov ecx, bufLen
+        mov ebx, 0x41F8E8
+        call ebx
+    }
+    // GM80_InitializeProject → sub_59DAC4 already created a default TIcon at
+    // dword_5E941C (0x1E941C). GM's own load (GM80_LoadSettings 0x59e4df) uses
+    // THAT object directly and LoadFromStreams into it. Prefer it if present.
+    void* img = nullptr;
+    uint32_t existingIcon = *(uint32_t*)(base + globOff);
+    if (existingIcon >= 0x10000) {
+        img = (void*)existingIcon;
+    } else {
+        // GM: sub_59DAC4 `mov eax, ds:off_42D258` — class ref is the VALUE at
+        // 0x42D258 (= 0x42D2A4), not the global address.
+        uint32_t iconCls = *(uint32_t*)(base + 0x2D258);
+        __asm {
+            mov eax, iconCls
+            mov dl, 1
+            xor ecx, ecx
+            mov ebx, 0x435F68          // TIcon ctor
+            call ebx
+            mov img, eax
+        }
+    }
+    if (!img) return;
+    // Rewind: TMemoryStream.FPosition = +12 (see load_image_file_core).
+    *(uint32_t*)((uint8_t*)stream + 12) = 0;
+    __asm {
+        mov eax, img
+        mov edx, stream
+        mov ecx, [eax]
+        call dword ptr [ecx+0x54]
+    }
+    *(uint32_t*)(base + globOff) = (uint32_t)img;
+    gm80l_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
+}
+
+// Safe wrappers — the icon/loading-bar bitmaps are cosmetic; a failure here must
+// never crash the whole project load (GM tolerates a null icon / no custom bar).
+static void load_image_file_safe(const fs::path& root, const char* fname,
+                                 uint32_t globOff, uint32_t imgCls) {
+    __try { load_image_file_core(root, fname, globOff, imgCls); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        gm80l_log("load_image FAILED %s code=0x%X", fname, GetExceptionCode());
+    }
+}
+static void load_icon_file_safe(const fs::path& root, const char* fname,
+                                uint32_t globOff) {
+    __try { load_icon_file(root, fname, globOff); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        gm80l_log("load_icon FAILED %s code=0x%X", fname, GetExceptionCode());
+    }
+}
+
 static void load_settings(const fs::path& root) {
     fs::path settPath = root / "settings" / "settings.txt";
     std::string txt = read_file(settPath);
     if (txt.empty()) return;
 
+    // Offsets corrected 2026-08-02 from GM80_SaveSettings/LoadSettings:
+    // fullscreen=0x1E93A0, scaling=0x1E93B0, priority=0x1E93F8 (u32),
+    // loading_bar=0x1E93FC (u32). All fields now round-trip.
     parse_kv(txt, [&](auto& k, auto& v) {
         if (k == "fullscreen") write_glob_bool(ADDR_SETTING_FULLSCREEN, v=="1");
         else if (k == "interpolate_pixels") write_glob_bool(ADDR_SETTING_INTERPOLATE, v=="1");
-        else if (k == "dont_draw_border") write_glob_u8(0x1E93B8, (uint8_t)std::stoul(v));   // byte_5E93B8
-        else if (k == "display_cursor") write_glob_u8(0x1E93C0, (uint8_t)std::stoul(v));     // byte_5E93C0
+        else if (k == "dont_draw_border") write_glob_bool(ADDR_SETTING_DONT_DRAW_BORDER, v=="1");
+        else if (k == "display_cursor") write_glob_bool(ADDR_SETTING_DISPLAY_CURSOR, v=="1");
         else if (k == "color_depth") write_glob_u32(ADDR_SETTING_COLOR_DEPTH, (uint32_t)std::stoul(v));
         else if (k == "resolution") write_glob_u32(ADDR_SETTING_RESOLUTION, (uint32_t)std::stoul(v));
         else if (k == "frequency") write_glob_u32(ADDR_SETTING_FREQUENCY, (uint32_t)std::stoul(v));
-        else if (k == "scaling") write_glob_i32(ADDR_SETTING_SCALING, std::stoi(v));
-        else if (k == "clear_color") write_glob_u8(ADDR_SETTING_CLEAR_COLOR, (uint8_t)std::stoul(v));
-        else if (k == "dont_show_buttons") write_glob_u8(0x1E93E0, (uint8_t)std::stoul(v));  // byte_5E93E0
-        else if (k == "vsync") write_glob_u8(0x1E93E4, (uint8_t)std::stoul(v));              // byte_5E93E4
-        else if (k == "disable_screensaver") write_glob_u8(0x1E93E8, (uint8_t)std::stoul(v));// byte_5E93E8
-        else if (k == "f4_fullscreen_toggle") write_glob_u8(0x1E93EC, (uint8_t)std::stoul(v));// byte_5E93EC
-        else if (k == "f1_help_menu") write_glob_u8(0x1E93F0, (uint8_t)std::stoul(v));       // byte_5E93F0
-        else if (k == "esc_close_game") write_glob_u8(0x1E93F4, (uint8_t)std::stoul(v));     // byte_5E93F4
-        else if (k == "priority") write_glob_u8(ADDR_SETTING_PRIORITY, (uint8_t)std::stoul(v));
-        else if (k == "loading_bar") write_glob_u8(ADDR_SETTING_LOADING_BAR, (uint8_t)std::stoul(v));
+        else if (k == "scaling") write_glob_i32(ADDR_SETTING_SCALING, (int32_t)std::stoul(v)); // signed; stoi throws on u32-encoded -1
+        else if (k == "clear_color") write_glob_u32(ADDR_SETTING_CLEAR_COLOR, (uint32_t)std::stoul(v));
+        else if (k == "dont_show_buttons") write_glob_u8(ADDR_SETTING_DONT_SHOW_BUTTONS, (uint8_t)std::stoul(v));
+        else if (k == "vsync") write_glob_u8(ADDR_SETTING_VSYNC, (uint8_t)std::stoul(v));
+        else if (k == "disable_screensaver") write_glob_u8(ADDR_SETTING_DISABLE_SCREENSAVER, (uint8_t)std::stoul(v));
+        else if (k == "f4_fullscreen_toggle") write_glob_u8(ADDR_SETTING_F4_FULLSCREEN, (uint8_t)std::stoul(v));
+        else if (k == "f1_help_menu") write_glob_u8(ADDR_SETTING_F1_HELP, (uint8_t)std::stoul(v));
+        else if (k == "esc_close_game") write_glob_u8(ADDR_SETTING_ESC_CLOSE, (uint8_t)std::stoul(v));
+        else if (k == "f5_save_f6_load") write_glob_u8(ADDR_SETTING_F5_SAVE_F6_LOAD, (uint8_t)std::stoul(v));
+        else if (k == "f9_screenshot") write_glob_u8(ADDR_SETTING_F9_SCREENSHOT, (uint8_t)std::stoul(v));
+        else if (k == "treat_close_as_esc") write_glob_u8(ADDR_SETTING_TREAT_CLOSE_AS_ESC, (uint8_t)std::stoul(v));
+        else if (k == "priority") write_glob_u32(ADDR_SETTING_PRIORITY, (uint32_t)std::stoul(v));
+        else if (k == "freeze_on_lose_focus") write_glob_bool(ADDR_SETTING_FREEZE_ON_LOSE_FOCUS, v=="1");
+        else if (k == "allow_resize") write_glob_bool(ADDR_SETTING_ALLOW_RESIZE, v=="1");
+        else if (k == "window_on_top") write_glob_bool(ADDR_SETTING_WINDOW_ON_TOP, v=="1");
+        else if (k == "set_resolution") write_glob_bool(ADDR_SETTING_SET_RESOLUTION, v=="1");
+        // gm82save writes the loading-bar type as "custom_bar"; accept the old
+        // "loading_bar" key too for files saved by earlier versions of this plugin.
+        else if (k == "custom_bar" || k == "loading_bar")
+            write_glob_u32(ADDR_SETTING_LOADING_BAR, (uint32_t)std::stoul(v));
         else if (k == "show_error_messages") write_glob_u8(0x1E9420, (uint8_t)std::stoul(v));// byte_5E9420
         else if (k == "log_errors") write_glob_u8(0x1E9424, (uint8_t)std::stoul(v));         // byte_5E9424
         else if (k == "always_abort") write_glob_u8(0x1E9428, (uint8_t)std::stoul(v));       // byte_5E9428
         else if (k == "zero_uninitialized_vars") write_glob_u8(0x1E942C, (uint8_t)std::stoul(v)); // byte_5E942C
+        // Loading-bar look (GM 8.0 globals verified from sub_59DD5C):
+        else if (k == "custom_loader") write_glob_u8(0x1E9400, (uint8_t)std::stoul(v));          // byte_5E9400
+        else if (k == "transparent") write_glob_u8(0x1E9410, (uint8_t)std::stoul(v));            // byte_5E9410
+        else if (k == "translucency") write_glob_u32(0x1E9414, (uint32_t)std::stoul(v));         // dword_5E9414
+        else if (k == "scale_progress_bar") write_glob_u8(0x1E9418, (uint8_t)std::stoul(v));     // byte_5E9418
+        // Version number quad (dword_5E943C/40/44/48 — .gmk save writes 4×u32)
+        else if (k == "exe_version") {
+            // metadata only; the GM globals are written by load_settings caller
+        }
     });
+
+    // Loading-bar bitmaps: settings/back.bmp → dword_5E940C, front.bmp →
+    // dword_5E9408, loader.bmp → dword_5E9404 (GM 8.0 TBitmap objects;
+    // verified from sub_59DD5C which uses sub_59DCD0 = stream → TBitmap via
+    // GM80_TBitmap_Create + LoadFromStream at vtable+0x54).
+    // Class references are VMT metadata-block addresses: TBitmap = 0x42D15C
+    // (off_42D110 holds it), TIcon = 0x42D248. NOT the first virtual method
+    // (0x41CE44 / 0x435F50) which is what dereferencing would yield.
+    gm80l_log("Load: settings parse done, loading bar bitmaps...");
+    load_image_file_safe(root, "back.bmp", 0x1E940C, 0x42D15C);
+    load_image_file_safe(root, "front.bmp", 0x1E9408, 0x42D15C);
+    load_image_file_safe(root, "loader.bmp", 0x1E9404, 0x42D15C);
+    gm80l_log("Load: bar bitmaps done, loading icon...");
+    load_icon_file_safe(root, "icon.ico", 0x1E941C);
+    gm80l_log("Load: icon done");
+
+    // Version number globals from the root metadata (dword_5E943C..48)
+    {
+        fs::path metaFile;
+        for (auto& entry : fs::directory_iterator(root)) {
+            auto ext = entry.path().extension().string();
+            if (ext == ".gm80" || entry.path().filename().string().find(".gm80") != std::string::npos) {
+                metaFile = entry.path();
+                break;
+            }
+        }
+        if (!metaFile.empty()) {
+            std::string meta = read_file(metaFile);
+            parse_kv(meta, [&](auto& k, auto& v) {
+                if (k == "exe_version") {
+                    int parts[4] = {0, 0, 0, 0};
+                    int idx = 0;
+                    std::string cur;
+                    for (char c : v) {
+                        if (c == '.') { if (idx < 4) parts[idx++] = atoi(cur.c_str()); cur.clear(); }
+                        else cur += c;
+                    }
+                    if (idx < 4) parts[idx] = atoi(cur.c_str());
+                    write_glob_u32(0x1E943C, (uint32_t)parts[0]);
+                    write_glob_u32(0x1E9440, (uint32_t)parts[1]);
+                    write_glob_u32(0x1E9444, (uint32_t)parts[2]);
+                    write_glob_u32(0x1E9448, (uint32_t)parts[3]);
+                }
+            });
+        }
+    }
 
     // Load constants
     fs::path constPath = root / "settings" / "constants.txt";
@@ -644,10 +853,7 @@ static void* load_trigger(const std::string& name, const fs::path& trigDir) {
     if (!ri) return nullptr;
 
     uint32_t trig_vmt = 0x55C304;
-    uint32_t trig_inst = *(uint32_t*)((uint8_t*)trig_vmt - 40);
-    gm80l_log("Trigger: class_ref=0x%X instSize=%u", trig_vmt, trig_inst);
     void* trig = delphi_ctor(trig_vmt, 0x55C358);
-    gm80l_log("Trigger ctor returned 0x%p", trig);
     if (trig == (void*)trig_vmt) trig = nullptr;
     if (!trig) return nullptr;
 
@@ -709,10 +915,12 @@ static void* load_font(const std::string& name, const fs::path& fontDir) {
 }
 
 // ==== Load sound ====
-// GM 8.0 layout (verified via IDA GM80_Sound_Create/sub_5447A0 + save_sound):
-//   +4 kind, +8 name (AnsiString), +16 filename/source (AnsiString),
-//   +24 pan (double, ctor=1.0), +32 volume (double), +40 preload (byte),
-//   +44 data (TMemoryStream*), +48 effects (i32, ctor=-1)
+// GM 8.0 layout (verified via IDA GM80_Sound_Create 0x5447A0 +
+// SaveSound_Individual 0x544B8C + LoadSound_Individual 0x5449C8, 2026-08-02):
+//   +4 kind, +8 name (AnsiString), +12 effects (i32), +16 filename/source,
+//   +24 volume (double, ctor=1.0), +32 pan (double, ctor=0.0),
+//   +40 preload (byte), +44 data (TMemoryStream*), +48 internal (ctor -1)
+// (Note: effects/volume/pan were previously at +48/+32/+24 — wrong.)
 static void* load_sound(const std::string& name, const fs::path& sndDir) {
     fs::path txtPath = sndDir / (name + ".txt");
     std::string txt = read_file(txtPath);
@@ -730,13 +938,13 @@ static void* load_sound(const std::string& name, const fs::path& sndDir) {
         else if (k == "source") src = v;
         else if (k == "exists") exists = (v == "1");
         else if (k == "kind") set_obj_u32(snd, 4, (uint32_t)std::stoul(v));
-        else if (k == "effects") set_obj_i32(snd, 48, std::stoi(v));
-        else if (k == "volume") set_obj_f64(snd, 32, std::stod(v));
-        else if (k == "pan") set_obj_f64(snd, 24, std::stod(v));
+        else if (k == "effects") set_obj_i32(snd, 12, std::stoi(v));
+        else if (k == "volume") set_obj_f64(snd, 24, std::stod(v));
+        else if (k == "pan") set_obj_f64(snd, 32, std::stod(v));
         else if (k == "preload") set_obj_bool(snd, 40, v == "1");
     });
     set_obj_str(snd, 8, name);   // name lives both in object +8 and parallel array
-    if (!src.empty()) set_obj_str(snd, 16, src);
+    if (!src.empty()) set_obj_str(snd, 16, utf8_to_ansi(src)); // file is UTF-8, GM stores AnsiString
 
     // Load audio binary data into a TMemoryStream at +44
     if (exists && !ext.empty()) {
@@ -858,7 +1066,6 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
         if (loaded > 0) {
             set_obj_ptr(sp, 48, frames);
             set_obj_u32(sp, 4, loaded);
-            gm80l_log("Sprite %s: %u/%u frames loaded", name.c_str(), loaded, frameCount);
         } else {
             delphi_free(frames);
         }
@@ -1129,28 +1336,6 @@ static bool fill_in_safe(void* act, uint32_t libId, uint32_t actId) {
     }
 }
 
-// Dump the action-library state for diagnostics. The library array lives AT
-// base+0x209D08 (sub_5A95C8 walks it with `mov ebx, offset dword_609D08;
-// mov eax, [ebx]` — the array body starts there, NOT a pointer to it).
-static void dump_action_libraries(const char* where) {
-    uint8_t* lb = (uint8_t*)g_load_base;
-    uint32_t libCnt = *(uint32_t*)(lb + 0x1E9468);
-    uint32_t* libs = (uint32_t*)(lb + 0x209D08);
-    gm80l_log("%s: libCnt=%u", where, libCnt);
-    if (libCnt > 0 && libCnt < 64) {
-        for (uint32_t li = 0; li < libCnt && li < 8; li++) {
-            uint32_t lpv = libs[li];
-            if (!lpv || IsBadReadPtr((void*)lpv, 0x100)) {
-                gm80l_log("%s: lib[%u]=0x%X <bad>", where, li, lpv);
-                continue;
-            }
-            uint8_t* lib = (uint8_t*)(uintptr_t)lpv;
-            gm80l_log("%s: lib[%u]=0x%X vmt=0x%X id=%u actCnt=%u",
-                      where, li, lpv, *(uint32_t*)lib, *(uint32_t*)(lib + 8),
-                      *(uint32_t*)(lib + 44));
-        }
-    }
-}
 
 // Parse YYD ACTION blocks from a body string into an Event (shared by
 // objects and timelines). Matches gm82save's load_event + save side format.
@@ -1172,9 +1357,6 @@ static void parse_actions_into_event(void* ev, const std::string& body,
             }
         }
         void* act = event_add_action(ev);
-        gm80l_log("parse_actions: ev=0x%X act=0x%X block='%s'",
-                  (uint32_t)ev, (uint32_t)act,
-                  block.substr(0, 80).c_str());
         if (!act) continue;
 
         // Phase 1: lib_id/action_id first, then fill in the action-library
@@ -1184,41 +1366,12 @@ static void parse_actions_into_event(void* ev, const std::string& body,
             if (k == "lib_id") libId = (uint32_t)std::stoul(v);
             else if (k == "action_id") actionId = (uint32_t)std::stoul(v);
         });
-        gm80l_log("parse_actions: fill_in(act=0x%X lib=%u id=%u)", (uint32_t)act, libId, actionId);
-        if (libId == 1 && actionId == 603) {
-            dump_action_libraries("lib state @ first 603");
-            // Deep: dump action ids of the first id==1 library's action array
-            // (sub_4EB6F8 reads lib+0x2C count / lib+0x30 array).
-            uint8_t* lb = (uint8_t*)g_load_base;
-            uint32_t* libs = (uint32_t*)(lb + 0x209D08);
-            uint32_t lpv = libs[0];
-            if (lpv && !IsBadReadPtr((void*)lpv, 0x200)) {
-                uint8_t* lib = (uint8_t*)(uintptr_t)lpv;
-                uint32_t acnt = *(uint32_t*)(lib + 44);
-                uint32_t* acts = *(uint32_t**)(lib + 48);
-                std::string ids;
-                for (uint32_t ai = 0; ai < acnt && ai < 60; ai++) {
-                    if (!acts[ai] || IsBadReadPtr((void*)acts[ai], 0x80)) {
-                        ids += " <bad@";
-                        ids += std::to_string(ai);
-                        ids += ">";
-                        continue;
-                    }
-                    ids += std::to_string(*(uint32_t*)((uint8_t*)(uintptr_t)acts[ai] + 8)) + ",";
-                }
-                gm80l_log("lib deep: lib0 actCnt=%u ids=[%s]", acnt, ids.c_str());
-            }
-        }
         bool templFound = false;
         if (libId != 0 || actionId != 0) {
             set_obj_u32(act, 4, libId);
             set_obj_u32(act, 8, actionId);
             templFound = fill_in_safe(act, libId, actionId);
         }
-        gm80l_log("parse_actions: fill_in RET tpl=%d kind=%u pcnt=%u flags=%u,%u,%u",
-                  templFound ? 1 : 0, *(uint32_t*)((uint8_t*)act + 12),
-                  *(uint32_t*)((uint8_t*)act + 32), *(uint8_t*)((uint8_t*)act + 16),
-                  *(uint8_t*)((uint8_t*)act + 17), *(uint8_t*)((uint8_t*)act + 18));
         // Do NOT run the post-init template param copy (0x5A6714): the
         // library template's param_strings for unused slots can be garbage,
         // and GM's action validator (sub_5A6B60, run by the post-load object
@@ -1228,10 +1381,6 @@ static void parse_actions_into_event(void* ev, const std::string& body,
         // already set +68=applies_to:self, +72/+108=0 and "0"-default params;
         // the +72/+108/+68 keys below overwrite their fields as needed.)
         for (int j = 0; j < 8; j++) set_obj_str(act, 76 + j * 4, "");
-        if (libId == 1 && (actionId == 603 || actionId == 604)) {
-            char* pstr = *(char**)((uint8_t*)act + 76);
-            gm80l_log("parse_actions: after clear p0='%.40s'", pstr ? pstr : "(nil)");
-        }
 
         // Phase 2: remaining keys override the template defaults, in file
         // order. can_be_relative / applies_to_something come from the
@@ -1285,11 +1434,6 @@ static void parse_actions_into_event(void* ev, const std::string& body,
         // otherwise) would otherwise be compiled as code and fail with
         // "Variable name expected".
         if (kind == 7) set_obj_str(act, 76, load_gml(codeAfter));
-        {
-            char* pstr = *(char**)((uint8_t*)act + 76);
-            std::string p0 = (pstr && !IsBadReadPtr(pstr, 4)) ? std::string(pstr) : "<bad>";
-            gm80l_log("parse_actions: action done kind=%u p0='%.40s'", kind, p0.c_str());
-        }
     }
 }
 
@@ -1412,9 +1556,6 @@ static void* load_object(const std::string& name, const fs::path& objDir,
         if (!ev) continue;
 
         // Parse YYD ACTION blocks within the section
-        gm80l_log("parse_actions: obj=%s ev=0x%X event='%s' bodyLen=%u",
-                  name.c_str(), (uint32_t)ev, sec.first.c_str(),
-                  (uint32_t)sec.second.size());
         parse_actions_into_event(ev, sec.second, objectNames);
 
         // Place event at its index in the type's sparse array
@@ -1974,7 +2115,6 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
 
     // 1b. Cache real VMTs from GM's array objects BEFORE SetLength replaces them
     cache_vmts();
-    dump_action_libraries("lib state @ load start");
 
     // 2. Read root .gm80 metadata
     auto stem = root.filename();
@@ -2002,9 +2142,12 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         }
     }
 
+    gm80l_log("Load: metadata done");
     // 3. Load settings + constants
     load_settings(root);
+    gm80l_log("Load: settings done");
     load_extensions(root);
+    gm80l_log("Load: extensions done");
 
     // 4. Load triggers (single array, names live inside objects at +4)
     {
@@ -2023,6 +2166,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
             }
         }
     }
+    gm80l_log("Load: triggers done");
 
     // 5. Load sounds
     gm80l_log("Loading sounds...");
@@ -2111,8 +2255,21 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     // 15. Clear all updated flags
     clear_all_updated_flags();
 
-    // 16. Update settings timestamp
-    write_glob_f64(ADDR_SETTINGS_TIMESTAMP, 0.0);
+    // 16. Update settings timestamp — GM 8.0 keeps the "last modified" as a
+    // Delphi TDateTime (double, days since 1899-12-30); writing 0.0 shows
+    // 1899/12/30 in the project properties. Use GM's own Now() (0x405CF18)
+    // for a correct value.
+    {
+        uint8_t* b = (uint8_t*)g_load_base;
+        uint32_t fn = (uint32_t)b + 0xCF18;   // sub_40CF18 = Now() (GetLocalTime→EncodeDate+EncodeTime)
+        double now = 0.0;
+        __asm {
+            call fn
+            fstp qword ptr [now]              // Delphi double return lives in ST(0), NOT EDX:EAX
+        }
+        write_glob_f64(ADDR_SETTINGS_TIMESTAMP, now);
+        gm80l_log("gm80_load_project: timestamp set to %f", now);
+    }
 
     // 17. Working directory: GM launches the compiled game with
     // lpCurrentDirectory=NULL (CreateProcessA at 0x521DF3), so the game
@@ -2187,7 +2344,7 @@ bool gm80_load_from_path(GMKProject& proj, const std::wstring& wpath) {
     parse_kv(settxt, [&](auto& k, auto& v) {
         if (k == "fullscreen") proj.settings.fullscreen = (v == "1");
         else if (k == "interpolate_pixels") proj.settings.interpolate_pixels = (v == "1");
-        else if (k == "scaling") proj.settings.scaling = std::stoi(v);
+        else if (k == "scaling") proj.settings.scaling = (int32_t)std::stoul(v); // signed; stoi throws on u32-encoded -1
         else if (k == "clear_color") proj.settings.clear_color = (uint32_t)std::stoul(v);
         else if (k == "color_depth") proj.settings.color_depth = (uint32_t)std::stoul(v);
         else if (k == "resolution") proj.settings.resolution = (uint32_t)std::stoul(v);

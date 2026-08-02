@@ -62,30 +62,59 @@ struct GM80ResourceGlobals {
     uint32_t off_updated_flag;
 };
 
-#define RESOURCE_SPRITES      {0x1E92E8, 0x1E92EC, 0x1EFD1C, 0x1EFCA0}  // sub_55D2F0
-#define RESOURCE_SOUNDS       {0x1E92FC, 0x1E932C, 0x1F1CA0, 0x1EFC64}  // sub_573618
-#define RESOURCE_BACKGROUNDS  {0x1E9278, 0x1E9288, 0x1E9284, 0x1EFC88}  // sub_5462F0
-#define RESOURCE_PATHS        {0x1E9108, 0x1E911C, 0x1E9114, 0x1EFC1C}  // sub_54032C
-#define RESOURCE_SCRIPTS      {0x1E9094, 0x1E90A8, 0x1E90A0, 0x1EFC38}  // sub_536A74
-#define RESOURCE_FONTS        {0x1E92AC, 0x1E92BC, 0x1E92B8, 0x1EFCFC}  // sub_556E14
-#define RESOURCE_TIMELINES    {0x1E92C0, 0x1E92D0, 0x1E92CC, 0x1EFD04}  // sub_558C54
-#define RESOURCE_OBJECTS      {0x1E9354, 0x1E9364, 0x1E9360, 0x1F61E8}  // sub_558C54
-#define RESOURCE_ROOMS        {0x1E9300, 0x1E9310, 0x1E930C, 0x1EFD3C}  // sub_562638
-#define RESOURCE_EXTENSIONS   {0x1E9294, 0x1E92A4, 0x1E92A0, 0x1EFD40}  // sub_553E20
-#define RESOURCE_TRIGGERS     {0x1E9320, 0x1E9330, 0x1E9328, 0x1EFD80}
-#define RESOURCE_CONSTANTS    {0x1E91C8, 0x1E91D8, 0x1E91D0, 0x1EFDCC}
+// NOTE: these macros are documentation only (unused by the C++ code, which uses
+// hardcoded offsets). Values corrected 2026-08-02 from GM80_Save*/Load* disasm;
+// previously every label was shifted by one. {array, count, timestamps, updated}
+#define RESOURCE_SPRITES      {0x1E9108, 0x1E911C, 0x1E9114, 0x1EFCA0}
+#define RESOURCE_SOUNDS       {0x1E9278, 0x1E9288, 0x1E9284, 0x1EFCE8}
+#define RESOURCE_BACKGROUNDS  {0x1E9094, 0x1E90A8, 0x1E90A0, 0x1EFC38}
+#define RESOURCE_PATHS        {0x1E92AC, 0x1E92BC, 0x1E92B8, 0x1EFCFC}
+#define RESOURCE_SCRIPTS      {0x1E92D4, 0x1E92E4, 0x1E92E0, 0x1EFD04}
+#define RESOURCE_FONTS        {0x1E92C0, 0x1E92D0, 0x1E92CC, 0x1EFD0C}
+#define RESOURCE_TIMELINES    {0x1E9300, 0x1E9310, 0x1E930C, 0x1EFD3C}
+#define RESOURCE_OBJECTS      {0x1E9354, 0x1E9364, 0x1E9360, 0x1F61E8}
+#define RESOURCE_ROOMS        {0x1E9294, 0x1E92A4, 0x1E92A0, 0x1EFCF4}
+#define RESOURCE_EXTENSIONS   {0x1E9460, 0x1E9464, 0x2000BC, 0}
+#define RESOURCE_TRIGGERS     {0x1E92E8, 0x1E92EC, 0x1EFD1C, 0x1EFD14}
+#define RESOURCE_CONSTANTS    {0x1E92FC, 0x1E932C, 0x1F1CA0, 0x1F1C98}
 #define RESOURCE_INCLUDED     {0x1E9248, 0x1E9258, 0x1E9250, 0x1EFE10}
 
-// ==== Settings Globals (verified from sub_59E648) ====
-#define ADDR_SETTING_FULLSCREEN      0x1E93B0   // u32 bool
-#define ADDR_SETTING_INTERPOLATE     0x1E93B4   // u32 bool
-#define ADDR_SETTING_COLOR_DEPTH     0x1E93BC   // u32
-#define ADDR_SETTING_RESOLUTION      0x1E93C4   // u32
-#define ADDR_SETTING_FREQUENCY       0x1E93C8   // u32
-#define ADDR_SETTING_SCALING         0x1E93CC   // i32
-#define ADDR_SETTING_CLEAR_COLOR     0x1E93D0   // u32 RGBA
-#define ADDR_SETTING_PRIORITY        0x1E93D4   // u32
-#define ADDR_SETTING_LOADING_BAR     0x1E93D8   // u32
+// ==== Settings Globals (verified from GM80_SaveSettings 0x59E648 disasm, 2026-08-02) ====
+// Field order = .gmk settings section order. Types match how SaveSettings reads
+// them (movzx byte vs mov dword). Previously these were all shifted by one slot.
+#define ADDR_SETTING_FULLSCREEN      0x1E93A0   // byte bool
+#define ADDR_SETTING_INTERPOLATE     0x1E93A4   // byte bool
+#define ADDR_SETTING_DONT_DRAW_BORDER 0x1E93A8  // byte bool
+#define ADDR_SETTING_DISPLAY_CURSOR  0x1E93AC   // byte bool
+#define ADDR_SETTING_SCALING         0x1E93B0   // i32  (Fixed scale %)
+#define ADDR_SETTING_ALLOW_RESIZE    0x1E93B4   // byte bool
+#define ADDR_SETTING_WINDOW_ON_TOP   0x1E93B8   // byte bool
+#define ADDR_SETTING_CLEAR_COLOR     0x1E93BC   // u32 RGBA
+#define ADDR_SETTING_SET_RESOLUTION  0x1E93C0   // byte bool
+#define ADDR_SETTING_COLOR_DEPTH     0x1E93C4   // u32
+#define ADDR_SETTING_RESOLUTION      0x1E93C8   // u32
+#define ADDR_SETTING_FREQUENCY       0x1E93CC   // u32
+#define ADDR_SETTING_DONT_SHOW_BUTTONS 0x1E93D0 // byte
+#define ADDR_SETTING_FREEZE_ON_LOSE_FOCUS 0x1E93D4 // byte
+#define ADDR_SETTING_VSYNC           0x1E93D8   // byte
+#define ADDR_SETTING_DISABLE_SCREENSAVER 0x1E93DC // byte
+#define ADDR_SETTING_F4_FULLSCREEN   0x1E93E0   // byte
+#define ADDR_SETTING_F1_HELP         0x1E93E4   // byte
+#define ADDR_SETTING_ESC_CLOSE       0x1E93E8   // byte
+#define ADDR_SETTING_F5_SAVE_F6_LOAD 0x1E93EC   // byte
+#define ADDR_SETTING_F9_SCREENSHOT   0x1E93F0   // byte
+#define ADDR_SETTING_TREAT_CLOSE_AS_ESC 0x1E93F4 // byte
+#define ADDR_SETTING_PRIORITY        0x1E93F8   // u32 (0 Normal, 1 High, 2 Highest)
+#define ADDR_SETTING_LOADING_BAR     0x1E93FC   // u32 (0 none, 1 default, 2 custom)
+// Loading-bar look / icon (verified sub_59E648):
+#define ADDR_SETTING_CUSTOM_LOADER   0x1E9400   // byte flag
+#define ADDR_SETTING_LOADER_IMAGE    0x1E9404   // TBitmap*
+#define ADDR_SETTING_BAR_FRONT       0x1E9408   // TBitmap*
+#define ADDR_SETTING_BAR_BACK        0x1E940C   // TBitmap*
+#define ADDR_SETTING_BAR_TRANSPARENT 0x1E9410   // byte
+#define ADDR_SETTING_BAR_TRANSLUCENCY 0x1E9414  // u32 (alpha 0-255)
+#define ADDR_SETTING_BAR_SCALE       0x1E9418   // byte
+#define ADDR_SETTING_GAME_ICON       0x1E941C   // TIcon*
 // String globals verified from GM80_SaveSettings disasm (0x59E960-0x59EA08)
 #define ADDR_SETTING_AUTHOR          0x1E9430   // dword_5E9430 → sub_4EA9E4
 #define ADDR_SETTING_VERSION         0x1E9434   // off_5E9434 → sub_4EA9E4

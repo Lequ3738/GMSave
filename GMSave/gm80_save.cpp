@@ -116,6 +116,38 @@ static bool wf(const std::wstring& fp, const std::string& content) {
     return true;
 }
 
+// Serialize a Delphi TBitmap/TIcon object (dword_5E940C/5E9408/5E9404/
+// 5E941C) to a file via SaveToStream (vtable+0x58 — 8.0: LoadFromStream is
+// vtable+0x54 per sub_59DCD0, SaveToStream follows it) into a TMemoryStream
+// whose memory (FMemory=+4, FSize=+8) we dump to file.
+static void save_bitmap_to_file(uint32_t bmpPtr, const wchar_t* fname) {
+    if (!bmpPtr) return;
+    // Create TMemoryStream the same way GM's Outer does (off_4EA854 chain).
+    uint32_t streamCls = *(uint32_t*)((uint8_t*)g_save_base + 0xEA854);
+    if (streamCls < 0x400000) streamCls = *(uint32_t*)((uint8_t*)g_save_base + 0xEA8A0);
+    void* stream = nullptr;
+    __asm {
+        mov dl, 1
+        mov eax, streamCls
+        mov ecx, 0x404560               // @ClassCreate
+        call ecx
+        mov stream, eax
+    }
+    if (!stream) return;
+    // TBitmap.SaveToStream(stream) — vtable+0x58
+    __asm {
+        mov eax, bmpPtr
+        mov edx, stream
+        mov ecx, [eax]
+        call dword ptr [ecx+0x58]
+    }
+    uint8_t* mem = *(uint8_t**)((uint8_t*)stream + 4);    // FMemory
+    uint32_t size = *(uint32_t*)((uint8_t*)stream + 8);   // FSize
+    if (mem && size > 0 && size < 64 * 1024 * 1024) {
+        wf(fname, std::string((char*)mem, size));
+    }
+}
+
 static bool wb(const std::wstring& fp, const void* data, size_t len) {
     auto lp = fp.find_last_of(L"\\/");
     if (lp != std::wstring::npos) CreateDirectoryW(fp.substr(0, lp).c_str(), NULL);
@@ -288,8 +320,11 @@ static void save_path(void* obj, const std::wstring& outPath) {
 
 // -- Sound --
 static void save_sound(void* obj, const std::wstring& outPath) {
-    std::string ext = RS(obj, 8); // extension string — actually GM80 sound has name at +8
-    // Sound layout: +4=kind, +8=name, +12=volume(int), +16=filename
+    // GM80 sound object layout (verified from GM80_Sound_Create 0x5447A0 +
+    // SaveSound_Individual 0x544B8C + LoadSound_Individual 0x5449C8, 2026-08-02):
+    //   +4 kind, +8 name, +12 effects, +16 filename/source,
+    //   +24 volume (f64, ctor 1.0), +32 pan (f64, ctor 0.0),
+    //   +40 preload (byte), +44 data (TMemoryStream*), +48 internal (ctor -1)
     std::string t;
     auto L = [&](const char* k, const std::string& v) { t += k; t += "="; t += v; t += "\n"; };
     std::string sndExt = RS(obj, 16); // filename/extension
@@ -297,11 +332,11 @@ static void save_sound(void* obj, const std::wstring& outPath) {
     auto dotPos = sndExt.find_last_of('.');
     std::string cleanExt = (dotPos != std::string::npos) ? sndExt.substr(dotPos + 1) : sndExt;
     L("extension", cleanExt);
-    L("source", RS(obj, 16));      // filename
+    L("source", ansi_to_utf8(RS(obj, 16))); // UTF-8 (was raw ANSI — mojibake for non-ASCII names)
     L("kind", to_str(R4(obj, 4)));  // kind
-    L("effects", to_str(R4(obj, 48))); // effects (from ctor: set to -1)
-    L("volume", to_str(R8(obj, 32)));  // volume as double
-    L("pan", to_str(R8(obj, 24)));     // pan as double
+    L("effects", to_str(R4(obj, 12))); // effects (was wrongly +48)
+    L("volume", to_str(R8(obj, 24)));  // volume as double (was wrongly +32)
+    L("pan", to_str(R8(obj, 32)));     // pan as double (was wrongly +24)
     L("preload", to_str(R1(obj, 40))); // preload flag
     // Check for binary audio data
     void* dataObj = RP(obj, 44);
@@ -920,7 +955,10 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         m += "exe_product=" + GS(0x1E9450) + "\n";
         m += "exe_copyright=" + GS(0x1E9454) + "\n";
         m += "exe_description=" + GS(0x1E9458) + "\n";
-        m += "exe_version=1.0.0.0\n\n";
+        // Version number quad from GM 8.0 globals dword_5E943C/40/44/48
+        // (verified from sub_59E648 .gmk save: 4×u32 after the strings).
+        m += "exe_version=" + to_str(GU32(0x1E943C)) + "." + to_str(GU32(0x1E9440)) +
+             "." + to_str(GU32(0x1E9444)) + "." + to_str(GU32(0x1E9448)) + "\n\n";
         m += "has_backgrounds=" + to_str(!bgNames.empty()) + "\n";
         m += "has_datafiles=0\n";
         m += "has_fonts=" + to_str(!fontNames.empty()) + "\n";
@@ -936,43 +974,60 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     }
 
     // ==== Settings ====
+    // Field offsets corrected 2026-08-02 from GM80_SaveSettings (0x59E648)
+    // disasm: fullscreen=0x1E93A0 … scaling=0x1E93B0 … priority=0x1E93F8,
+    // loading_bar=0x1E93FC (u32). Previously every field was shifted by one.
     {
         std::string s;
         auto L = [&](const char* k, const std::string& v) { s += std::string(k) + "=" + v + "\n"; };
-        L("fullscreen", to_str(GU32(0x1E93B0) != 0));
-        L("interpolate_pixels", to_str(GU8(0x1E93B4) != 0));
-        // GM 8.0 globals verified from GM80_SaveSettings disasm (sub_59E648) +
-        // load sub_59DD5C: B8 border, C0 cursor, E0-E4-E8-EC-F0-F4 bytes,
-        // 9420-942C error/uninit bytes
-        L("dont_draw_border", to_str((unsigned)GU8(0x1E93B8)));
-        L("display_cursor", to_str((unsigned)GU8(0x1E93C0)));
-        L("scaling", to_str(GU32(0x1E93CC)));
-        L("allow_resize", "0"); L("window_on_top", "0");   // no GM80 global
-        L("clear_color", to_str((unsigned)GU8(0x1E93D0)));
-        L("set_resolution", "0");                          // no GM80 global
-        L("color_depth", to_str(GU32(0x1E93BC)));
-        L("resolution", to_str(GU32(0x1E93C4)));
-        L("frequency", to_str(GU32(0x1E93C8)));
-        L("dont_show_buttons", to_str((unsigned)GU8(0x1E93E0)));
-        L("vsync", to_str((unsigned)GU8(0x1E93E4)));
+        L("fullscreen", to_str(GU8(ADDR_SETTING_FULLSCREEN) != 0));
+        L("interpolate_pixels", to_str(GU8(ADDR_SETTING_INTERPOLATE) != 0));
+        L("dont_draw_border", to_str((unsigned)GU8(ADDR_SETTING_DONT_DRAW_BORDER)));
+        L("display_cursor", to_str((unsigned)GU8(ADDR_SETTING_DISPLAY_CURSOR)));
+        L("scaling", to_str((int32_t)GU32(ADDR_SETTING_SCALING))); // signed (-1=keep aspect); stoi on u32 form crashes
+        L("allow_resize", to_str(GU8(ADDR_SETTING_ALLOW_RESIZE) != 0));
+        L("window_on_top", to_str(GU8(ADDR_SETTING_WINDOW_ON_TOP) != 0));
+        L("clear_color", to_str(GU32(ADDR_SETTING_CLEAR_COLOR))); // u32 RGBA
+        L("set_resolution", to_str(GU8(ADDR_SETTING_SET_RESOLUTION) != 0));
+        L("color_depth", to_str(GU32(ADDR_SETTING_COLOR_DEPTH)));
+        L("resolution", to_str(GU32(ADDR_SETTING_RESOLUTION)));
+        L("frequency", to_str(GU32(ADDR_SETTING_FREQUENCY)));
+        L("dont_show_buttons", to_str((unsigned)GU8(ADDR_SETTING_DONT_SHOW_BUTTONS)));
+        L("vsync", to_str((unsigned)GU8(ADDR_SETTING_VSYNC)));
         L("swap_creation_events", "0");                    // no GM80 global
-        L("disable_screensaver", to_str((unsigned)GU8(0x1E93E8)));
-        L("f4_fullscreen_toggle", to_str((unsigned)GU8(0x1E93EC)));
-        L("f1_help_menu", to_str((unsigned)GU8(0x1E93F0)));
-        L("esc_close_game", to_str((unsigned)GU8(0x1E93F4)));
-        L("f5_save_f6_load", "0"); L("f9_screenshot", "0"); // no GM80 globals
-        L("treat_close_as_esc", "0");                      // no GM80 global
-        L("priority", to_str((int)GU8(0x1E93D4)));         // GM80_Priority at 0x5E93D4
-        L("freeze_on_lose_focus", "0");                    // no GM80 global
-        L("custom_loader", "0"); L("custom_bar", to_str((int)GU8(0x1E93D8))); // GM80_LoadingBar at 0x5E93D8
-        L("bar_has_bg", "0"); L("bar_has_fg", "0");
-        L("transparent", "1"); L("translucency", "255"); L("scale_progress_bar", "1");
+        L("disable_screensaver", to_str((unsigned)GU8(ADDR_SETTING_DISABLE_SCREENSAVER)));
+        L("f4_fullscreen_toggle", to_str((unsigned)GU8(ADDR_SETTING_F4_FULLSCREEN)));
+        L("f1_help_menu", to_str((unsigned)GU8(ADDR_SETTING_F1_HELP)));
+        L("esc_close_game", to_str((unsigned)GU8(ADDR_SETTING_ESC_CLOSE)));
+        L("f5_save_f6_load", to_str((unsigned)GU8(ADDR_SETTING_F5_SAVE_F6_LOAD)));
+        L("f9_screenshot", to_str((unsigned)GU8(ADDR_SETTING_F9_SCREENSHOT)));
+        L("treat_close_as_esc", to_str((unsigned)GU8(ADDR_SETTING_TREAT_CLOSE_AS_ESC)));
+        L("priority", to_str(GU32(ADDR_SETTING_PRIORITY))); // u32 0/1/2
+        L("freeze_on_lose_focus", to_str(GU8(ADDR_SETTING_FREEZE_ON_LOSE_FOCUS) != 0));
+        // Loading-bar state: value at 0x1E93FC (u32 0 none / 1 default / 2 custom);
+        // custom bitmaps at dword_5E940C/5E9408 (back/front) and dword_5E9404
+        // (loader image), flagged by byte_5E9400.
+        L("custom_loader", to_str((unsigned)GU8(ADDR_SETTING_CUSTOM_LOADER)));
+        L("custom_bar", to_str(GU32(ADDR_SETTING_LOADING_BAR)));
+        L("bar_has_bg", to_str(*(uint32_t*)((uint8_t*)g_save_base + ADDR_SETTING_BAR_BACK) != 0));
+        L("bar_has_fg", to_str(*(uint32_t*)((uint8_t*)g_save_base + ADDR_SETTING_BAR_FRONT) != 0));
+        L("transparent", to_str((unsigned)GU8(ADDR_SETTING_BAR_TRANSPARENT)));
+        L("translucency", to_str(GU32(ADDR_SETTING_BAR_TRANSLUCENCY)));
+        L("scale_progress_bar", to_str((unsigned)GU8(ADDR_SETTING_BAR_SCALE)));
         L("show_error_messages", to_str((unsigned)GU8(0x1E9420)));
         L("log_errors", to_str((unsigned)GU8(0x1E9424)));
         L("always_abort", to_str((unsigned)GU8(0x1E9428)));
         L("zero_uninitialized_vars", to_str((unsigned)GU8(0x1E942C)));
         L("error_on_uninitialized_args", "0");             // no GM80 global
         wf(sub(L"settings\\settings.txt"), s);
+
+        // NOTE: absolute paths via sub() — relative paths would land in the
+        // process cwd (outside the .gm80 project folder).
+        save_bitmap_to_file(*(uint32_t*)((uint8_t*)g_save_base + 0x1E940C), sub(L"settings\\back.bmp").c_str());
+        save_bitmap_to_file(*(uint32_t*)((uint8_t*)g_save_base + 0x1E9408), sub(L"settings\\front.bmp").c_str());
+        save_bitmap_to_file(*(uint32_t*)((uint8_t*)g_save_base + 0x1E9404), sub(L"settings\\loader.bmp").c_str());
+        // Game icon: TIcon at dword_5E941C (verified sub_59DAC4) → icon.ico
+        save_bitmap_to_file(*(uint32_t*)((uint8_t*)g_save_base + 0x1E941C), sub(L"settings\\icon.ico").c_str());
 
         // Extensions — settings/extensions.txt (matches gm82save)
         // GM 8.0 (verified sub_5A80A8/sub_5A7FF0/sub_5A7910):
@@ -1072,11 +1127,14 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
 
     // Sounds
     if (soundCnt > 0) {
-        // Sound names from name array
+        // Sound names from name array (corrected 2026-08-02: 0x1E9280 not 0x1E932C;
+        // 0x1E932C is the CONSTANTS count — reading it here crashed on any project
+        // with sounds. Object array is 0x1E9278, not 0x1E92FC.)
         std::vector<std::string> sndNames;
-        read_names_global(0x1E932C, 0x1E9288, sndNames);
+        read_names_global(0x1E9280, 0x1E9288, sndNames);
         save_index(L"sounds", sndNames);
-        uint32_t* sndArr = *(uint32_t**)(base + 0x1E92FC);
+        save_tree(L"sounds", sndNames, 3);   // was missing → no tree.yyd → empty IDE tree
+        uint32_t* sndArr = *(uint32_t**)(base + 0x1E9278);
         if (sndArr) {
             for (uint32_t i = 0; i < soundCnt && i < (uint32_t)sndNames.size(); i++) {
                 if (sndNames[i].empty()) continue;
