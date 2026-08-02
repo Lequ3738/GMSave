@@ -5,6 +5,7 @@
 #include "delphi.h"
 #include "gm80_save.h"
 #include "gm80_load.h"
+#include "project_watcher.h"
 #include <cstdarg>
 #include <ctime>
 #include <filesystem>
@@ -252,6 +253,8 @@ static void gm80_progress_step(int pos);
 static void gm80_progress_close();
 
 static void __stdcall do_gm80_save_if_needed() {
+    // Stop the file watcher first so our own writes are never seen as foreign.
+    project_watcher_stop();
     dbg_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
     gm80_progress_show();
     gm80_progress_step(25);
@@ -261,6 +264,9 @@ static void __stdcall do_gm80_save_if_needed() {
         else {
             dbg_log("Save: .gm80 complete");
             clear_updated_flags();
+            // Re-arm the watcher + SAVE_END so subsequent foreign edits are seen.
+            project_watcher_start(g_gm80_save_path);
+            project_watcher_mark_saved();
         }
     } catch (std::exception& e) {
         dbg_log("Save: EXCEPTION: %s", e.what());
@@ -336,6 +342,8 @@ static void gm80_progress_close() {
 // NULL path argument on our call path) into the "cannot create file" dialog.
 // Verified: Inner alone returns 1 with a full 0xACC54-byte stream.
 static void __stdcall do_gmk_save_direct() {
+    // A .gmk save changes the project type — stop watching the old .gm80 dir.
+    project_watcher_stop();
     uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
     if (!base) return;
     char** pp = (char**)(base + 0x1EA27C);
@@ -540,6 +548,9 @@ static int __stdcall check_and_do_gm80_load() {
     // (Delphi MM is ready — InitializeProject already ran at this point)
     if (gm80_load_project(g_gm_base, dirPath)) {
         dbg_log("Load: .gm80 direct Delphi objects — SUCCESS");
+        // Start the file watcher so external edits are detected (silent reload
+        // when the user hasn't changed anything; Yes/No prompt on conflict).
+        project_watcher_start(dirPath);
         return 1;
     }
 
@@ -706,6 +717,9 @@ bool ide_hooks_install(HMODULE gm_base) {
     g_gm_base_ptr = gm_base;
     uint8_t* base = (uint8_t*)gm_base;
     hook_comdlg32_iat(gm_base);
+    // NOTE: the file watcher's hidden timer window is created lazily on the
+    // first project_watcher_start (project load / save), NOT here — creating a
+    // window inside DllMain (loader lock held) is unsafe.
 
     // Save hook 1: patch CALL at 0x5DAE36 (dialog save path in sub_5DAD60)
     void* save_call_addr = base + 0x1DAE36;
