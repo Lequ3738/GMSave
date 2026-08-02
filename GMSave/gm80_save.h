@@ -7,3 +7,8 @@
 // gm_base: GetModuleHandle(NULL) of GameMaker.exe
 // path: full path to .gm80 file (e.g. "C:\project.gm80")
 bool gm80_save_to_path(void* gm_base, const std::wstring& path);
+
+// If gm80_save_to_path returned false, this holds the human-readable reason
+// (currently: a resource-name validation error). The caller should close any
+// progress form before displaying it.
+const std::string& gm80_save_last_error();

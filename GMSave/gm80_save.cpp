@@ -3,10 +3,13 @@
 #include "pch.h"
 #include "gm80_save.h"
 #include "gm80_addresses.h"
+#include "project_watcher.h"
 #include <cstdio>
 #include <sstream>
 #include <cstdarg>
 #include <map>
+#include <cctype>
+#include <cstring>
 
 static void svlog(const char* fmt, ...) {
     char path[MAX_PATH], buf[512];
@@ -21,6 +24,15 @@ static void svlog(const char* fmt, ...) {
 // These use the offsets verified by IDA analysis of GM 8.0 serializers
 
 static void* g_save_base = nullptr;
+
+// Reason gm80_save_to_path returned false (resource-name validation error).
+// Read by the caller (ide_hooks) AFTER it closes the progress form, so the
+// error dialog is never buried under the "Saving…" progress window.
+static std::string g_save_error;
+
+const std::string& gm80_save_last_error() {
+    return g_save_error;
+}
 
 // ==== Smart save state ====
 // A resource is re-written on save only when its Delphi timestamp is newer than
@@ -65,6 +77,55 @@ static double* ts_ptr(uint32_t tsOff) {
     void* p = *(void**)((uint8_t*)g_save_base + tsOff);
     if (!p || (uintptr_t)p == 0xFFFFFFFF) return nullptr;
     return (double*)p;
+}
+
+// ==== Resource name validation (gm82save filename_invalid parity) ====
+// Windows path-component restrictions: `<>:"/\|?*`, reserved device names
+// (CON/PRN/AUX/NUL/COM1-9/LPT1-9), trailing dot, blank/`.`/`..`. Returns a short
+// reason, or nullptr if the name is usable as a file/directory component.
+static const char* filename_invalid(const std::string& s) {
+    if (s == "." || s == "..") return "reserved \".\"";
+    if (!s.empty() && s.back() == '.') return "trailing dot";
+    if (s.empty()) return "blank";
+    bool blank = true;
+    for (char c : s) if (!isspace((unsigned char)c)) { blank = false; break; }
+    if (blank) return "blank";
+    for (char c : s)
+        if (strchr("<>:\"/\\|?*", c)) return "contains an invalid character";
+    static const char* const reserved[] = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9",
+    };
+    for (auto* r : reserved)
+        if (_stricmp(s.c_str(), r) == 0) return "is a reserved device name";
+    return nullptr;
+}
+
+// Validate one name list; returns a descriptive error for the first invalid or
+// case-insensitively duplicate name, or "" if every name is usable.
+static std::string validate_name_list(const char* what, const std::vector<std::string>& names) {
+    std::map<std::string, int> seen; // lowercase name → first index
+    for (size_t i = 0; i < names.size(); i++) {
+        const std::string& n = names[i];
+        if (n.empty()) continue;
+        if (const char* why = filename_invalid(n)) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s '%s' %s", what, n.c_str(), why);
+            return buf;
+        }
+        std::string l = n;
+        for (auto& c : l) c = (char)tolower((unsigned char)c);
+        auto it = seen.find(l);
+        if (it != seen.end()) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s '%s' duplicates '%s' (case-insensitive)",
+                     what, n.c_str(), names[it->second].c_str());
+            return buf;
+        }
+        seen[l] = (int)i;
+    }
+    return "";
 }
 
 static uint32_t R4(void* obj, int off) { return *(uint32_t*)((uint8_t*)obj + off); }
@@ -1041,6 +1102,43 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                 if (!tObj) { triggerNames.push_back(""); continue; }
                 triggerNames.push_back(RS(tObj, 4));
             }
+        }
+    }
+
+    // ==== Resource name validation (abort before any write) ====
+    // A name Windows can't use as a path component would silently fail
+    // CreateFileW (resource missing on reload) or collide case-insensitively
+    // (one file overwrites another → two resources point at the same file).
+    // Validate everything up front so an abort leaves the on-disk project
+    // exactly as the last good save.
+    {
+        std::string nerr = validate_name_list("sprite", spriteNames);
+        if (nerr.empty()) nerr = validate_name_list("sound", soundNames);
+        if (nerr.empty()) nerr = validate_name_list("background", bgNames);
+        if (nerr.empty()) nerr = validate_name_list("path", pathNames);
+        if (nerr.empty()) nerr = validate_name_list("script", scriptNames);
+        if (nerr.empty()) nerr = validate_name_list("font", fontNames);
+        if (nerr.empty()) nerr = validate_name_list("timeline", tlNames);
+        if (nerr.empty()) nerr = validate_name_list("object", objectNames);
+        if (nerr.empty()) nerr = validate_name_list("room", roomNames);
+        if (nerr.empty()) nerr = validate_name_list("trigger", triggerNames);
+        if (nerr.empty()) {
+            uint32_t dCnt = *(uint32_t*)(base + 0x1E9398);
+            uint32_t* dArr = *(uint32_t**)(base + 0x1E9390);
+            std::vector<std::string> dNames;
+            if (dCnt > 0 && dCnt < 10000 && dArr) {
+                dNames.reserve(dCnt);
+                for (uint32_t i = 0; i < dCnt; i++) {
+                    void* f = (void*)(uintptr_t)dArr[i];
+                    dNames.push_back(f ? RS(f, 4) : std::string());
+                }
+            }
+            nerr = validate_name_list("included file", dNames);
+        }
+        if (!nerr.empty()) {
+            g_save_error = nerr;
+            svlog("Save: ABORTED — %s", nerr.c_str());
+            return false; // caller shows the error after closing the progress form
         }
     }
 

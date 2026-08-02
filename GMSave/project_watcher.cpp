@@ -243,7 +243,7 @@ static void do_reload() {
 // The main window as MessageBox owner: the prompt is then modal to the IDE
 // (main window + its controls are disabled while it is up) and stays in front.
 // Falls back to the foreground window (the gate already requires it == main).
-static HWND prompt_owner() {
+HWND gm80_prompt_owner() {
     HWND main = FindWindowW(L"TMainForm", NULL);
     if (!main) main = GetForegroundWindow();
     return main;
@@ -252,7 +252,7 @@ static HWND prompt_owner() {
 static void project_watcher_act() {
     if (user_has_unsaved_changes()) {
         pwl_log("Watcher: unsaved changes present → prompting");
-        int r = MessageBoxW(prompt_owner(),
+        int r = MessageBoxW(gm80_prompt_owner(),
             L"Project files have been modified outside Game Maker. Reload project? "
             L"Unsaved changes will be lost.\r\n"
             L"If you click \"No\", saving will overwrite any foreign changes.",

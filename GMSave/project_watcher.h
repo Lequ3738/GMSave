@@ -26,3 +26,8 @@ void project_watcher_ensure_timer_window();
 void project_watcher_tick();
 
 bool project_watcher_is_running();
+
+// Main-window HWND for modal dialog owners (FindWindow("TMainForm"), falling
+// back to the foreground window). Share ONE implementation across all plugin
+// message boxes so the dialog stays in front of the IDE and disables it.
+HWND gm80_prompt_owner();

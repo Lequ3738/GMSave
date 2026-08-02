@@ -258,6 +258,7 @@ static void __stdcall do_gm80_save_if_needed() {
     dbg_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
     gm80_progress_show();
     gm80_progress_step(25);
+    bool ok = false;
     try {
         if (!gm80_save_to_path(g_gm_base, g_gm80_save_path))
             dbg_log("Save: ERROR");
@@ -267,6 +268,7 @@ static void __stdcall do_gm80_save_if_needed() {
             // Re-arm the watcher + SAVE_END so subsequent foreign edits are seen.
             project_watcher_start(g_gm80_save_path);
             project_watcher_mark_saved();
+            ok = true;
         }
     } catch (std::exception& e) {
         dbg_log("Save: EXCEPTION: %s", e.what());
@@ -275,6 +277,18 @@ static void __stdcall do_gm80_save_if_needed() {
     }
     gm80_progress_step(100);
     gm80_progress_close();
+    // A failed save is currently always a resource-name validation error. Show
+    // it only AFTER the progress form is closed so the dialog isn't buried
+    // under the "Saving…" window.
+    if (!ok) {
+        const std::string& err = gm80_save_last_error();
+        if (!err.empty()) {
+            std::string msg = "Cannot save project:\r\n" + err + ".\r\n"
+                              "Rename it and try again.";
+            MessageBoxA(gm80_prompt_owner(), msg.c_str(), "Game Maker 8.0",
+                        MB_OK | MB_ICONERROR);
+        }
+    }
 }
 // .gmk save prep: GM's save inner writes via RELATIVE paths (it relies on
 // the open dialog having set the cwd to the project folder — verified: the
