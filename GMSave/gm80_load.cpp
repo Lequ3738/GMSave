@@ -574,8 +574,9 @@ static void load_image_file_core(const fs::path& root, const char* fname,
         call ebx
     }
     // Image object ctor (eax=class ref, dl=1 allocate) — local copies only.
-    // GM loads the class-ref VALUE at the global (sub_59DCD0: `mov eax, ds:off_42D15C`),
-    // NOT the global's address. imgCls is the absolute addr of the class-ref global.
+    // GM loads the class-ref VALUE at the global (sub_4EAC48: `mov eax, ds:off_42D110`
+    // for loading-bar bitmaps), NOT the global's address. imgCls is the absolute
+    // addr of the class-ref global.
     void* img = nullptr;
     uint32_t imgClsVal = *(uint32_t*)((uint8_t*)g_load_base + (imgCls - 0x400000));
     __asm {
@@ -740,9 +741,11 @@ static void load_settings(const fs::path& root) {
     // (off_42D110 holds it), TIcon = 0x42D248. NOT the first virtual method
     // (0x41CE44 / 0x435F50) which is what dereferencing would yield.
     gm80l_log("Load: settings parse done, loading bar bitmaps...");
-    load_image_file_safe(root, "back.bmp", 0x1E940C, 0x42D15C);
-    load_image_file_safe(root, "front.bmp", 0x1E9408, 0x42D15C);
-    load_image_file_safe(root, "loader.bmp", 0x1E9404, 0x42D15C);
+    // Class ref [0x42D110] = GM's loading-bar bitmap class (sub_4EAC48).
+    // Was 0x42D15C (= sub_59DCD0's general bitmap class) → wrong class → AV.
+    load_image_file_safe(root, "back.bmp", 0x1E940C, 0x42D110);
+    load_image_file_safe(root, "front.bmp", 0x1E9408, 0x42D110);
+    load_image_file_safe(root, "loader.bmp", 0x1E9404, 0x42D110);
     gm80l_log("Load: bar bitmaps done, loading icon...");
     load_icon_file_safe(root, "icon.ico", 0x1E941C);
     gm80l_log("Load: icon done");

@@ -138,13 +138,9 @@ static std::string read_delphi_str(void** ppStr) {
     return std::string(data, len);
 }
 
-// Called on every save attempt. Returns 1 if we handled it.
-// Flag set by check_* before original save runs
-static bool g_is_gm80_save = false;
 static std::wstring g_gm80_save_path;
 
 static int __stdcall check_and_do_gm80_save() {
-    g_is_gm80_save = false;
     uint8_t* base = (uint8_t*)g_gm_base;
 
     char** ppProjPath = (char**)(base + 0x1EA27C);
@@ -153,19 +149,10 @@ static int __stdcall check_and_do_gm80_save() {
     size_t len = strlen(projPath);
     if (len < 6) return 0;
 
+    // The save dialog now offers *.gm80 (IAT hook), so the path arrives as pure
+    // "...\X.gm80" — the legacy "...\X.gm80.gmk" suffix handling was removed.
     bool is_gm80 = (_stricmp(projPath + len - 5, ".gm80") == 0);
-    if (!is_gm80 && len > 9)
-        is_gm80 = (_strnicmp(projPath + len - 9, ".gm80.gmk", 9) == 0);
-
     if (!is_gm80) return 0;
-
-    // Strip .gmk suffix so title bar shows ".gm80" natively
-    // Must update BOTH the null terminator AND the Delphi AnsiString length field
-    if (_strnicmp(projPath + len - 9, ".gm80.gmk", 9) == 0) {
-        len -= 4;
-        projPath[len] = '\0';                     // C string null terminator
-        *(int32_t*)(projPath - 4) = (int32_t)len; // Delphi AnsiString length field
-    }
 
     int cch = MultiByteToWideChar(CP_ACP, 0, projPath, (int)len, NULL, 0);
     if (cch > 0) {
@@ -187,18 +174,7 @@ static int __stdcall check_and_do_gm80_save() {
                     g_gm80_save_path.c_str());
         }
     }
-    g_is_gm80_save = true;
-    return 1; // no .gmk save needed (we'll delete .gm80.gmk ourselves)
-}
-
-// Delete .gm80.gmk left by GM's save dialog filter
-static void __stdcall cleanup_gm80_gmk() {
-    if (!g_is_gm80_save) return;
-    std::wstring gmkPath = g_gm80_save_path + L".gmk";
-    if (GetFileAttributesW(gmkPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        DeleteFileW(gmkPath.c_str());
-        g_is_gm80_save = false;
-    }
+    return 1; // handled .gm80 save
 }
 
 // Read a Delphi AnsiString from a global.
@@ -551,9 +527,6 @@ __declspec(naked) static void save_thunk() {
     gm80_save:
         pushad
         call do_gm80_save_if_needed      // .gm80 multi-file save
-        popad
-        pushad
-        call cleanup_gm80_gmk             // delete .gm80.gmk if present
         popad
         xor eax, eax                      // return 0 (success) to GM
 
