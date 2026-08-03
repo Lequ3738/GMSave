@@ -142,49 +142,6 @@ inline void* delphi_construct(uint32_t class_ref, void* constructor) {
     return (void*)result;
 }
 
-// ---- Delphi AnsiString helpers for GM 8.0 ----
-
-// Create a Delphi AnsiString from a C string
-// Uses @LStrFromPChar (GM 8.0 address: base+0x55F8)
-inline char* delphi_ansi_string(void* base, const char* s) {
-    if (!s || !*s) return nullptr;
-    uint32_t func = (uint32_t)base + 0x55F8;
-    char* out = nullptr;
-    __asm {
-        lea eax, out           // eax = &out
-        mov edx, s             // edx = source char*
-        push 0                 // push 0 as third arg
-        call func
-        add esp, 4
-    }
-    return out;
-}
-
-// Assign C string to Delphi AnsiString pointer (updates refcount)
-// Uses @LStrAsg (GM 8.0 address: base+0x5528)
-inline void delphi_str_assign(void* base, char** dest, const char* src_val) {
-    if (!dest) return;
-    // Create the AnsiString from src_val
-    char* newStr = delphi_ansi_string(base, src_val);
-    // Assign to dest (this decrements old refcount and sets new pointer)
-    uint32_t func = (uint32_t)base + 0x5528;
-    __asm {
-        mov eax, dest
-        mov edx, newStr
-        call func
-    }
-}
-
-// Free a Delphi AnsiString (decrements refcount)
-// Uses @LStrClr (GM 8.0 address: base+0x47E8)
-inline void delphi_str_free(void* base, char** str_ptr) {
-    uint32_t func = (uint32_t)base + 0x47E8;
-    __asm {
-        mov eax, str_ptr
-        call func
-    }
-}
-
 // ---- Delphi TList helper ----
 
 // Resize a Delphi TList-like container to hold `count` items
