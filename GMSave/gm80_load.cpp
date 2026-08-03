@@ -88,6 +88,8 @@ static void parse_kv(const std::string& txt,
     std::function<void(const std::string&,const std::string&)> cb) {
     std::istringstream ss(txt); std::string line;
     while (std::getline(ss, line)) {
+        // Line-ending agnostic: git may check text files out as CRLF.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -608,6 +610,7 @@ static void load_resource_tree(
 
         char rtype = trimmed[0];
         std::string name = trimmed.substr(1);
+        if (!name.empty() && name.back() == '\r') name.pop_back();
         int idx = name_to_index(names, name);
 
         while (stack.size() > level + 1) stack.pop_back();
@@ -874,6 +877,8 @@ static void load_settings(const fs::path& root) {
         std::string line;
         while (std::getline(css, line)) {
             if (line.empty()) continue;
+            if (line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
             auto eq = line.find('=');
             if (eq != std::string::npos) {
                 names.push_back(line.substr(0, eq));
@@ -1044,7 +1049,10 @@ static void load_included_files(const fs::path& root) {
     std::vector<std::string> names;
     std::istringstream ss(idx);
     std::string line;
-    while (std::getline(ss, line)) if (!line.empty()) names.push_back(line);
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) names.push_back(line);
+    }
     uint32_t cnt = (uint32_t)names.size();
     if (cnt == 0 || cnt > 10000) return;
     uint8_t* b = (uint8_t*)g_load_base;
@@ -1130,6 +1138,8 @@ static void load_extensions(const fs::path& root) {
     std::istringstream ss(txt);
     std::string line;
     while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+        if (line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
         for (uint32_t i = 0; i < cnt; i++) {
             uint32_t obj = arr[i];
@@ -1665,7 +1675,11 @@ static AssetNameMaps g_action_names;
 static void parse_actions_into_event(void* ev, const std::string& body,
                                      const std::vector<std::string>& objectNames,
                                      const std::string& owner) {
+    // Line-ending agnostic: git may check .gml out as CRLF, and the block
+    // terminator search ("*/\n") below must not trip on the \r before \n.
     std::string b = body;
+    if (b.find('\r') != std::string::npos)
+        b.erase(std::remove(b.begin(), b.end(), '\r'), b.end());
     size_t pos = 0;
     while ((pos = b.find(ACTION_TOKEN, pos)) != std::string::npos) {
         pos += strlen(ACTION_TOKEN);
@@ -2152,6 +2166,8 @@ static void load_room_instances(void* rm, const fs::path& subDir,
             std::string line;
             while (std::getline(iss, line)) {
                 if (line.empty()) continue;
+                // Strip CR so the trailing hash/flag columns aren't \r-suffixed.
+                if (line.back() == '\r') line.pop_back();
                 std::vector<std::string> cols;
                 size_t s = 0, e;
                 while ((e = line.find(',', s)) != std::string::npos) {
@@ -2220,12 +2236,16 @@ static void load_room_instances(void* rm, const fs::path& subDir,
             std::string depthLine;
             while (std::getline(lss, depthLine)) {
                 if (depthLine.empty()) continue;
+                // Strip CR — depthLine is used to build the layer FILE name.
+                if (depthLine.back() == '\r') depthLine.pop_back();
+                if (depthLine.empty()) continue;
                 fs::path layerFile = subDir / (depthLine + ".txt");
                 std::string layerTxt = read_file(layerFile);
                 std::istringstream tss(layerTxt);
                 std::string tline;
                 while (std::getline(tss, tline)) {
                     if (tline.empty()) continue;
+                    if (tline.back() == '\r') tline.pop_back();
                     std::vector<std::string> cols;
                     size_t s = 0, e;
                     while ((e = tline.find(',', s)) != std::string::npos) {
@@ -2274,7 +2294,12 @@ static std::vector<std::string> load_names(const fs::path& idxPath) {
     if (idx.empty()) return out;
     std::istringstream ss(idx);
     std::string line;
-    while (std::getline(ss, line)) out.push_back(line);
+    while (std::getline(ss, line)) {
+        // Strip CR so names are never used to build paths with a trailing \r
+        // (an invalid Windows filename character — git may check out CRLF).
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        out.push_back(line);
+    }
     return out;
 }
 
