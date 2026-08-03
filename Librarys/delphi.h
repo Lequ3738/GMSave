@@ -295,7 +295,3 @@ inline DelphiList* glob_list(void* base, uint32_t off) {
 #define RT_GAME_INFO    9
 #define RT_SETTINGS     10
 #define RT_EXTENSIONS   11
-
-// ---- zlib helpers ----
-std::vector<uint8_t> zlib_decompress(const uint8_t* src, size_t src_len);
-std::vector<uint8_t> zlib_compress(const uint8_t* src, size_t src_len, int level = 6);
