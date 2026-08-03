@@ -3,6 +3,7 @@
 #include "pch.h"
 #include "gm80_load.h"
 #include "gm80_addresses.h"
+#include "project_watcher.h"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -19,6 +20,42 @@
 namespace fs = std::filesystem;
 
 static void* g_load_base = nullptr; // GM base address
+
+// ==== Instance code-hash map (gm82save model) ====
+// See gm80_load.h. instance ids are GM's counter-based values (LAST_INSTANCE_ID
+// 0x1E928C); the 8-hex code-hash is a separate stable value preserved here.
+static std::map<int32_t, std::string> g_instance_hashes;
+
+void gm80_instance_hashes_clear() { g_instance_hashes.clear(); }
+const std::string* gm80_instance_hash_get(int32_t id) {
+    auto it = g_instance_hashes.find(id);
+    return it == g_instance_hashes.end() ? nullptr : &it->second;
+}
+void gm80_instance_hash_set(int32_t id, const std::string& hash) {
+    g_instance_hashes[id] = hash;
+}
+void gm80_instance_hashes_collect(std::set<std::string>& out) {
+    for (auto& kv : g_instance_hashes) out.insert(kv.second);
+}
+
+bool gm80_valid_code_hash(const std::string& h) {
+    if (h.empty() || h.size() > 64) return false;
+    for (unsigned char c : h) {
+        bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                  (c >= 'a' && c <= 'z') || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// ==== Instance / tile id assignment (matches GM 8.0) ====
+// 2026-08-03: verified via 8.1→8.0 similarity (GM81_Room_AddInstance/AddTile/
+// LoadPostProcess ↔ GM80 0x548FE4/0x5494B0/0x549880). GM assigns:
+//   instance.id = ++LAST_INSTANCE_ID   (GM80_LAST_INSTANCE_ID  = 0x1E928C)
+//   tile.id     = ++LAST_TILE_ID       (GM80_LAST_TILE_ID      = 0x1E9290)
+// and the .gmk root stores/restores these counters. ids < 100001 would collide
+// with the object namespace (0-100000); tile ids < 10000001 with backgrounds.
+// Load re-assigns ids from these counters exactly like GM's room post-process.
 
 // ==== UTF-8 → ANSI conversion for GML files ====
 // GM 8.0 uses AnsiString (CP_ACP/GBK). .gml files use UTF-8.
@@ -167,6 +204,58 @@ static void gm80l_log(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     FILE* f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+}
+
+// ==== Font installation verification (gm82save parity) ====
+// After loading, warn about fonts the project uses that aren't installed on
+// this system (they'd render as substitutes). Win32 GDI check, self-contained.
+static BOOL CALLBACK enum_font_cb(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM lp) {
+    *(bool*)lp = true;
+    return FALSE; // stop at first match
+}
+
+static bool font_family_installed(const char* ansiFamily) {
+    int wlen = MultiByteToWideChar(CP_ACP, 0, ansiFamily, -1, NULL, 0);
+    if (wlen <= 1) return false;
+    std::wstring w(wlen - 1, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, ansiFamily, -1, &w[0], wlen);
+    HDC dc = GetDC(NULL);
+    if (!dc) return false;
+    LOGFONTW lf = {};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(lf.lfFaceName, w.c_str(), _TRUNCATE);
+    bool found = false;
+    EnumFontFamiliesExW(dc, &lf, enum_font_cb, (LPARAM)&found, 0);
+    ReleaseDC(NULL, dc);
+    return found;
+}
+
+// Font object +4 = sys_name (family name). Warn once per load about missing ones.
+static void verify_fonts() {
+    uint8_t* b = (uint8_t*)g_load_base;
+    if (!b) return;
+    uint32_t cnt = *(uint32_t*)(b + 0x1E92D0);   // font count
+    uint32_t* arr = *(uint32_t**)(b + 0x1E92C0); // font objects
+    if (!arr || cnt == 0 || cnt > 10000) return;
+    std::string missing;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t f = arr[i];
+        if (!f) continue;
+        char* name = *(char**)((uint8_t*)(uintptr_t)f + 4); // sys_name
+        if (!name) continue;
+        uint32_t len = *(uint32_t*)(name - 4);
+        if (len == 0 || len > 200) continue;
+        std::string fam(name, len);
+        if (!font_family_installed(fam.c_str()))
+            missing += "\n" + fam;
+    }
+    if (!missing.empty()) {
+        std::string msg = "Warning: this game uses the following fonts, which are "
+                          "not installed:" + missing;
+        gm80l_log("Font check: missing fonts%s", missing.c_str());
+        MessageBoxA(gm80_prompt_owner(), msg.c_str(), "Game Maker 8.0",
+                    MB_OK | MB_ICONWARNING);
+    }
 }
 
 // Naked wrapper to call Delphi constructors with proper register convention.
@@ -2098,8 +2187,12 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                         *(int32_t*)(inst + 0) = rows[i].x;
                         *(int32_t*)(inst + 4) = rows[i].y;
                         *(int32_t*)(inst + 8) = rows[i].obj;
-                        *(int32_t*)(inst + 12) = rows[i].hash.empty()
-                            ? 0 : (int32_t)std::stoul(rows[i].hash, nullptr, 16);
+                        // id = ++GM80_LAST_INSTANCE_ID (matches GM's room load
+                        // post-process reassignment). The 8-hex code-hash is kept
+                        // SEPARATELY (gm80_instance_hash_set) so it stays stable.
+                        int32_t iid = (int32_t)(++(*(uint32_t*)(glob_base() + ADDR_LAST_INSTANCE_ID)));
+                        *(int32_t*)(inst + 12) = iid;
+                        if (gm80_valid_code_hash(rows[i].hash)) gm80_instance_hash_set(iid, rows[i].hash);
                         *(inst + 20) = rows[i].locked ? 1 : 0;
                         if (rows[i].hasCode && !rows[i].hash.empty()) {
                             fs::path codePath = subDir / (rows[i].hash + ".gml");
@@ -2150,7 +2243,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                     t[5] = std::stoi(cols[5]);               // width
                     t[6] = std::stoi(cols[6]);               // height
                     t[7] = std::stoi(depthLine);             // depth
-                    t[8] = 0;                                // id
+                    t[8] = (int32_t)(++(*(uint32_t*)(glob_base() + ADDR_LAST_TILE_ID))); // ++GM80_LAST_TILE_ID
                     t[9] = (cols.size() > 7 && cols[7] == "1") ? 1 : 0; // locked
                     tiles.push_back(t);
                 }
@@ -2400,8 +2493,19 @@ static uint32_t rt_kind(int kind) {
 // ==== Main load entry point ====
 bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     g_load_base = gm_base;
+    gm80_instance_hashes_clear();
     fs::path root(wpath);
     if (!fs::is_directory(root)) return false;
+    // Ensure GM's id counters start in the valid ranges: instance ids < 100001
+    // would collide with the object namespace (0-100000), tile ids < 10000001
+    // with backgrounds. GM's room load post-process re-assigns ids from these
+    // counters; we do the same so new instances/tiles placed after load continue
+    // without colliding.
+    uint8_t* gb = glob_base();
+    if (*(uint32_t*)(gb + ADDR_LAST_INSTANCE_ID) < 100000)
+        *(uint32_t*)(gb + ADDR_LAST_INSTANCE_ID) = 100000;
+    if (*(uint32_t*)(gb + ADDR_LAST_TILE_ID) < 10000000)
+        *(uint32_t*)(gb + ADDR_LAST_TILE_ID) = 10000000;
 
     // 1. InitializeProject already called by GM80_LoadRecentProject before our hook.
     //    Calling it again would double-reset and corrupt. Skip.
@@ -2560,6 +2664,9 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     load_assets_simple("timelines", load_timeline, find_res("timelines"), root);
     gm80l_log("Timelines done.");
     gm80_progress_step(100);
+
+    // 14b. Font installation verification (warn about fonts not on this system)
+    verify_fonts();
 
     // 15. Clear all updated flags
     clear_all_updated_flags();

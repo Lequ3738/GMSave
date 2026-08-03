@@ -2,9 +2,12 @@
 // Reads directly from Delphi objects and writes .gm80 format
 #include "pch.h"
 #include "gm80_save.h"
+#include "gm80_load.h"
 #include "gm80_addresses.h"
 #include "project_watcher.h"
 #include <cstdio>
+#include <cstdlib>
+#include <set>
 #include <sstream>
 #include <cstdarg>
 #include <map>
@@ -24,6 +27,12 @@ static void svlog(const char* fmt, ...) {
 // These use the offsets verified by IDA analysis of GM 8.0 serializers
 
 static void* g_save_base = nullptr;
+
+// Any file write failed during this save. When set, gm80_save_to_path does NOT
+// advance the smart-save baseline (LAST_SAVE + name hashes), so the next save
+// is a full save that retries everything instead of silently skipping a file
+// that failed to write.
+static bool g_save_io_error = false;
 
 // Reason gm80_save_to_path returned false (resource-name validation error).
 // Read by the caller (ide_hooks) AFTER it closes the progress form, so the
@@ -79,13 +88,42 @@ static double* ts_ptr(uint32_t tsOff) {
     return (double*)p;
 }
 
+// xorshift32 — full 32-bit pseudo-random. (rand() has only 15 useful bits and a
+// permanently-zero bit 15, which would halve the hash space; the used-set retry
+// below makes collisions impossible regardless, but a full-range source retries
+// less.)
+static uint32_t xrng_state = 0;
+
+static uint32_t xrng() {
+    if (!xrng_state) xrng_state = (uint32_t)GetTickCount() ^ 0x9E3779B9u;
+    xrng_state ^= xrng_state << 13;
+    xrng_state ^= xrng_state >> 17;
+    xrng_state ^= xrng_state << 5;
+    return xrng_state;
+}
+
+// Generate a unique 8-hex code-hash for a NEW instance (one the load didn't
+// bring in from the file). gm82save parity: instances.txt's hash column stays
+// stable across re-saves; only newly-placed instances get a fresh random name.
+static std::string gm80_unique_instance_hash(std::set<std::string>& used) {
+    for (;;) {
+        uint32_t r = xrng() ^ (uint32_t)GetTickCount();
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%08X", r);
+        std::string h(buf);
+        if (used.insert(h).second) return h;
+    }
+}
+
 // ==== Resource name validation (gm82save filename_invalid parity) ====
 // Windows path-component restrictions: `<>:"/\|?*`, reserved device names
 // (CON/PRN/AUX/NUL/COM1-9/LPT1-9), trailing dot, blank/`.`/`..`. Returns a short
 // reason, or nullptr if the name is usable as a file/directory component.
 static const char* filename_invalid(const std::string& s) {
     if (s == "." || s == "..") return "reserved \".\"";
-    if (!s.empty() && s.back() == '.') return "trailing dot";
+    // Windows strips trailing dots AND spaces ("foo " becomes "foo") — either
+    // collides with a real "foo" directory, so reject both.
+    if (!s.empty() && (s.back() == '.' || s.back() == ' ')) return "trailing dot/space";
     if (s.empty()) return "blank";
     bool blank = true;
     for (char c : s) if (!isspace((unsigned char)c)) { blank = false; break; }
@@ -228,9 +266,10 @@ static bool wf(const std::wstring& fp, const std::string& content) {
     }
     HANDLE h = CreateFileW(fp.c_str(), GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) { g_save_io_error = true; return false; }
     DWORD written;
-    WriteFile(h, content.c_str(), (DWORD)content.size(), &written, NULL);
+    if (!WriteFile(h, content.c_str(), (DWORD)content.size(), &written, NULL) || written != content.size())
+        g_save_io_error = true; // partial/failed write
     CloseHandle(h);
     return true;
 }
@@ -272,9 +311,10 @@ static bool wb(const std::wstring& fp, const void* data, size_t len) {
     if (lp != std::wstring::npos) CreateDirectoryW(fp.substr(0, lp).c_str(), NULL);
     HANDLE h = CreateFileW(fp.c_str(), GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) { g_save_io_error = true; return false; }
     DWORD written;
-    WriteFile(h, data, (DWORD)len, &written, NULL);
+    if (!WriteFile(h, data, (DWORD)len, &written, NULL) || written != len)
+        g_save_io_error = true;
     CloseHandle(h);
     return true;
 }
@@ -510,7 +550,7 @@ static void save_sprite(void* obj, const std::wstring& outPath) {
             if (pix && fw > 0 && fh > 0 && fw < 16384 && fh < 16384) {
                 wchar_t fname[32];
                 swprintf(fname, 32, L"\\%u.png", i);
-                save_png(outPath + fname, pix, fw, fh);
+                if (!save_png(outPath + fname, pix, fw, fh)) g_save_io_error = true;
             }
         }
     }
@@ -531,7 +571,7 @@ static void save_background(void* obj, const std::wstring& outPath) {
 
     // Save image
     if (exists) {
-        save_png(outPath + L".png", pix, fw, fh);
+        if (!save_png(outPath + L".png", pix, fw, fh)) g_save_io_error = true;
     }
 
     // bg.txt
@@ -743,12 +783,28 @@ static void save_object(void* obj,
     wf(outPath + L".gml", gml);
 }
 
+// Clean unused assets before serializing a room: GM's own room save
+// (GM80_SaveRoom_Individual 0x54898C) calls GM80_Room_CleanUnused (0x547F80)
+// first — it removes instances/tiles that reference deleted objects/backgrounds
+// (compacting the arrays) so a stale reference is never serialized. We mirror
+// that. (Verified: 8.1 GM81_Room_CleanUnused 0x6576FC ↔ 8.0 0x547F80,
+// similarity 1.0.)
+static void clean_room_unused(void* room) {
+    if (!room || (uintptr_t)room < 0x10000) return;
+    uint32_t fn = (uint32_t)g_save_base + 0x147F80; // GM80_Room_CleanUnused
+    __asm {
+        mov eax, room
+        call fn
+    }
+}
+
 // -- Room --
 static void save_room(void* obj, const std::vector<std::string>& bgNames,
                        const std::vector<std::string>& objectNames,
                        const std::vector<std::string>& roomNames,
                        const std::wstring& outPath) {
     CreateDirectoryW(outPath.c_str(), NULL);
+    clean_room_unused(obj);
 
     // room.txt
     std::string t;
@@ -844,6 +900,20 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
     uint8_t* instData = *(uint8_t**)((uint8_t*)obj + 756);
     if (instData && instCount > 0 && instCount < 100000) {
         std::string ilines;
+        std::set<std::string> usedHashes;
+        gm80_instance_hashes_collect(usedHashes);
+        // Orphaned code files (left behind when an instance was deleted) must not
+        // be overwritten by a newly generated hash. ("code.gml" is the room's own
+        // creation code, not an instance.)
+        {
+            std::error_code ec;
+            for (auto& e : fs::directory_iterator(outPath, ec)) {
+                if (e.path().extension() != L".gml") continue;
+                std::string stem = e.path().stem().string();
+                if (stem == "code") continue;
+                usedHashes.insert(stem);
+            }
+        }
         for (int i = 0; i < instCount; i++) {
             uint8_t* inst = instData + i * 24;
             int ox = *(int32_t*)(inst + 0);
@@ -859,16 +929,21 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
             }
             bool locked = *(uint8_t*)(inst + 20) != 0;
             std::string oname = (oid >= 0 && oid < (int)objectNames.size()) ? objectNames[oid] : to_str(oid);
-            char hexId[16];
-            snprintf(hexId, 16, "%08X", (uint32_t)iid);
+            // Stable code-hash from the load, or a fresh random one for new
+            // instances — NOT derived from the id, so the hash column doesn't
+            // change on re-save (git-friendly, gm82save model).
+            std::string hash;
+            if (const std::string* h = gm80_instance_hash_get(iid))
+                if (gm80_valid_code_hash(*h)) hash = *h;
+            if (hash.empty()) { hash = gm80_unique_instance_hash(usedHashes); gm80_instance_hash_set(iid, hash); }
             ilines += oname + "," + to_str(ox) + "," + to_str(oy) + ",";
-            ilines += hexId;
+            ilines += hash;
             ilines += "," + to_str(locked);
             ilines += ",1,1,4294967295,0";
             ilines += "," + to_str(!ccode.empty());
             ilines += "\n";
             if (!ccode.empty()) {
-                wf(outPath + L"\\" + std::wstring(hexId, hexId+8) + L".gml", encode_gml(ccode));
+                wf(outPath + L"\\" + std::wstring(hash.begin(), hash.end()) + L".gml", encode_gml(ccode));
             }
         }
         wf(outPath + L"\\instances.txt", ilines);
@@ -1063,6 +1138,7 @@ static bool extract_richtext(uint8_t* b, std::string* out) {
 // ==== Main save function ====
 bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     g_save_base = gm_base;
+    g_save_io_error = false;
     uint8_t* base = (uint8_t*)gm_base;
 
     CreateDirectoryW(path.c_str(), NULL);
@@ -1631,6 +1707,13 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     // ==== Update smart-save baseline ====
     // (Names arrays are re-hashed after the save; stored hash == what we just wrote,
     // so a subsequent unchanged save skips everything.)
+    if (g_save_io_error) {
+        // A file write failed — do NOT advance the baseline, so the next save is
+        // a full save that retries the failed file(s) instead of silently
+        // skipping them (which would lose the change).
+        svlog("SmartSave: I/O error during save — baseline NOT updated (next save full)");
+        return true;
+    }
     g_last_save = now_t();
     for (int t = 0; t < 10; t++) {
         g_last_names_hash[t] = curHash[t];

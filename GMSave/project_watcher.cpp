@@ -75,8 +75,11 @@ static DWORD WINAPI watch_thread(LPVOID) {
         if (!ReadDirectoryChangesW(hDir, buf, sizeof(buf), TRUE,
             FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
             &bytes, &ov, NULL)) {
-            pwl_log("Watcher: ReadDirectoryChangesW failed err=%u", GetLastError());
-            break;
+            // e.g. ERROR_NOTIFY_ENUM_DIR (buffer overflow from a big batch of
+            // changes). Retry instead of dying silently, so the watcher survives.
+            pwl_log("Watcher: ReadDirectoryChangesW failed err=%u — retrying", GetLastError());
+            Sleep(500);
+            continue;
         }
         DWORD wait = WaitForSingleObject(ov.hEvent, 2000);
         ResetEvent(ov.hEvent);
@@ -187,7 +190,8 @@ static bool editor_form_open() {
     for (auto& f : F) {
         uint32_t cnt = *(uint32_t*)(b + f.cnt);
         uint32_t* arr = *(uint32_t**)(b + f.arr);
-        if (!arr || cnt == 0 || cnt > 50000) continue;
+        // Guard the 0xFFFFFFFF "uninitialized dynamic array" sentinel too.
+        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000) continue;
         for (uint32_t i = 0; i < cnt; i++)
             if (arr[i]) return true;
     }

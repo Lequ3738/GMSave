@@ -185,8 +185,15 @@ struct GM80ResourceGlobals {
 #define ADDR_APP_EXENAME         0x120290   // TApplication.GetExeName
 
 // ==== Room Editor ====
-#define ADDR_LAST_INSTANCE_ID    0x1F9320   // Last used instance ID
-#define ADDR_LAST_TILE_ID        0x1F9324   // Last used tile ID
+// Corrected 2026-08-03 (previously WRONG 0x1F9320/0x1F9324 — no such globals).
+// Verified via 8.1→8.0 similarity: 8.1 GM81_LAST_INSTANCE_ID=0x77F2E0 /
+// GM81_LAST_TILE_ID=0x77F2E4 map to 8.0 dword_5E928C / dword_5E9290. GM assigns
+// instance.id = ++LAST_INSTANCE_ID (GM80_Room_AddInstance 0x548FE4, room load
+// post-process 0x549880) and tile.id = ++LAST_TILE_ID (GM80_Room_AddTile
+// 0x5494B0). The .gmk root stores/restores these (GM80_PTR_LAST_INSTANCE_ID
+// 0x1EAADC → 0x1E928C, GM80_PTR_LAST_TILE_ID 0x1EA47C → 0x1E9290).
+#define ADDR_LAST_INSTANCE_ID    0x1E928C   // GM80_LAST_INSTANCE_ID (dword_5E928C)
+#define ADDR_LAST_TILE_ID        0x1E9290   // GM80_LAST_TILE_ID (dword_5E9290)
 
 // ==== Resource Tree Helper ====
 #define ADDR_TREENODE_COUNT      0x0AD490   // TTreeNode.GetCount
