@@ -7,6 +7,7 @@
 #include "gm80_load.h"
 #include "project_watcher.h"
 #include "gm_log.h"
+#include "gm80_diag.h"
 #include <ctime>
 #include <filesystem>
 #include <exception>
@@ -266,6 +267,10 @@ static void __stdcall do_gm80_save_if_needed() {
     }
     gm80_progress_step(100);
     gm80_progress_close();
+    // Show diagnostics (e.g. applies_to pointing at a deleted object) only AFTER
+    // the progress form is closed so the dialog isn't buried under it.
+    if (ok && gm80_diag_any())
+        gm80_diag_show("Game Maker 8.0");
     // A failed save is currently always a resource-name validation error. Show
     // it only AFTER the progress form is closed so the dialog isn't buried
     // under the "Saving…" window.

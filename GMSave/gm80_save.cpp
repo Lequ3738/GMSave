@@ -5,6 +5,7 @@
 #include "gm80_load.h"
 #include "gm80_addresses.h"
 #include "gm_log.h"
+#include "gm80_diag.h"
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -328,8 +329,11 @@ static std::string encode_gml(const std::string& gml) {
     std::istringstream ss(gml);
     std::string line;
     while (std::getline(ss, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
-            line.pop_back();
+        // Strip only CR (from CRLF). Keep trailing spaces: they may be part of a
+        // string literal (e.g. a multi-line string ending in a space) or the
+        // indentation a blank line carries for the editor's auto-indent — both
+        // would be corrupted by trimming.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         out += ansi_to_utf8(line) + "\r\n";
     }
     return out;
@@ -627,8 +631,14 @@ static void save_timeline(void* obj, const std::vector<std::string>& objectNames
                 int32_t at = R4s(act, 68); // +68 = applies_to
                 if (at == -2) gml += "applies_to=other\n";
                 else if (at == -1) gml += "applies_to=self\n";
-                else if (at >= 0) gml += "applies_to=" +
-                        ((at < (int)objectNames.size()) ? objectNames[at] : to_str(at)) + "\n";
+                else if (at >= 0) {
+                    if (at < (int)objectNames.size())
+                        gml += "applies_to=" + objectNames[at] + "\n";
+                    else {
+                        gml += "applies_to=" + to_str(at) + "\n"; // tolerant fallback
+                        gm80_diag_add("a timeline action applies_to references a deleted object (index %d)", at);
+                    }
+                }
             }
             int argCount = R4s(act, 32); // +32 = param_count
             switch (kind) {
@@ -728,8 +738,16 @@ static void save_object(void* obj,
                     int32_t at = R4s(act, 68); // +68 = applies_to
                     if (at == -2) gml += "applies_to=other\n";
                     else if (at == -1) gml += "applies_to=self\n";
-                    else if (at >= 0 && at < (int)objectNames.size())
-                        gml += "applies_to=" + objectNames[at] + "\n";
+                    else if (at >= 0) {
+                        if (at < (int)objectNames.size())
+                            gml += "applies_to=" + objectNames[at] + "\n";
+                        else {
+                            // Deleted object: keep the save tolerant (write the
+                            // index) but flag it so the broken action is found.
+                            gml += "applies_to=" + to_str(at) + "\n";
+                            gm80_diag_add("an action applies_to references a deleted object (index %d)", at);
+                        }
+                    }
                 }
                 int argCount = R4s(act, 32); // +32 = param_count
                 switch (kind) {
@@ -1126,6 +1144,7 @@ static bool extract_richtext(uint8_t* b, std::string* out) {
 bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     g_save_base = gm_base;
     g_save_io_error = false;
+    gm80_diag_reset();
     uint8_t* base = (uint8_t*)gm_base;
 
     CreateDirectoryW(path.c_str(), NULL);
@@ -1243,7 +1262,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     // ==== Root .gm80 metadata ====
     {
         std::string m;
-        m += "gm80_version=5\n";
+        m += "gm80_version=" + to_str(GM80_VERSION) + "\n";
         m += "gameid=" + to_str(GU32(0x1F6218)) + "\n\n";
         m += "info_author=" + GS(0x1E9430) + "\n";
         m += "info_version=" + GS(0x1E9434) + "\n";
@@ -1358,15 +1377,19 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                 GL("color", to_str(ed && ed >= 0x10000 ? *(uint32_t*)(ed + 0x70) : 0));
             }
             GL("caption", encode_delimit(GS(0x1E936C)));
-            GL("byte_9368", to_str((unsigned)*(uint8_t*)(b + 0x1E9368)));
+            // 5 flag bytes (verified 2026-08-03 via GM80_SaveGameInfo 0x5991A0 /
+            // GM80_LoadGameInfo 0x599024 read order — matches GM 8.1's layout):
+            //   +9368 new_window, +9380 border, +9384 resizable,
+            //   +9388 window_on_top, +938C freeze_game
+            GL("new_window", to_str((unsigned)*(uint8_t*)(b + 0x1E9368)));
             GL("left", to_str(*(uint32_t*)(b + 0x1E9370)));
             GL("top", to_str(*(uint32_t*)(b + 0x1E9374)));
             GL("width", to_str(*(uint32_t*)(b + 0x1E9378)));
             GL("height", to_str(*(uint32_t*)(b + 0x1E937C)));
-            GL("byte_9380", to_str((unsigned)*(uint8_t*)(b + 0x1E9380)));
-            GL("byte_9384", to_str((unsigned)*(uint8_t*)(b + 0x1E9384)));
-            GL("byte_9388", to_str((unsigned)*(uint8_t*)(b + 0x1E9388)));
-            GL("byte_938C", to_str((unsigned)*(uint8_t*)(b + 0x1E938C)));
+            GL("border", to_str((unsigned)*(uint8_t*)(b + 0x1E9380)));
+            GL("resizable", to_str((unsigned)*(uint8_t*)(b + 0x1E9384)));
+            GL("window_on_top", to_str((unsigned)*(uint8_t*)(b + 0x1E9388)));
+            GL("freeze_game", to_str((unsigned)*(uint8_t*)(b + 0x1E938C)));
             wf(sub(L"settings\\gameinfo.txt"), g);
 
             // F1 help text (RichEdit content) → gameinfo.rtf

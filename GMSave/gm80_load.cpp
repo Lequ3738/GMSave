@@ -5,6 +5,7 @@
 #include "gm80_addresses.h"
 #include "project_watcher.h"
 #include "gm_log.h"
+#include "gm80_diag.h"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -368,6 +369,23 @@ static int name_to_index(const std::vector<std::string>& names, const std::strin
     for (size_t i = 0; i < names.size(); i++)
         if (names[i] == name) return (int)i;
     return -1;
+}
+
+// Like name_to_index, but records a diagnostic when a NON-EMPTY reference fails
+// to resolve — the project references a deleted/renamed asset. Tolerant: still
+// returns -1 so the load continues (gm82save hard-errors here instead).
+// A pure-number value is skipped: it's GMSave's own fallback for an action whose
+// applies_to pointed at a deleted object (save side), not a missing NAME.
+static int resolve_name_warn(const char* owner, const char* what,
+                             const std::string& name, const std::vector<std::string>& names) {
+    int idx = name_to_index(names, name);
+    if (idx < 0 && !name.empty()) {
+        bool isNumber = true;
+        for (char c : name) if (c < '0' || c > '9') { isNumber = false; break; }
+        if (!isNumber)
+            gm80_diag_add("%s: %s '%s' not found", owner, what, name.c_str());
+    }
+    return idx;
 }
 
 // ==== Resource type layout info ====
@@ -966,15 +984,16 @@ static void load_gameinfo(const fs::path& root) {
         parse_kv(txt, [&](auto& k, auto& v) {
             if (k == "color") restore_gameinfo_color(b, (uint32_t)std::stoul(v));
             else if (k == "caption" || k == "text") write_glob_str(0x1E936C, decode_delimit(v));
-            else if (k == "byte_9368") *(uint8_t*)(b + 0x1E9368) = (uint8_t)std::stoul(v);
+            // Old byte_XXXX keys still accepted for files saved by earlier builds.
+            else if (k == "byte_9368" || k == "new_window") *(uint8_t*)(b + 0x1E9368) = (uint8_t)std::stoul(v);
             else if (k == "left") *(uint32_t*)(b + 0x1E9370) = (uint32_t)std::stoul(v);
             else if (k == "top") *(uint32_t*)(b + 0x1E9374) = (uint32_t)std::stoul(v);
             else if (k == "width") *(uint32_t*)(b + 0x1E9378) = (uint32_t)std::stoul(v);
             else if (k == "height") *(uint32_t*)(b + 0x1E937C) = (uint32_t)std::stoul(v);
-            else if (k == "byte_9380") *(uint8_t*)(b + 0x1E9380) = (uint8_t)std::stoul(v);
-            else if (k == "byte_9384") *(uint8_t*)(b + 0x1E9384) = (uint8_t)std::stoul(v);
-            else if (k == "byte_9388") *(uint8_t*)(b + 0x1E9388) = (uint8_t)std::stoul(v);
-            else if (k == "byte_938C") *(uint8_t*)(b + 0x1E938C) = (uint8_t)std::stoul(v);
+            else if (k == "byte_9380" || k == "border") *(uint8_t*)(b + 0x1E9380) = (uint8_t)std::stoul(v);
+            else if (k == "byte_9384" || k == "resizable") *(uint8_t*)(b + 0x1E9384) = (uint8_t)std::stoul(v);
+            else if (k == "byte_9388" || k == "window_on_top") *(uint8_t*)(b + 0x1E9388) = (uint8_t)std::stoul(v);
+            else if (k == "byte_938C" || k == "freeze_game") *(uint8_t*)(b + 0x1E938C) = (uint8_t)std::stoul(v);
         });
     }
     // F1 help text (RichEdit content) from settings/gameinfo.rtf.
@@ -1644,7 +1663,8 @@ static AssetNameMaps g_action_names;
 // Parse YYD ACTION blocks from a body string into an Event (shared by
 // objects and timelines). Matches gm82save's load_event + save side format.
 static void parse_actions_into_event(void* ev, const std::string& body,
-                                     const std::vector<std::string>& objectNames) {
+                                     const std::vector<std::string>& objectNames,
+                                     const std::string& owner) {
     std::string b = body;
     size_t pos = 0;
     while ((pos = b.find(ACTION_TOKEN, pos)) != std::string::npos) {
@@ -1703,7 +1723,7 @@ static void parse_actions_into_event(void* ev, const std::string& body,
                 if (v == "other") set_obj_i32(act, 68, -2);
                 else if (v == "self") set_obj_i32(act, 68, -1);
                 else if (v.empty()) set_obj_i32(act, 68, -4);
-                else set_obj_i32(act, 68, name_to_index(objectNames, v));
+                else set_obj_i32(act, 68, resolve_name_warn(owner.c_str(), "applies_to", v, objectNames));
             } else if (k == "invert") set_obj_bool(act, 108, v == "1");
             else if (k == "repeats") { hasRepeats = true; pset[0] = true; pstrs[0] = v; if (pcount < 1) pcount = 1; }
             else if (k == "var_name") { hasVar = true; pset[0] = true; pstrs[0] = v; if (pcount < 1) pcount = 1; }
@@ -1739,6 +1759,8 @@ static void parse_actions_into_event(void* ev, const std::string& body,
                         case 12: idx = AssetNameMaps::find(g_action_names.fonts, pv); break;
                         case 14: idx = AssetNameMaps::find(g_action_names.timelines, pv); break;
                     }
+                    if (idx < 0)
+                        gm80_diag_add("%s: action references missing resource '%s'", owner.c_str(), pv.c_str());
                 }
                 pv = std::to_string(idx);
             }
@@ -1830,13 +1852,13 @@ static void* load_object(const std::string& name, const fs::path& objDir,
     if (!obj) return nullptr;
 
     parse_kv(txt, [&](auto& k, auto& v) {
-        if (k == "sprite") set_obj_i32(obj, 4, name_to_index(spriteNames, v));
+        if (k == "sprite") set_obj_i32(obj, 4, resolve_name_warn(name.c_str(), "sprite", v, spriteNames));
         else if (k == "visible") set_obj_bool(obj, 9, v == "1");
         else if (k == "solid") set_obj_bool(obj, 8, v == "1");
         else if (k == "depth") set_obj_i32(obj, 12, std::stoi(v));
         else if (k == "persistent") set_obj_bool(obj, 16, v == "1");
-        else if (k == "parent") set_obj_i32(obj, 20, name_to_index(objectNames, v));
-        else if (k == "mask") set_obj_i32(obj, 24, name_to_index(spriteNames, v));
+        else if (k == "parent") set_obj_i32(obj, 20, resolve_name_warn(name.c_str(), "parent", v, objectNames));
+        else if (k == "mask") set_obj_i32(obj, 24, resolve_name_warn(name.c_str(), "mask", v, spriteNames));
     });
 
     // Events from <name>.gml (save side writes flat objects/<name>.gml)
@@ -1886,7 +1908,7 @@ static void* load_object(const std::string& name, const fs::path& objDir,
         if (!ev) continue;
 
         // Parse YYD ACTION blocks within the section
-        parse_actions_into_event(ev, sec.second, objectNames);
+        parse_actions_into_event(ev, sec.second, objectNames, name);
 
         // Place event at its index in the type's sparse array
         obj_add_event(obj, evType, evIndex, ev);
@@ -1921,7 +1943,7 @@ static void* load_timeline(const std::string& name, const fs::path& tlDir) {
         void* ev = make_event();
         if (ev) {
             auto objNames = load_names(tlDir.parent_path() / "objects" / "index.yyd");
-            parse_actions_into_event(ev, curBody, objNames);
+            parse_actions_into_event(ev, curBody, objNames, name);
             times.push_back(curTime);
             events.push_back(ev);
         }
@@ -2026,7 +2048,7 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
         parse_kv(txt, [&](auto& k, auto& v) {
             if (k == p0) set_obj_bool(rm, bo, v == "1");
             else if (k == p1) set_obj_bool(rm, bo + 1, v == "1");
-            else if (k == p2) set_obj_i32(rm, bo + 4, name_to_index(bgNames, v));
+            else if (k == p2) set_obj_i32(rm, bo + 4, resolve_name_warn(name.c_str(), "background", v, bgNames));
             else if (k == p3) set_obj_i32(rm, bo + 8, std::stoi(v));
             else if (k == p4) set_obj_i32(rm, bo + 12, std::stoi(v));
             else if (k == p5) set_obj_bool(rm, bo + 16, v == "1");
@@ -2071,7 +2093,7 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
             else if (k == p10) set_obj_i32(rm, vo + 40, std::stoi(v));
             else if (k == p11) set_obj_i32(rm, vo + 44, std::stoi(v));
             else if (k == p12) set_obj_i32(rm, vo + 48, std::stoi(v));
-            else if (k == p13) set_obj_i32(rm, vo + 52, name_to_index(objectNames, v));
+            else if (k == p13) set_obj_i32(rm, vo + 52, resolve_name_warn(name.c_str(), "view follow target", v, objectNames));
         });
     }
 
@@ -2116,6 +2138,8 @@ static void load_room_instances(void* rm, const fs::path& subDir,
     const std::vector<std::string>& objectNames,
     const std::vector<std::string>& bgNames)
 {
+    const std::string roomName = subDir.filename().string();
+
     // ==== Instances (instances.txt) ====
     {
         fs::path instPath = subDir / "instances.txt";
@@ -2137,7 +2161,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                 cols.push_back(line.substr(s));
                 if (cols.size() < 5) continue;
                 InstRow r;
-                r.obj = name_to_index(objectNames, cols[0]);
+                r.obj = resolve_name_warn(roomName.c_str(), "instance object", cols[0], objectNames);
                 r.x = std::stoi(cols[1]);
                 r.y = std::stoi(cols[2]);
                 r.hash = cols[3];
@@ -2213,7 +2237,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                     std::array<int32_t, 10> t = {};
                     t[0] = std::stoi(cols[1]);               // x
                     t[1] = std::stoi(cols[2]);               // y
-                    t[2] = name_to_index(bgNames, cols[0]);  // source_bg
+                    t[2] = resolve_name_warn(roomName.c_str(), "tile background", cols[0], bgNames); // source_bg
                     t[3] = std::stoi(cols[3]);               // u
                     t[4] = std::stoi(cols[4]);               // v
                     t[5] = std::stoi(cols[5]);               // width
@@ -2451,6 +2475,7 @@ static bool load_assets_ctx(
 bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     g_load_base = gm_base;
     gm80_instance_hashes_clear();
+    gm80_diag_reset();
     fs::path root(wpath);
     if (!fs::is_directory(root)) return false;
     // Ensure GM's id counters start in the valid ranges: instance ids < 100001
@@ -2473,6 +2498,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     auto stem = root.filename();
     std::string projName = "";
     fs::path metaFile;   // the .gm80 metadata FILE inside the project folder
+    uint32_t fileVersion = 1; // missing gm80_version → old file, load tolerantly
     // Find the .gm80 metadata file
     for (auto& entry : fs::directory_iterator(root)) {
         auto ext = entry.path().extension().string();
@@ -2481,7 +2507,8 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
             std::string meta = read_file(entry.path());
             if (!meta.empty()) {
                 parse_kv(meta, [&](auto& k, auto& v) {
-                    if (k == "gameid") write_glob_u32(ADDR_GAME_ID, (uint32_t)std::stoul(v));
+                    if (k == "gm80_version") fileVersion = (uint32_t)std::stoul(v);
+                    else if (k == "gameid") write_glob_u32(ADDR_GAME_ID, (uint32_t)std::stoul(v));
                     else if (k == "info_author") write_glob_str(ADDR_SETTING_AUTHOR, v);
                     else if (k == "info_version") write_glob_str(ADDR_SETTING_VERSION, v);
                     else if (k == "info_information") write_glob_str(ADDR_SETTING_INFO, decode_delimit(v));
@@ -2493,6 +2520,18 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
                 break;
             }
         }
+    }
+    // Refuse files from a NEWER GMSave — the format may have changed and we'd
+    // misread it (gm82save parity: rejects a newer gm82_version).
+    if (fileVersion > GM80_VERSION) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "This project was saved with a newer version of GMSave "
+            "(file version %u, this build supports %u).\r\n"
+            "Please update GMSave to open it.",
+            fileVersion, (uint32_t)GM80_VERSION);
+        MessageBoxA(gm80_prompt_owner(), buf, "Game Maker 8.0", MB_OK | MB_ICONERROR);
+        return false;
     }
 
     gm_log("Load: metadata done");
@@ -2622,6 +2661,9 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
 
     // 14b. Font installation verification (warn about fonts not on this system)
     verify_fonts();
+
+    // 14c. Diagnostics: broken asset references collected during the load.
+    gm80_diag_show("Game Maker 8.0");
 
     // 15. Clear all updated flags
     clear_all_updated_flags();

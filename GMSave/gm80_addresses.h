@@ -3,6 +3,12 @@
 // Format: A_D_D_R_E_S_S absolute = base + O_F_F_S_E_T
 #pragma once
 
+// Current .gm80 format version written by this plugin. Files carrying a NEWER
+// gm80_version are refused on load (the format may have changed under us);
+// a missing key is treated as an old file and loaded tolerantly.
+// (gm82save parity: it refuses gm82_version > 6.)
+#define GM80_VERSION 5
+
 // ==== Delphi RTL (Delphi 7 AnsiString era) ====
 #define ADDR_COMPARETEXT           0xA0C8     // CompareText — case-insensitive AnsiString compare
 #define ADDR_LSTRASG              0x005528   // @LStrAsg — AnsiString assign
