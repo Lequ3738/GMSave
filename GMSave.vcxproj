@@ -50,10 +50,12 @@
     <ClInclude Include="Librarys\delphi.h" />
     <ClInclude Include="GMSave\ide_hooks.h" /><ClInclude Include="GMSave\gm80_addresses.h" />
     <ClInclude Include="GMSave\gm80_load.h" /><ClInclude Include="GMSave\gm80_save.h" />
+    <ClInclude Include="GMSave\gm_log.h" />
     <ClInclude Include="GMSave\project_watcher.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" /><ClCompile Include="pch.cpp" />
+    <ClCompile Include="GMSave\gm_log.cpp" />
     <ClCompile Include="GMSave\ide_hooks.cpp" />
     <ClCompile Include="GMSave\gm80_load.cpp" /><ClCompile Include="GMSave\gm80_save.cpp" />
     <ClCompile Include="GMSave\project_watcher.cpp" />

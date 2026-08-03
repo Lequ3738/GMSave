@@ -4,24 +4,14 @@
 #include "gm80_save.h"
 #include "gm80_load.h"
 #include "gm80_addresses.h"
-#include "project_watcher.h"
+#include "gm_log.h"
 #include <cstdio>
 #include <cstdlib>
 #include <set>
 #include <sstream>
-#include <cstdarg>
 #include <map>
 #include <cctype>
 #include <cstring>
-
-static void svlog(const char* fmt, ...) {
-    char path[MAX_PATH], buf[512];
-    GetEnvironmentVariableA("TEMP", path, sizeof(path));
-    strcat_s(path, "\\GMSave.log");
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    FILE* f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
-}
 
 // ==== Delphi object field reading ====
 // These use the offsets verified by IDA analysis of GM 8.0 serializers
@@ -95,7 +85,7 @@ static double* ts_ptr(uint32_t tsOff) {
 static uint32_t xrng_state = 0;
 
 static uint32_t xrng() {
-    if (!xrng_state) xrng_state = (uint32_t)GetTickCount() ^ 0x9E3779B9u;
+    if (!xrng_state) xrng_state = (uint32_t)GetTickCount64() ^ 0x9E3779B9u;
     xrng_state ^= xrng_state << 13;
     xrng_state ^= xrng_state >> 17;
     xrng_state ^= xrng_state << 5;
@@ -107,7 +97,7 @@ static uint32_t xrng() {
 // stable across re-saves; only newly-placed instances get a fresh random name.
 static std::string gm80_unique_instance_hash(std::set<std::string>& used) {
     for (;;) {
-        uint32_t r = xrng() ^ (uint32_t)GetTickCount();
+        uint32_t r = xrng() ^ (uint32_t)GetTickCount64();
         char buf[16];
         snprintf(buf, sizeof(buf), "%08X", r);
         std::string h(buf);
@@ -676,7 +666,6 @@ static void save_object(void* obj,
     const std::vector<std::string>& tlNames, const std::vector<std::string>& objectNames,
     const std::vector<std::string>& roomNames, const std::vector<std::string>& triggerNames,
     const std::wstring& outPath) {
-    
 
     // .txt
     std::string t;
@@ -1046,7 +1035,6 @@ static uint32_t tree_read_kind(void* node) {
     return td ? td[2] : 0;
 }
 
-// Recursive tree writer (static helper, not a lambda)
 static void tree_write_recurse(void* parent, const std::vector<std::string>& names,
                                 std::string& tabs, std::string& out) {
     uint32_t cnt = tree_get_count(parent);
@@ -1056,7 +1044,6 @@ static void tree_write_recurse(void* parent, const std::vector<std::string>& nam
         std::string name = tree_read_name(child);
         uint32_t rtype = tree_read_rtype(child);
         uint32_t index = tree_read_index(child);
-        svlog("Tree: child[%u]=0x%p name='%s' rtype=%u idx=%u", i, child, name.c_str(), rtype, index);
         if (rtype == 2) {
             out += tabs + "+" + name + "\n";
             tabs += "\t";
@@ -1213,7 +1200,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         }
         if (!nerr.empty()) {
             g_save_error = nerr;
-            svlog("Save: ABORTED — %s", nerr.c_str());
+            gm_log("Save: ABORTED — %s", nerr.c_str());
             return false; // caller shows the error after closing the progress form
         }
     }
@@ -1249,9 +1236,9 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     if (changed[T_OBJ] || changed[T_BG]) changed[T_ROM] = true;
     if (changed[T_ROM]) changed[T_PAT] = true;
     bool smart = (g_last_save != 0.0); // we have saved at least once before
-    svlog("SmartSave: anyChanged=%d full=[%d%d%d%d%d%d%d%d%d%d] smart=%d",
-          anyChanged, changed[0],changed[1],changed[2],changed[3],changed[4],
-          changed[5],changed[6],changed[7],changed[8],changed[9], smart);
+    gm_log("SmartSave: anyChanged=%d full=[%d%d%d%d%d%d%d%d%d%d] smart=%d",
+           anyChanged, changed[0], changed[1], changed[2], changed[3], changed[4],
+           changed[5], changed[6], changed[7], changed[8], changed[9], smart);
 
     // ==== Root .gm80 metadata ====
     {
@@ -1443,7 +1430,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         }
         dataHash = names_hash(dataNames);
         bool dataFull = !g_has_last_data || g_last_data_hash != dataHash;
-        svlog("SmartSave: included files dataFull=%d (count=%u)", dataFull, ifCnt);
+        gm_log("SmartSave: included files dataFull=%d (count=%u)", dataFull, ifCnt);
         if (ifCnt > 0 && ifCnt < 10000 && ifArr) {
             CreateDirectoryW(sub(L"datafiles").c_str(), NULL);
             CreateDirectoryW(sub(L"datafiles\\include").c_str(), NULL);
@@ -1502,8 +1489,6 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
                           uint32_t kind) {
         std::string tree;
         void* rootNode = tree_get_root(base, kind);
-        svlog("Tree: kind=%u root=0x%p count=%u names=%zu", kind, rootNode,
-              rootNode ? tree_get_count(rootNode) : 0, names.size());
         if (rootNode) {
             std::string tabs;
             tree_write_recurse(rootNode, names, tabs, tree);
@@ -1651,14 +1636,12 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     // Triggers
     if (!triggerNames.empty()) {
         save_index(L"triggers", triggerNames);
-        svlog("Triggers: count=%u names.size()=%u", triggerCnt, (uint32_t)triggerNames.size());
         uint32_t* tArr = *(uint32_t**)(base + 0x1E92E8);
         if (tArr && triggerCnt < 500) {
             for (uint32_t i = 0; i < triggerCnt && i < (uint32_t)triggerNames.size(); i++) {
-                if (triggerNames[i].empty()) { svlog("Trigger[%u]: empty name, skip", i); continue; }
+                if (triggerNames[i].empty()) continue;
                 void* tObj = (void*)(uintptr_t)tArr[i];
-                if (!tObj) { svlog("Trigger[%u]: '%s' obj=null, skip", i, triggerNames[i].c_str()); continue; }
-                svlog("Trigger[%u]: '%s' saving...", i, triggerNames[i].c_str());
+                if (!tObj) continue;
                 std::wstring wname(triggerNames[i].begin(), triggerNames[i].end());
                 save_trigger(tObj, sub((L"triggers\\" + wname).c_str()));
             }
@@ -1711,7 +1694,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
         // A file write failed — do NOT advance the baseline, so the next save is
         // a full save that retries the failed file(s) instead of silently
         // skipping them (which would lose the change).
-        svlog("SmartSave: I/O error during save — baseline NOT updated (next save full)");
+        gm_log("SmartSave: I/O error during save — baseline NOT updated (next save full)");
         return true;
     }
     g_last_save = now_t();
@@ -1721,7 +1704,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     }
     g_last_data_hash = dataHash;
     g_has_last_data = true;
-    svlog("SmartSave: LAST_SAVE=%f", g_last_save);
+    gm_log("SmartSave: LAST_SAVE=%f", g_last_save);
 
     return true;
 }

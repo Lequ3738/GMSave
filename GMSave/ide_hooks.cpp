@@ -6,14 +6,13 @@
 #include "gm80_save.h"
 #include "gm80_load.h"
 #include "project_watcher.h"
-#include <cstdarg>
+#include "gm_log.h"
 #include <ctime>
 #include <filesystem>
 #include <exception>
 #include <mutex>
 #include <string>
 #include <commdlg.h>
-#include <winnt.h>
 
 // Verified injection points from IDA:
 //   Save: 0x5DAE36 in sub_5DAD60 — CALL sub_59BA38 (dialog save) → save_thunk
@@ -61,9 +60,7 @@ void* g_gm_base_ptr = NULL;
 static uint32_t g_save_outer_addr = ADDR_SAVE_OUTER;
 static uint32_t g_load_addr = ADDR_LOAD_PROJECT;
 
-// Forward decl for debug logging (defined later in this file)
-static void dbg_log(const char* fmt, ...);
-static int  __stdcall check_and_do_gm80_load();
+static int __stdcall check_and_do_gm80_load();
 
 // CompareText hook — tests BOTH ".gm80" (our own constant; the binary string
 // patch is disabled) and ".gmk" (backward compatibility with old .gmk
@@ -113,15 +110,6 @@ __declspec(naked) static void gmk_or_gm80_thunk() {
 // When GM's save dialog handler calls the save function, we intercept:
 //   - If project path ends with .gm80: do multi-file save
 //   - Otherwise: call original save function
-// ==== Runtime debug logging ====
-static void dbg_log(const char* fmt, ...) {
-    char path[MAX_PATH], buf[1024];
-    GetEnvironmentVariableA("TEMP", path, sizeof(path));
-    strcat_s(path, "\\GMSave.log");
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    FILE* f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
-}
 
 // Read a Delphi AnsiString from a pointer-to-pointer
 // Returns "" if invalid
@@ -170,7 +158,7 @@ static int __stdcall check_and_do_gm80_save() {
         if (fn.size() > 5 && fn.compare(fn.size() - 5, 5, L".gm80") == 0 &&
             pn.size() > 5 && pn.compare(pn.size() - 5, 5, L".gm80") == 0) {
             g_gm80_save_path = sp.parent_path().wstring();
-            dbg_log("Save: normalized save path to folder '%S'",
+            gm_log("Save: normalized save path to folder '%S'",
                     g_gm80_save_path.c_str());
         }
     }
@@ -255,25 +243,26 @@ static void gm80_progress_close();
 static void __stdcall do_gm80_save_if_needed() {
     // Stop the file watcher first so our own writes are never seen as foreign.
     project_watcher_stop();
-    dbg_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
+    gm_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
     gm80_progress_show();
     gm80_progress_step(25);
     bool ok = false;
     try {
         if (!gm80_save_to_path(g_gm_base, g_gm80_save_path))
-            dbg_log("Save: ERROR");
+            gm_log("Save: ERROR");
         else {
-            dbg_log("Save: .gm80 complete");
+            gm_log("Save: .gm80 complete");
             clear_updated_flags();
             // Re-arm the watcher + SAVE_END so subsequent foreign edits are seen.
             project_watcher_start(g_gm80_save_path);
             project_watcher_mark_saved();
             ok = true;
         }
-    } catch (std::exception& e) {
-        dbg_log("Save: EXCEPTION: %s", e.what());
+    } catch (const std::exception& e) {
+        (void)e; // referenced only by the Debug log below; keep Release warning-free
+        gm_log("Save: EXCEPTION: %s", e.what());
     } catch (...) {
-        dbg_log("Save: UNKNOWN EXCEPTION");
+        gm_log("Save: UNKNOWN EXCEPTION");
     }
     gm80_progress_step(100);
     gm80_progress_close();
@@ -300,7 +289,7 @@ static void __stdcall log_gmk_save_ctx() {
     GetCurrentDirectoryA(sizeof(cwd), cwd);
     uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
     char** pp = (char**)(base + 0x1EA27C);
-    dbg_log("GMK save ctx: cwd='%s' projPath='%s'",
+    gm_log("GMK save ctx: cwd='%s' projPath='%s'",
             cwd, (pp && *pp && !IsBadStringPtrA(*pp, 1024)) ? *pp : "(null/bad)");
     if (pp && *pp && !IsBadStringPtrA(*pp, 1024)) {
         char dir[MAX_PATH];
@@ -309,13 +298,13 @@ static void __stdcall log_gmk_save_ctx() {
         if (slash) {
             *slash = '\0';
             if (SetCurrentDirectoryA(dir))
-                dbg_log("GMK save ctx: cwd set to '%s'", dir);
+                gm_log("GMK save ctx: cwd set to '%s'", dir);
         }
         DWORD attrs = GetFileAttributesA(*pp);
         if (attrs == INVALID_FILE_ATTRIBUTES) {
-            dbg_log("GMK save ctx: target file attrs FAIL err=%u", GetLastError());
+            gm_log("GMK save ctx: target file attrs FAIL err=%u", GetLastError());
         } else {
-            dbg_log("GMK save ctx: target attrs=0x%X readonly=%d",
+            gm_log("GMK save ctx: target attrs=0x%X readonly=%d",
                     attrs, (attrs & FILE_ATTRIBUTE_READONLY) ? 1 : 0);
         }
     }
@@ -362,7 +351,7 @@ static void __stdcall do_gmk_save_direct() {
     if (!base) return;
     char** pp = (char**)(base + 0x1EA27C);
     if (!pp || !*pp || IsBadStringPtrA(*pp, 1024)) {
-        dbg_log("GMK direct save: no project path");
+        gm_log("GMK direct save: no project path");
         return;
     }
     const char* gmkPath = *pp;
@@ -379,7 +368,7 @@ static void __stdcall do_gmk_save_direct() {
         mov stream, eax
     }
     if (!stream) {
-        dbg_log("GMK direct save: stream create failed");
+        gm_log("GMK direct save: stream create failed");
         gm80_progress_close();
         return;
     }
@@ -393,13 +382,13 @@ static void __stdcall do_gmk_save_direct() {
             mov ok, eax
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        dbg_log("GMK direct save: Inner exception code=0x%X",
+        gm_log("GMK direct save: Inner exception code=0x%X",
                 GetExceptionCode());
         gm80_progress_close();
         return;
     }
     if (!ok) {
-        dbg_log("GMK direct save: Inner returned 0");
+        gm_log("GMK direct save: Inner returned 0");
         gm80_progress_close();
         return;
     }
@@ -407,16 +396,16 @@ static void __stdcall do_gmk_save_direct() {
     // +0 vtable, +4 FMemory (data pointer), +8 FSize.
     uint8_t* mem = *(uint8_t**)((uint8_t*)stream + 4);    // FMemory
     uint32_t size = *(uint32_t*)((uint8_t*)stream + 8);   // FSize
-    dbg_log("GMK direct save: stream mem=0x%X size=%u", (uint32_t)mem, size);
+    gm_log("GMK direct save: stream mem=0x%X size=%u", (uint32_t)mem, size);
     if (!mem || size == 0 || size > 64 * 1024 * 1024) {
-        dbg_log("GMK direct save: bad stream content");
+        gm_log("GMK direct save: bad stream content");
         gm80_progress_close();
         return;
     }
     gm80_progress_step(60);
     FILE* f = fopen(gmkPath, "wb");
     if (!f) {
-        dbg_log("GMK direct save: fopen fail err=%u", GetLastError());
+        gm_log("GMK direct save: fopen fail err=%u", GetLastError());
         gm80_progress_close();
         return;
     }
@@ -424,7 +413,7 @@ static void __stdcall do_gmk_save_direct() {
     fclose(f);
     gm80_progress_step(90);
     gm80_progress_close();
-    dbg_log("GMK direct save: wrote %u bytes to '%s'", (uint32_t)w, gmkPath);
+    gm_log("GMK direct save: wrote %u bytes to '%s'", (uint32_t)w, gmkPath);
     if (w == size) {
         clear_updated_flags();
     }
@@ -474,7 +463,7 @@ static void __stdcall msg_log(void* callerAddr) {
         uint32_t len = *(uint32_t*)(msg - 4);
         if (len < 250) { memcpy(buf, msg, len); buf[len] = 0; }
     }
-    dbg_log("ShowMessage called: text='%s' callerRVA=0x%X (callerAddr=0x%p)",
+    gm_log("ShowMessage called: text='%s' callerRVA=0x%X (callerAddr=0x%p)",
         buf, callerRva, callerAddr);
 }
 
@@ -539,11 +528,11 @@ static int __stdcall check_and_do_gm80_load() {
     // Validate pointer before using it (prevent crash on garbage ptr during startup)
     if (IsBadStringPtrA(projPath, 512)) return 0;
     size_t len = strlen(projPath);
-    if (len < 6) { dbg_log("check_gm80: len=%u path='%s' -> 0", (uint32_t)len, projPath); return 0; }
+    if (len < 6) { gm_log("check_gm80: len=%u path='%s' -> 0", (uint32_t)len, projPath); return 0; }
     bool is_gm80 = (_stricmp(projPath + len - 5, ".gm80") == 0);
-    if (!is_gm80) { dbg_log("check_gm80: not .gm80 path='%s' -> 0", projPath); return 0; }
+    if (!is_gm80) { gm_log("check_gm80: not .gm80 path='%s' -> 0", projPath); return 0; }
 
-    dbg_log("Load: .gm80 detected '%s'", projPath);
+    gm_log("Load: .gm80 detected '%s'", projPath);
 
     int wlen = MultiByteToWideChar(CP_ACP, 0, projPath, (int)len, NULL, 0);
     if (wlen <= 0) return 0;
@@ -553,7 +542,7 @@ static int __stdcall check_and_do_gm80_load() {
     // The path points to the .gm80 metadata FILE. Use parent directory.
     fs::path loadPath(wpath);
     if (fs::is_regular_file(loadPath)) {
-        dbg_log("Load: path is file, using parent dir");
+        gm_log("Load: path is file, using parent dir");
         loadPath = loadPath.parent_path();
     }
     std::wstring dirPath = loadPath.wstring();
@@ -561,14 +550,14 @@ static int __stdcall check_and_do_gm80_load() {
     // Direct Delphi object creation via gm80_load_project
     // (Delphi MM is ready — InitializeProject already ran at this point)
     if (gm80_load_project(g_gm_base, dirPath)) {
-        dbg_log("Load: .gm80 direct Delphi objects — SUCCESS");
+        gm_log("Load: .gm80 direct Delphi objects — SUCCESS");
         // Start the file watcher so external edits are detected (silent reload
         // when the user hasn't changed anything; Yes/No prompt on conflict).
         project_watcher_start(dirPath);
         return 1;
     }
 
-    dbg_log("Load: gm80_load_project failed");
+    gm_log("Load: gm80_load_project failed");
     return 0;
 }
 
@@ -637,7 +626,7 @@ static const char* __stdcall get_compile_folder() {
         }
     }
     s_str.length = (uint32_t)strlen(s_str.data);
-    dbg_log("compile eax: project path -> '%s'", s_str.data);
+    gm_log("compile eax: project path -> '%s'", s_str.data);
     return s_str.data;
 }
 
@@ -650,8 +639,6 @@ __declspec(naked) static void compile_path_eax() {
         ret
     }
 }
-
-// g_gm_base_ptr and address variables are declared at the top of this file
 
 // ==== Save/Open dialog filter hooks ====
 // GM's project dialogs only offer "*.gmk". Patch the IAT entries for
@@ -710,7 +697,7 @@ static void hook_comdlg32_iat(HMODULE gm_base) {
                 if (VirtualProtect(&thunk->u1.Function, 4, PAGE_READWRITE, &oldp)) {
                     thunk->u1.Function = (uintptr_t)gm80_get_save_file_name;
                     VirtualProtect(&thunk->u1.Function, 4, oldp, &oldp);
-                    dbg_log("IAT: GetSaveFileNameA hooked");
+                    gm_log("IAT: GetSaveFileNameA hooked");
                 }
             } else if (strcmp(ibn->Name, "GetOpenFileNameA") == 0 && !g_real_GetOpenFileNameA) {
                 g_real_GetOpenFileNameA = (BOOL(WINAPI*)(LPOPENFILENAMEA))thunk->u1.Function;
@@ -718,7 +705,7 @@ static void hook_comdlg32_iat(HMODULE gm_base) {
                 if (VirtualProtect(&thunk->u1.Function, 4, PAGE_READWRITE, &oldp)) {
                     thunk->u1.Function = (uintptr_t)gm80_get_open_file_name;
                     VirtualProtect(&thunk->u1.Function, 4, oldp, &oldp);
-                    dbg_log("IAT: GetOpenFileNameA hooked");
+                    gm_log("IAT: GetOpenFileNameA hooked");
                 }
             }
         }
@@ -771,7 +758,7 @@ bool ide_hooks_install(HMODULE gm_base) {
         void* call_addr = base + rva;
         patch_call(call_addr, (void*)gmk_or_gm80_thunk);
     }
-    dbg_log("CompareText hooks installed at %u sites", (uint32_t)(sizeof(cmptext_sites)/sizeof(cmptext_sites[0])));
+    gm_log("CompareText hooks installed at %u sites", (uint32_t)(sizeof(cmptext_sites)/sizeof(cmptext_sites[0])));
 
     // ==== Hook sub_5D453C entry (load project AND compile core) ====
     // sub_5D453C is both the open-project loader and the compile core
@@ -793,7 +780,7 @@ bool ide_hooks_install(HMODULE gm_base) {
         }
         patch_jmp(fn453C, (void*)load_func_hook);
         FlushInstructionCache(GetCurrentProcess(), fn453C, 6);
-        dbg_log("Hooked sub_5D453C entry (load + compile)");
+        gm_log("Hooked sub_5D453C entry (load + compile)");
     }
 
     // ==== Patch `mov eax, GM80_ProjectPath` at 0x5DBF14 / 0x5DBF2B ====
@@ -807,12 +794,12 @@ bool ide_hooks_install(HMODULE gm_base) {
     {
         void* dest = base + 0x1DBF14;
         patch_call(dest, (void*)compile_path_eax);
-        dbg_log("Patched 0x5DBF14 (compile project path -> folder)");
+        gm_log("Patched 0x5DBF14 (compile project path -> folder)");
     }
     {
         void* dest = base + 0x1DBF2B;
         patch_call(dest, (void*)compile_path_eax);
-        dbg_log("Patched 0x5DBF2B (run command-line project path -> folder)");
+        gm_log("Patched 0x5DBF2B (run command-line project path -> folder)");
     }
 
     // NOTE: hooking sub_521D84 (game launch) crashed Softwrap.dll (GM 8.0's
@@ -827,7 +814,7 @@ bool ide_hooks_install(HMODULE gm_base) {
     {
         void* callSite = base + 0x19B91B;
         patch_call(callSite, (void*)parse_gmk_or_gm80_thunk);
-        dbg_log("Hooked sub_59B28C call at 0x19B91B (post-InitializeProject, MM ready)");
+        gm_log("Hooked sub_59B28C call at 0x19B91B (post-InitializeProject, MM ready)");
     }
 
     // ==== Message hook on sub_4518B0 (ShowMessage/MessageDlg) ====
@@ -845,10 +832,10 @@ bool ide_hooks_install(HMODULE gm_base) {
         }
         patch_jmp(fnMsg, (void*)msg_hook_thunk);
         FlushInstructionCache(GetCurrentProcess(), fnMsg, 6);
-        dbg_log("Hooked ShowMessage (sub_4518B0) to trace 'Not a GameMaker file' origin");
+        gm_log("Hooked ShowMessage (sub_4518B0) to trace 'Not a GameMaker file' origin");
     }
 
-    dbg_log("Working hooks: save x2 + strings x4 + CompareText x4 — GM should start OK");
+    gm_log("Working hooks: save x2 + strings x4 + CompareText x4 — GM should start OK");
 
     return true;
 }
@@ -858,6 +845,6 @@ void ide_hooks_uninstall() {
     if (base) {
         patch_bytes(base + 0x1DAE36, g_orig_save_call, 5);
         patch_bytes(base + ADDR_DIRECT_SAVE_CALL, g_orig_direct_save, 5);
-        dbg_log("Hooks uninstalled");
+        gm_log("Hooks uninstalled");
     }
 }

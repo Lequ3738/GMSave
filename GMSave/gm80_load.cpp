@@ -4,6 +4,7 @@
 #include "gm80_load.h"
 #include "gm80_addresses.h"
 #include "project_watcher.h"
+#include "gm_log.h"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -196,16 +197,6 @@ static uint8_t* glob_base() {
     return b ? b : (uint8_t*)GetModuleHandle(NULL);
 }
 
-// Debug logging from DLL context (gm80_load.cpp has no direct dbg_log)
-static void gm80l_log(const char* fmt, ...) {
-    char path[MAX_PATH], buf[1024];
-    GetEnvironmentVariableA("TEMP", path, sizeof(path));
-    strcat_s(path, "\\GMSave.log");
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    FILE* f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
-}
-
 // ==== Font installation verification (gm82save parity) ====
 // After loading, warn about fonts the project uses that aren't installed on
 // this system (they'd render as substitutes). Win32 GDI check, self-contained.
@@ -252,7 +243,7 @@ static void verify_fonts() {
     if (!missing.empty()) {
         std::string msg = "Warning: this game uses the following fonts, which are "
                           "not installed:" + missing;
-        gm80l_log("Font check: missing fonts%s", missing.c_str());
+        gm_log("Font check: missing fonts%s", missing.c_str());
         MessageBoxA(gm80_prompt_owner(), msg.c_str(), "Game Maker 8.0",
                     MB_OK | MB_ICONWARNING);
     }
@@ -269,7 +260,6 @@ __declspec(naked) static void* delphi_ctor(uint32_t class_ref, uint32_t ctor_add
         ret
     }
 }
-
 
 // Allocate memory using Delphi's memory manager
 static void* delphi_alloc(uint32_t sz) {
@@ -430,7 +420,6 @@ static void cache_vmts() {
         // GM uses 0xFFFFFFFF as "uninitialized array" sentinel — guard it
         if (arr && arr != (uint32_t*)-1 && arr[0]) {
             ri.cachedVmt = *(uint32_t*)arr[0]; // object[0] = VMT pointer
-            gm80l_log("cache_vmts: %s VMT=0x%X (from GM obj 0x%X)", ri.dir, ri.cachedVmt, arr[0]);
         }
     }
 }
@@ -502,7 +491,7 @@ static void* tree_add_child(void* nodes, void* parent, const std::string& name,
                             uint32_t rtype, uint32_t kind, uint32_t index) {
     uint8_t* b = glob_base();
     if (!nodes || (uintptr_t)nodes < 0x10000) {
-        gm80l_log("tree_add_child: bad nodes container, skipping");
+        gm_log("tree_add_child: bad nodes container, skipping");
         return nullptr;
     }
 
@@ -573,7 +562,7 @@ static void load_resource_tree(
     // Get root TTreeNode
     void* rootNode = *(void**)(base + rtOff);
     if (!rootNode || (uintptr_t)rootNode < 0x10000) {
-        gm80l_log("load_resource_tree %s: no root node at 0x%X", dirName, rtOff);
+        gm_log("load_resource_tree %s: no root node at 0x%X", dirName, rtOff);
         return;
     }
 
@@ -582,7 +571,7 @@ static void load_resource_tree(
     void* treeView = *(void**)(base + 0x1F6288);               // dword_5F6288
     void* nodes = treeView ? *(void**)((uint8_t*)treeView + 0x2B4) : nullptr;
     if (!nodes || (uintptr_t)nodes < 0x10000) {
-        gm80l_log("load_resource_tree %s: no nodes container (tv=0x%p)", dirName, treeView);
+        gm_log("load_resource_tree %s: no nodes container (tv=0x%p)", dirName, treeView);
         return;
     }
 
@@ -618,20 +607,12 @@ static void load_resource_tree(
     }
 }
 
-// ==== Initialize project ====
-static void init_project() {
-    uint32_t func = (uint32_t)g_load_base + 0x19B7EC; // GM80_InitializeProject (verified from sub_59B905 call)
-    __asm { call func }
-}
-
 // ==== Load settings ====
 // Loading-bar bitmaps + icon: read a Delphi image file (BMP/ICO) into a
-// TMemoryStream, create the image object (TBitmap from off_42D15C /
-// TIcon from off_42D248) and LoadFromStream (vtable+0x54 — verified from
-// sub_59DCD0). Target globals: dword_5E940C back / 5E9408 front /
-// 5E9404 loader / 5E941C icon.
-// Read a Delphi image file (BMP/ICO) into a TMemoryStream, create the image
-// object and LoadFromStream (vtable+0x54 — verified from sub_59DCD0).
+// TMemoryStream, create the image object and LoadFromStream (vtable+0x54 —
+// verified from sub_59DCD0). Target globals: dword_5E940C back / 5E9408 front /
+// 5E9404 loader / 5E941C icon (TBitmap / TIcon class refs from off_42D110 /
+// off_42D248).
 // NOTE: inline asm must reference only LOCAL variables — MSVC misreads
 // function parameters inside __asm blocks.
 static void load_image_file_core(const fs::path& root, const char* fname,
@@ -691,7 +672,7 @@ static void load_image_file_core(const fs::path& root, const char* fname,
         call dword ptr [ecx+0x54]
     }
     *(uint32_t*)(base + globOff) = (uint32_t)img;
-    gm80l_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
+    gm_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
 }
 
 // TIcon variant — same but the icon ctor (0x435F68, class ref off_42D248).
@@ -750,7 +731,7 @@ static void load_icon_file(const fs::path& root, const char* fname,
         call dword ptr [ecx+0x54]
     }
     *(uint32_t*)(base + globOff) = (uint32_t)img;
-    gm80l_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
+    gm_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
 }
 
 // Safe wrappers — the icon/loading-bar bitmaps are cosmetic; a failure here must
@@ -759,14 +740,14 @@ static void load_image_file_safe(const fs::path& root, const char* fname,
                                  uint32_t globOff, uint32_t imgCls) {
     __try { load_image_file_core(root, fname, globOff, imgCls); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        gm80l_log("load_image FAILED %s code=0x%X", fname, GetExceptionCode());
+        gm_log("load_image FAILED %s code=0x%X", fname, GetExceptionCode());
     }
 }
 static void load_icon_file_safe(const fs::path& root, const char* fname,
                                 uint32_t globOff) {
     __try { load_icon_file(root, fname, globOff); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        gm80l_log("load_icon FAILED %s code=0x%X", fname, GetExceptionCode());
+        gm_log("load_icon FAILED %s code=0x%X", fname, GetExceptionCode());
     }
 }
 
@@ -828,15 +809,12 @@ static void load_settings(const fs::path& root) {
     // Class references are VMT metadata-block addresses: TBitmap = 0x42D15C
     // (off_42D110 holds it), TIcon = 0x42D248. NOT the first virtual method
     // (0x41CE44 / 0x435F50) which is what dereferencing would yield.
-    gm80l_log("Load: settings parse done, loading bar bitmaps...");
     // Class ref [0x42D110] = GM's loading-bar bitmap class (sub_4EAC48).
     // Was 0x42D15C (= sub_59DCD0's general bitmap class) → wrong class → AV.
     load_image_file_safe(root, "back.bmp", 0x1E940C, 0x42D110);
     load_image_file_safe(root, "front.bmp", 0x1E9408, 0x42D110);
     load_image_file_safe(root, "loader.bmp", 0x1E9404, 0x42D110);
-    gm80l_log("Load: bar bitmaps done, loading icon...");
     load_icon_file_safe(root, "icon.ico", 0x1E941C);
-    gm80l_log("Load: icon done");
 
     // Version number globals from the root metadata (dword_5E943C..48)
     {
@@ -1323,7 +1301,7 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
 
     uint32_t sp_vmt = get_real_vmt(ri->arrObjOff, ri->vmtRva);
     void* sp = delphi_ctor(sp_vmt, (uint32_t)glob_base() + ri->ctorRva);
-    if (!sp || sp == (void*)sp_vmt) { gm80l_log("Sprite %s: ctor FAILED", name.c_str()); return nullptr; }
+    if (!sp || sp == (void*)sp_vmt) { gm_log("Sprite %s: ctor FAILED", name.c_str()); return nullptr; }
 
     uint32_t frameCount = 0;
     // GM 8.0 layout (verified from sub_4F8E40 .gmk loader order + GM 8.1
@@ -1343,7 +1321,7 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
         else if (k == "bbox_right") set_obj_i32(sp, 40, std::stoi(v));
         else if (k == "bbox_bottom") set_obj_i32(sp, 44, std::stoi(v));
         else if (k == "frames") frameCount = (uint32_t)std::stoul(v);
-        } catch(...) { gm80l_log("  WARN: sprite field parse error for %s key=%s", name.c_str(), k.c_str()); }
+        } catch(...) { gm_log("  WARN: sprite field parse error for %s key=%s", name.c_str(), k.c_str()); }
     });
 
     // Load frames (PNG) into a raw Frame** array at +48
@@ -1357,7 +1335,7 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
             uint32_t fw = 0, fh = 0;
             std::vector<uint8_t> pixels;
             if (!load_frame_png(pngPath, fw, fh, pixels)) {
-                gm80l_log("  WARN: cannot decode %ls", pngPath.c_str());
+                gm_log("  WARN: cannot decode %ls", pngPath.c_str());
                 continue;
             }
 
@@ -1551,7 +1529,7 @@ static void* make_event() {
         call fn
         mov ev, eax
     }
-    if (!ev || ev == (void*)cls) gm80l_log("make_event FAILED cls=0x%X", cls);
+    if (!ev || ev == (void*)cls) gm_log("make_event FAILED cls=0x%X", cls);
     return ev;
 }
 
@@ -1642,8 +1620,8 @@ static bool fill_in_safe(void* act, uint32_t libId, uint32_t actId) {
     __try {
         return gm80_action_fill_in(act, libId, actId);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        gm80l_log("fill_in_safe: AV code=0x%X lib=%u id=%u act=0x%X",
-                  GetExceptionCode(), libId, actId, (uint32_t)act);
+        gm_log("fill_in_safe: AV code=0x%X lib=%u id=%u act=0x%X",
+               GetExceptionCode(), libId, actId, (uint32_t)act);
         return false;
     }
 }
@@ -2134,8 +2112,6 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     return rm;
 }
 
-// Fill room instances/tiles after the room object exists
-// (kept separate to keep load_room_obj readable)
 static void load_room_instances(void* rm, const fs::path& subDir,
     const std::vector<std::string>& objectNames,
     const std::vector<std::string>& bgNames)
@@ -2385,18 +2361,15 @@ static bool load_assets_simple(
 {
     auto idxPath = root / dirName / "index.yyd";
     auto names = load_names(idxPath);
-    gm80l_log("  %s: %zu names from index.yyd", dirName, names.size());
     if (names.empty()) return true;
 
     uint8_t* base = (uint8_t*)g_load_base;
     uint32_t cnt = (uint32_t)names.size();
-    gm80l_log("  %s: allocating %u objects + names...", dirName, cnt);
 
     // Allocate via GM's @DynArraySetLength (proper Delphi dynamic arrays)
     alloc_asset_arrays(dirName, cnt);
     void** newObjs = (void**)get_asset_array(ri->arrObjOff);
     void** newNames = ri->arrNameOff ? (void**)get_asset_array(ri->arrNameOff) : nullptr;
-    gm80l_log("  %s: arrays allocated, loading %u items...", dirName, cnt);
 
     fs::path resDir = root / dirName;
     bool isSprites = (strcmp(dirName, "sprites") == 0);
@@ -2474,22 +2447,6 @@ static bool load_assets_ctx(
     return true;
 }
 
-// ==== Resource tree roots map ====
-static uint32_t rt_kind(int kind) {
-    switch (kind) {
-        case 1: return RT_OBJECTS;
-        case 2: return RT_SPRITES;
-        case 3: return RT_SOUNDS;
-        case 4: return RT_ROOMS;
-        case 6: return RT_BACKGROUNDS;
-        case 7: return RT_SCRIPTS;
-        case 8: return RT_PATHS;
-        case 9: return RT_FONTS;
-        case 12: return RT_TIMELINES;
-        default: return 0;
-    }
-}
-
 // ==== Main load entry point ====
 bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     g_load_base = gm_base;
@@ -2507,10 +2464,8 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     if (*(uint32_t*)(gb + ADDR_LAST_TILE_ID) < 10000000)
         *(uint32_t*)(gb + ADDR_LAST_TILE_ID) = 10000000;
 
-    // 1. InitializeProject already called by GM80_LoadRecentProject before our hook.
-    //    Calling it again would double-reset and corrupt. Skip.
-    // init_project();
-
+    // 1. InitializeProject already ran in GM80_LoadRecentProject before our hook;
+    //    calling it again would double-reset and corrupt.
     // 1b. Cache real VMTs from GM's array objects BEFORE SetLength replaces them
     cache_vmts();
 
@@ -2540,15 +2495,15 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         }
     }
 
-    gm80l_log("Load: metadata done");
+    gm_log("Load: metadata done");
     // 3. Load settings + constants
     load_settings(root);
-    gm80l_log("Load: settings done");
+    gm_log("Load: settings done");
     load_gameinfo(root);
     load_extensions(root);
-    gm80l_log("Load: extensions done");
+    gm_log("Load: extensions done");
     load_included_files(root);
-    gm80l_log("Load: included files done");
+    gm_log("Load: included files done");
 
     // 4. Load triggers (single array, names live inside objects at +4)
     {
@@ -2567,42 +2522,42 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
             }
         }
     }
-    gm80l_log("Load: triggers done");
+    gm_log("Load: triggers done");
 
     // 5. Load sounds
-    gm80l_log("Loading sounds...");
+    gm_log("Loading sounds...");
     load_assets_simple("sounds", load_sound, find_res("sounds"), root);
-    gm80l_log("Sounds done.");
+    gm_log("Sounds done.");
     gm80_progress_step(10);
 
     // 6. Load sprites
-    gm80l_log("Loading sprites...");
+    gm_log("Loading sprites...");
     load_assets_simple("sprites", load_sprite_obj, find_res("sprites"), root);
-    gm80l_log("Sprites done.");
+    gm_log("Sprites done.");
     gm80_progress_step(20);
 
     // 7. Load backgrounds
-    gm80l_log("Loading backgrounds...");
+    gm_log("Loading backgrounds...");
     load_assets_simple("backgrounds", load_bg_obj, find_res("backgrounds"), root);
-    gm80l_log("Backgrounds done.");
+    gm_log("Backgrounds done.");
     gm80_progress_step(30);
 
     // 8. Load paths
-    gm80l_log("Loading paths...");
+    gm_log("Loading paths...");
     load_assets_simple("paths", load_path_obj, find_res("paths"), root);
-    gm80l_log("Paths done.");
+    gm_log("Paths done.");
     gm80_progress_step(40);
 
     // 9. Load scripts
-    gm80l_log("Loading scripts...");
+    gm_log("Loading scripts...");
     load_assets_simple("scripts", load_script, find_res("scripts"), root);
-    gm80l_log("Scripts done.");
+    gm_log("Scripts done.");
     gm80_progress_step(50);
 
     // 10. Load fonts
-    gm80l_log("Loading fonts...");
+    gm_log("Loading fonts...");
     load_assets_simple("fonts", load_font, find_res("fonts"), root);
-    gm80l_log("Fonts done.");
+    gm_log("Fonts done.");
     gm80_progress_step(60);
 
     // 11. Load objects (needs sprite + object name context)
@@ -2623,28 +2578,28 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
     g_action_names.fonts     = load_names(root / "fonts" / "index.yyd");
     g_action_names.timelines = load_names(root / "timelines" / "index.yyd");
 
-    gm80l_log("Loading objects...");
+    gm_log("Loading objects...");
     {
         auto names = load_names(root / "objects" / "index.yyd");
         auto sprites = load_names(root / "sprites" / "index.yyd");
         load_assets_ctx("objects", load_object, find_res("objects"), root, names, sprites);
     }
-    gm80l_log("Objects done.");
+    gm_log("Objects done.");
     gm80_progress_step(70);
 
     // 12. Load rooms (needs object + background name context)
-    gm80l_log("Loading rooms...");
+    gm_log("Loading rooms...");
     {
         auto names = load_names(root / "rooms" / "index.yyd");
         auto objs = load_names(root / "objects" / "index.yyd");
         auto bgs = load_names(root / "backgrounds" / "index.yyd");
         load_assets_ctx("rooms", load_room_obj, find_res("rooms"), root, objs, bgs);
     }
-    gm80l_log("Rooms done.");
+    gm_log("Rooms done.");
     gm80_progress_step(80);
 
     // 13. Resource tree (tree.yyd per type) — needed for the IDE to display assets
-    gm80l_log("Loading resource trees...");
+    gm_log("Loading resource trees...");
     {
         const struct { const char* dir; int kind; } treeTypes[] = {
             {"sprites", 2}, {"sounds", 3}, {"backgrounds", 6}, {"paths", 8},
@@ -2656,13 +2611,13 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
             load_resource_tree(names, t.kind, t.dir, root);
         }
     }
-    gm80l_log("Resource trees done.");
+    gm_log("Resource trees done.");
     gm80_progress_step(90);
 
     // 14. Load timelines (before objects — they share the Event/Action system)
-    gm80l_log("Loading timelines...");
+    gm_log("Loading timelines...");
     load_assets_simple("timelines", load_timeline, find_res("timelines"), root);
-    gm80l_log("Timelines done.");
+    gm_log("Timelines done.");
     gm80_progress_step(100);
 
     // 14b. Font installation verification (warn about fonts not on this system)
@@ -2673,8 +2628,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
 
     // 16. Update settings timestamp — GM 8.0 keeps the "last modified" as a
     // Delphi TDateTime (double, days since 1899-12-30); writing 0.0 shows
-    // 1899/12/30 in the project properties. Use GM's own Now() (0x405CF18)
-    // for a correct value.
+    // 1899/12/30 in the project properties. Use GM's own Now() (sub_40CF18).
     {
         uint8_t* b = (uint8_t*)g_load_base;
         uint32_t fn = (uint32_t)b + 0xCF18;   // sub_40CF18 = Now() (GetLocalTime→EncodeDate+EncodeTime)
@@ -2684,7 +2638,7 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
             fstp qword ptr [now]              // Delphi double return lives in ST(0), NOT EDX:EAX
         }
         write_glob_f64(ADDR_SETTINGS_TIMESTAMP, now);
-        gm80l_log("gm80_load_project: timestamp set to %f", now);
+        gm_log("gm80_load_project: timestamp set to %f", now);
     }
 
     // 17. Working directory: GM launches the compiled game with
@@ -2697,10 +2651,10 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
         fs::path cwd = root.parent_path();
         if (cwd.empty()) cwd = root;
         if (SetCurrentDirectoryW(cwd.c_str())) {
-            gm80l_log("gm80_load_project: cwd set to '%ls'", cwd.c_str());
+            gm_log("gm80_load_project: cwd set to '%ls'", cwd.c_str());
         } else {
-            gm80l_log("gm80_load_project: SetCurrentDirectoryW failed err=%u",
-                      (uint32_t)GetLastError());
+            gm_log("gm80_load_project: SetCurrentDirectoryW failed err=%u",
+                   (uint32_t)GetLastError());
         }
     }
 
@@ -2719,12 +2673,12 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath) {
             WideCharToMultiByte(CP_ACP, 0, wproj.c_str(), (int)wproj.size(),
                                 &aproj[0], alen, NULL, NULL);
             write_glob_str(0x1EA27C, aproj);
-            gm80l_log("gm80_load_project: GM80_ProjectPath set to '%s'",
-                      aproj.c_str());
+            gm_log("gm80_load_project: GM80_ProjectPath set to '%s'",
+                   aproj.c_str());
         }
     }
 
-    gm80l_log("gm80_load_project: SUCCESS, returning true");
+    gm_log("gm80_load_project: SUCCESS, returning true");
     return true;
 }
 

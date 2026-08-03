@@ -11,19 +11,9 @@
 #include "pch.h"
 #include "project_watcher.h"
 #include "gm80_addresses.h"
+#include "gm_log.h"
 #include <windows.h>
 #include <string>
-#include <cstdarg>
-
-// ---- Debug log (same target as the rest of the plugin) ----
-static void pwl_log(const char* fmt, ...) {
-    char path[MAX_PATH], buf[1024];
-    GetEnvironmentVariableA("TEMP", path, sizeof(path));
-    strcat_s(path, "\\GMSave.log");
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    FILE* f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
-}
 
 // ==== Shared state ====
 static HANDLE g_watch_thread = NULL;
@@ -46,7 +36,7 @@ static ULONGLONG now_ft() {
 
 void project_watcher_mark_saved() {
     g_save_end_ft = now_ft();
-    pwl_log("Watcher: SAVE_END updated");
+    gm_log("Watcher: SAVE_END updated");
 }
 
 // ==== Watcher thread ====
@@ -62,13 +52,13 @@ static DWORD WINAPI watch_thread(LPVOID) {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
         NULL);
     if (hDir == INVALID_HANDLE_VALUE) {
-        pwl_log("Watcher: cannot open dir err=%u", GetLastError());
+        gm_log("Watcher: cannot open dir err=%u", GetLastError());
         return 1;
     }
     uint8_t buf[64 * 1024];
     OVERLAPPED ov = {};
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    pwl_log("Watcher: started on '%S'", g_watch_path.c_str());
+    gm_log("Watcher: started on '%S'", g_watch_path.c_str());
 
     while (g_watching) {
         DWORD bytes = 0;
@@ -77,7 +67,7 @@ static DWORD WINAPI watch_thread(LPVOID) {
             &bytes, &ov, NULL)) {
             // e.g. ERROR_NOTIFY_ENUM_DIR (buffer overflow from a big batch of
             // changes). Retry instead of dying silently, so the watcher survives.
-            pwl_log("Watcher: ReadDirectoryChangesW failed err=%u — retrying", GetLastError());
+            gm_log("Watcher: ReadDirectoryChangesW failed err=%u — retrying", GetLastError());
             Sleep(500);
             continue;
         }
@@ -121,7 +111,7 @@ static DWORD WINAPI watch_thread(LPVOID) {
             }
             if (foreign) {
                 if (InterlockedExchange(&g_pending_foreign, 1) == 0)
-                    pwl_log("Watcher: foreign change detected");
+                    gm_log("Watcher: foreign change detected");
             }
             if (!fni->NextEntryOffset) break;
             p += fni->NextEntryOffset;
@@ -129,7 +119,7 @@ static DWORD WINAPI watch_thread(LPVOID) {
     }
     CloseHandle(ov.hEvent);
     CloseHandle(hDir);
-    pwl_log("Watcher: thread exited");
+    gm_log("Watcher: thread exited");
     return 0;
 }
 
@@ -141,7 +131,7 @@ void project_watcher_stop() {
         g_watch_thread = NULL;
     }
     InterlockedExchange(&g_pending_foreign, 0);
-    pwl_log("Watcher: stopped");
+    gm_log("Watcher: stopped");
 }
 
 void project_watcher_start(const std::wstring& path) {
@@ -155,7 +145,7 @@ void project_watcher_start(const std::wstring& path) {
     g_save_end_ft = now_ft(); // everything we load/read predates now → not foreign
     g_watching = true;
     g_watch_thread = CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
-    pwl_log("Watcher: start requested for '%S'", path.c_str());
+    gm_log("Watcher: start requested for '%S'", path.c_str());
 }
 
 bool project_watcher_is_running() {
@@ -227,11 +217,11 @@ static void do_reload() {
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return;
     char** pp = (char**)(b + 0x1EA27C);
-    if (!pp || !*pp) { pwl_log("Watcher: reload aborted, no project path"); return; }
+    if (!pp || !*pp) { gm_log("Watcher: reload aborted, no project path"); return; }
     char* path = *pp;
     uint32_t fn = (uint32_t)b + 0x19B860; // GM80_LoadRecentProject
     uint32_t pathVal = (uint32_t)path;
-    pwl_log("Watcher: reloading project '%s'", path);
+    gm_log("Watcher: reloading project '%s'", path);
     __asm {
         mov eax, pathVal
         xor ebx, ebx
@@ -240,7 +230,7 @@ static void do_reload() {
         mov ecx, fn
         call ecx
     }
-    pwl_log("Watcher: reload returned");
+    gm_log("Watcher: reload returned");
 }
 
 // ==== Main-thread timer ====
@@ -255,7 +245,7 @@ HWND gm80_prompt_owner() {
 
 static void project_watcher_act() {
     if (user_has_unsaved_changes()) {
-        pwl_log("Watcher: unsaved changes present → prompting");
+        gm_log("Watcher: unsaved changes present → prompting");
         int r = MessageBoxW(gm80_prompt_owner(),
             L"Project files have been modified outside Game Maker. Reload project? "
             L"Unsaved changes will be lost.\r\n"
@@ -264,10 +254,10 @@ static void project_watcher_act() {
         if (r == IDYES) {
             do_reload();
         } else {
-            pwl_log("Watcher: user chose No — keeping unsaved changes");
+            gm_log("Watcher: user chose No — keeping unsaved changes");
         }
     } else {
-        pwl_log("Watcher: no unsaved changes → silent reload");
+        gm_log("Watcher: no unsaved changes → silent reload");
         do_reload();
     }
 }
@@ -332,8 +322,8 @@ void project_watcher_ensure_timer_window() {
         0, 0, 0, 0, 0, HWND_MESSAGE, NULL, inst, NULL);
     if (g_timer_wnd) {
         SetTimer(g_timer_wnd, kTimerId, 1000, NULL);
-        pwl_log("Watcher: timer window created");
+        gm_log("Watcher: timer window created");
     } else {
-        pwl_log("Watcher: timer window create FAILED err=%u", GetLastError());
+        gm_log("Watcher: timer window create FAILED err=%u", GetLastError());
     }
 }
