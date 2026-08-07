@@ -174,6 +174,89 @@ static std::string RS(void* obj, int off) {
     return std::string(data, len);
 }
 
+// ==== Stale-resource cleanup ====
+// Renaming or deleting a resource in the GM IDE leaves its old .gm80 files
+// behind (GMSave — like gm82save — only writes current assets). After a
+// successful save, scan each type directory and remove entries whose resource
+// name is no longer live. Folder-type resources (sprites/paths/rooms) store one
+// directory per resource; file-type resources store one or more files named
+// "<name>.<ext>". Only entries matching the type's layout are touched, and
+// index.yyd / tree.yyd are always kept. datafiles/ is never scanned (included
+// files are real relative paths, handled separately).
+static std::string ascii_lower(const std::string& s) {
+    std::string r = s;
+    for (auto& c : r) if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+    return r;
+}
+
+static bool remove_dir_recursive(const std::wstring& path) {
+    WIN32_FIND_DATAW fd;
+    std::wstring pattern = path + L"\\*";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring e = fd.cFileName;
+            if (e == L"." || e == L"..") continue;
+            std::wstring full = path + L"\\" + e;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                remove_dir_recursive(full);
+            else
+                DeleteFileW(full.c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return RemoveDirectoryW(path.c_str()) != 0;
+}
+
+// Scan one type directory under `root`; delete entries whose resource name
+// isn't in `names`. `folder_type` = the resource name is a directory
+// (sprites/paths/rooms); otherwise the name is the file stem (last extension
+// stripped). Returns the number of entries removed.
+static int cleanup_type_dir(const std::wstring& root, const wchar_t* dir,
+                            const std::vector<std::string>& names, bool folder_type) {
+    std::wstring dirPath = root + L"\\" + dir;
+    if (GetFileAttributesW(dirPath.c_str()) == INVALID_FILE_ATTRIBUTES) return 0;
+
+    std::set<std::string> live;
+    for (auto& n : names) if (!n.empty()) live.insert(ascii_lower(n));
+
+    WIN32_FIND_DATAW fd;
+    std::wstring pattern = dirPath + L"\\*";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int removed = 0;
+    do {
+        std::wstring entry = fd.cFileName;
+        if (entry == L"." || entry == L"..") continue;
+        if (entry == L"index.yyd" || entry == L"tree.yyd") continue;
+        bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (isDir != folder_type) continue;   // only scan the type's own layout
+
+        std::string name;
+        if (folder_type) {
+            // directory name is the resource name (wchar→char 1:1, matching the
+            // save-side widening of the byte names)
+            for (wchar_t w : entry) name.push_back((char)w);
+        } else {
+            auto dot = entry.find_last_of(L'.');
+            if (dot == std::wstring::npos) continue;  // extensionless file → not ours
+            for (wchar_t w : entry.substr(0, dot)) name.push_back((char)w);
+        }
+        if (live.count(ascii_lower(name))) continue;  // still live → keep
+
+        std::wstring full = dirPath + L"\\" + entry;
+        bool ok = isDir ? remove_dir_recursive(full) : (DeleteFileW(full.c_str()) != 0);
+        if (ok) {
+            removed++;
+            gm_log("cleanup: removed stale %S", full.c_str());
+        } else {
+            gm_log("cleanup: could not remove %S", full.c_str());
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return removed;
+}
+
 // Read global u32/u8
 static uint32_t GU32(uint32_t off) { return *(uint32_t*)((uint8_t*)g_save_base + off); }
 static uint8_t  GU8(uint32_t off)  { return *(uint8_t*)((uint8_t*)g_save_base + off); }
@@ -199,8 +282,26 @@ static void read_names_global(uint32_t name_off, uint32_t cnt_off,
         char* p = (char*)(uintptr_t)names[i];
         if (!p) { out.push_back(""); continue; }
         uint32_t len = (uint32_t)*(int32_t*)(p - 4);
-        if (len > 200000) { out.push_back(std::string(p)); continue; }
-        out.push_back(std::string(p, len));
+        if (len > 200000) { out.push_back(std::string(p)); continue; }  // garbage length: C-string fallback
+
+        // A resource name is the bytes up to the first NUL. GM may leave
+        // trailing bytes after the terminator (stale folder path / a previous
+        // longer name). Those must never reach validation or filenames — this
+        // is why renaming a script to "g" still failed "contains an invalid
+        // character": the declared length covered junk past the NUL while
+        // %s rendered only up to it.
+        const char* nul = (const char*)memchr(p, '\0', len);
+        size_t nlen = nul ? (size_t)(nul - p) : (size_t)len;
+        if (nul) {
+            std::string hex;
+            for (uint32_t k = 0; k < len && k < 48; k++) {
+                char h[4]; snprintf(h, sizeof(h), "%02X ", (unsigned char)p[k]);
+                hex += h;
+            }
+            gm_log("save: name has embedded NUL (declared %u, real %zu) — bytes: %s",
+                   len, nlen, hex.c_str());
+        }
+        out.push_back(std::string(p, nlen));
     }
 }
 
@@ -1173,6 +1274,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     read_names_global(0x1E9308, 0x1E9310, tlNames);
     read_names_global(0x1E935C, 0x1E9364, objectNames);
     read_names_global(0x1E929C, 0x1E92A4, roomNames);
+    read_names_global(0x1E9280, 0x1E9288, soundNames);  // 0x1E9280 names / 0x1E9288 count
 
     // Triggers: names inside object at +4
     {
@@ -1579,22 +1681,20 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
 
     // Sounds
     if (soundCnt > 0) {
-        // Sound names from name array (corrected 2026-08-02: 0x1E9280 not 0x1E932C;
-        // 0x1E932C is the CONSTANTS count — reading it here crashed on any project
-        // with sounds. Object array is 0x1E9278, not 0x1E92FC.)
-        std::vector<std::string> sndNames;
-        read_names_global(0x1E9280, 0x1E9288, sndNames);
-        save_index(L"sounds", sndNames);
-        save_tree(L"sounds", sndNames, 3);   // was missing → no tree.yyd → empty IDE tree
+        // Names come from soundNames (filled at the top from 0x1E9280 — the
+        // correct name array, verified 2026-08-02; 0x1E932C is the CONSTANTS
+        // count and must never be used here. Object array is 0x1E9278.)
+        save_index(L"sounds", soundNames);
+        save_tree(L"sounds", soundNames, 3);   // was missing → no tree.yyd → empty IDE tree
         uint32_t* sndArr = *(uint32_t**)(base + 0x1E9278);
         double* sndTs = ts_ptr(0x1E9284);
         if (sndArr) {
-            for (uint32_t i = 0; i < soundCnt && i < (uint32_t)sndNames.size(); i++) {
-                if (sndNames[i].empty()) continue;
+            for (uint32_t i = 0; i < soundCnt && i < (uint32_t)soundNames.size(); i++) {
+                if (soundNames[i].empty()) continue;
                 if (!changed[T_SND] && sndTs && sndTs[i] <= g_last_save) continue; // smart skip
                 void* sObj = (void*)(uintptr_t)sndArr[i];
                 if (!sObj) continue;
-                std::wstring wname(sndNames[i].begin(), sndNames[i].end());
+                std::wstring wname(soundNames[i].begin(), soundNames[i].end());
                 save_sound(sObj, sub((L"sounds\\" + wname).c_str()));
             }
         }
@@ -1728,6 +1828,22 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path) {
     g_last_data_hash = dataHash;
     g_has_last_data = true;
     gm_log("SmartSave: LAST_SAVE=%f", g_last_save);
+
+    // ==== Stale-resource cleanup (only after a fully successful save) ====
+    // Renames and deletions in the IDE leave old .gm80 files; remove them now
+    // so a rename doesn't accumulate stale files and git stays clean. Runs on
+    // every save; when nothing changed it's a cheap no-op scan.
+    int removed = 0;
+    removed += cleanup_type_dir(path, L"sprites",     spriteNames, true);
+    removed += cleanup_type_dir(path, L"backgrounds", bgNames,     false);
+    removed += cleanup_type_dir(path, L"paths",       pathNames,   true);
+    removed += cleanup_type_dir(path, L"scripts",     scriptNames, false);
+    removed += cleanup_type_dir(path, L"fonts",       fontNames,   false);
+    removed += cleanup_type_dir(path, L"timelines",   tlNames,     false);
+    removed += cleanup_type_dir(path, L"objects",     objectNames, false);
+    removed += cleanup_type_dir(path, L"rooms",       roomNames,   true);
+    removed += cleanup_type_dir(path, L"sounds",      soundNames,  false);
+    gm_log("SmartSave: cleanup removed %d stale entries", removed);
 
     return true;
 }
