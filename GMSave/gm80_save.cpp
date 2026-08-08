@@ -718,25 +718,25 @@ static void save_timeline(void* obj, const std::vector<std::string>& objectNames
         void** actions = *(void***)((uint8_t*)evList + 4);
         if (!actions || actCount == 0) continue;
 
-        gml += "#define " + to_str(step) + "\n";
+        gml += "#define " + to_str(step) + "\r\n";
         for (uint32_t a = 0; a < actCount; a++) {
             void* act = actions[a];
             if (!act) continue;
-            gml += "/*\"/*'/**//* YYD ACTION\n";
-            gml += "lib_id=" + to_str(R4(act, 4)) + "\n";    // +4 = lib_id
-            gml += "action_id=" + to_str(R4(act, 8)) + "\n";  // +8 = action_id
+            gml += "/*\"/*'/**//* YYD ACTION\r\n";
+            gml += "lib_id=" + to_str(R4(act, 4)) + "\r\n";    // +4 = lib_id
+            gml += "action_id=" + to_str(R4(act, 8)) + "\r\n";  // +8 = action_id
             uint32_t kind = R4(act, 12); // +12 = action_kind
             if (R1(act, 16)) // +16 = can_be_relative
-                gml += "relative=" + to_str(R1(act, 72)) + "\n"; // +72 = is_relative
+                gml += "relative=" + to_str(R1(act, 72)) + "\r\n"; // +72 = is_relative
             if (R1(act, 18)) { // +18 = applies_to_something
                 int32_t at = R4s(act, 68); // +68 = applies_to
-                if (at == -2) gml += "applies_to=other\n";
-                else if (at == -1) gml += "applies_to=self\n";
+                if (at == -2) gml += "applies_to=other\r\n";
+                else if (at == -1) gml += "applies_to=self\r\n";
                 else if (at >= 0) {
                     if (at < (int)objectNames.size())
-                        gml += "applies_to=" + objectNames[at] + "\n";
+                        gml += "applies_to=" + objectNames[at] + "\r\n";
                     else {
-                        gml += "applies_to=" + to_str(at) + "\n"; // tolerant fallback
+                        gml += "applies_to=" + to_str(at) + "\r\n"; // tolerant fallback
                         gm80_diag_add("a timeline action applies_to references a deleted object (index %d)", at);
                     }
                 }
@@ -744,22 +744,22 @@ static void save_timeline(void* obj, const std::vector<std::string>& objectNames
             int argCount = R4s(act, 32); // +32 = param_count
             switch (kind) {
             case 0: // normal — use param_strings (matching gm82save)
-                gml += "invert=" + to_str(R1(act, 108)) + "\n"; // +108 = invert_condition
+                gml += "invert=" + to_str(R1(act, 108)) + "\r\n"; // +108 = invert_condition
                 for (int j = 0; j < argCount && j < 8; j++) {
                     std::string pval = RS(act, 76 + j*4); // +76 = param_strings[j]
-                    gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\n";
+                    gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\r\n";
                 }
                 break;
             case 5: // repeat
-                gml += "repeats=" + RS(act, 76) + "\n"; // param_strings[0]
+                gml += "repeats=" + RS(act, 76) + "\r\n"; // param_strings[0]
                 break;
             case 6: // variable
-                gml += "var_name=" + RS(act, 76) + "\n";
-                gml += "var_value=" + RS(act, 80) + "\n"; // param_strings[1]
+                gml += "var_name=" + RS(act, 76) + "\r\n";
+                gml += "var_value=" + RS(act, 80) + "\r\n"; // param_strings[1]
                 break;
             // case 7: code — write nothing before */
             }
-            gml += "*/\n";
+            gml += "*/\r\n";
             if (kind == 7) { // code action
                 std::string code = RS(act, 76); // param_strings[0]
                 if (!code.empty()) gml += encode_gml(code);
@@ -823,29 +823,29 @@ static void save_object(void* obj,
             } else {
                 evName += "_" + to_str((int)ei);
             }
-            gml += "#define " + evName + "\n";
+            gml += "#define " + evName + "\r\n";
 
             // Write actions (matching gm82save save_event exactly)
             for (uint32_t a = 0; a < actCount; a++) {
                 void* act = actions[a];
                 if (!act) continue;
-                gml += "/*\"/*'/**//* YYD ACTION\n";
-                gml += "lib_id=" + to_str(R4(act, 4)) + "\n";    // +4 = lib_id
-                gml += "action_id=" + to_str(R4(act, 8)) + "\n";  // +8 = action_id
+                gml += "/*\"/*'/**//* YYD ACTION\r\n";
+                gml += "lib_id=" + to_str(R4(act, 4)) + "\r\n";    // +4 = lib_id
+                gml += "action_id=" + to_str(R4(act, 8)) + "\r\n";  // +8 = action_id
                 uint32_t kind = R4(act, 12); // +12 = action_kind
                 if (R1(act, 16)) // +16 = can_be_relative
-                    gml += "relative=" + to_str(R1(act, 72)) + "\n"; // +72 = is_relative
+                    gml += "relative=" + to_str(R1(act, 72)) + "\r\n"; // +72 = is_relative
                 if (R1(act, 18)) { // +18 = applies_to_something
                     int32_t at = R4s(act, 68); // +68 = applies_to
-                    if (at == -2) gml += "applies_to=other\n";
-                    else if (at == -1) gml += "applies_to=self\n";
+                    if (at == -2) gml += "applies_to=other\r\n";
+                    else if (at == -1) gml += "applies_to=self\r\n";
                     else if (at >= 0) {
                         if (at < (int)objectNames.size())
-                            gml += "applies_to=" + objectNames[at] + "\n";
+                            gml += "applies_to=" + objectNames[at] + "\r\n";
                         else {
                             // Deleted object: keep the save tolerant (write the
                             // index) but flag it so the broken action is found.
-                            gml += "applies_to=" + to_str(at) + "\n";
+                            gml += "applies_to=" + to_str(at) + "\r\n";
                             gm80_diag_add("an action applies_to references a deleted object (index %d)", at);
                         }
                     }
@@ -853,7 +853,7 @@ static void save_object(void* obj,
                 int argCount = R4s(act, 32); // +32 = param_count
                 switch (kind) {
                 case 0: // normal — resolve param_types to resource names
-                    gml += "invert=" + to_str(R1(act, 108)) + "\n"; // +108 = invert_condition
+                    gml += "invert=" + to_str(R1(act, 108)) + "\r\n"; // +108 = invert_condition
                     for (int j = 0; j < argCount && j < 8; j++) {
                         uint32_t ptype = R4(act, 36 + j*4); // +36 = param_types[j]
                         std::string pval = RS(act, 76 + j*4); // +76 = param_strings[j]
@@ -869,18 +869,18 @@ static void save_object(void* obj,
                             else if (ptype == 12) pval = (idx>=0&&idx<(int)fontNames.size())?fontNames[idx]:"";
                             else if (ptype == 14) pval = (idx>=0&&idx<(int)tlNames.size())?tlNames[idx]:"";
                         }
-                        gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\n";
+                        gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\r\n";
                     }
                     break;
                 case 5: // repeat
-                    gml += "repeats=" + RS(act, 76) + "\n";
+                    gml += "repeats=" + RS(act, 76) + "\r\n";
                     break;
                 case 6: // variable
-                    gml += "var_name=" + RS(act, 76) + "\n";
-                    gml += "var_value=" + RS(act, 80) + "\n";
+                    gml += "var_name=" + RS(act, 76) + "\r\n";
+                    gml += "var_value=" + RS(act, 80) + "\r\n";
                     break;
                 }
-                gml += "*/\n";
+                gml += "*/\r\n";
                 if (kind == 7) { // code action
                     std::string code = RS(act, 76); // param_strings[0]
                     if (!code.empty()) gml += encode_gml(code);
