@@ -28,13 +28,15 @@ static volatile ULONGLONG g_save_end_ft = 0;
 // by the main-thread timer.
 static volatile LONG g_pending_foreign = 0;
 
-static ULONGLONG now_ft() {
+static ULONGLONG now_ft()
+{
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
 
-void project_watcher_mark_saved() {
+void project_watcher_mark_saved()
+{
     g_save_end_ft = now_ft();
     gm_log("Watcher: SAVE_END updated");
 }
@@ -44,14 +46,13 @@ void project_watcher_mark_saved() {
 //   ignore FILE_ACTION_ADDED (gm82save parity);
 //   FILE_ACTION_MODIFIED -> foreign only if file mtime > SAVE_END;
 //   FILE_ACTION_REMOVED / RENAMED -> foreign.
-static DWORD WINAPI watch_thread(LPVOID) {
-    HANDLE hDir = CreateFileW(g_watch_path.c_str(),
-        FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-        NULL);
-    if (hDir == INVALID_HANDLE_VALUE) {
+static DWORD WINAPI watch_thread(LPVOID)
+{
+    HANDLE hDir = CreateFileW(g_watch_path.c_str(), FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
+    if (hDir == INVALID_HANDLE_VALUE)
+    {
         gm_log("Watcher: cannot open dir err=%u", GetLastError());
         return 1;
     }
@@ -60,14 +61,18 @@ static DWORD WINAPI watch_thread(LPVOID) {
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     gm_log("Watcher: started on '%S'", g_watch_path.c_str());
 
-    while (g_watching) {
+    while (g_watching)
+    {
         DWORD bytes = 0;
         if (!ReadDirectoryChangesW(hDir, buf, sizeof(buf), TRUE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-            &bytes, &ov, NULL)) {
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
+            FILE_NOTIFY_CHANGE_SIZE,
+            &bytes, &ov, NULL))
+        {
             // e.g. ERROR_NOTIFY_ENUM_DIR (buffer overflow from a big batch of
             // changes). Retry instead of dying silently, so the watcher survives.
-            gm_log("Watcher: ReadDirectoryChangesW failed err=%u — retrying", GetLastError());
+            gm_log("Watcher: ReadDirectoryChangesW failed err=%u — retrying",
+                GetLastError());
             Sleep(500);
             continue;
         }
@@ -80,36 +85,44 @@ static DWORD WINAPI watch_thread(LPVOID) {
         if (got == 0) continue;
 
         uint8_t* p = buf;
-        while (p < buf + got) {
+        while (p < buf + got)
+        {
             FILE_NOTIFY_INFORMATION* fni = (FILE_NOTIFY_INFORMATION*)p;
             bool foreign = false;
-            switch (fni->Action) {
-                case FILE_ACTION_ADDED:
-                    break; // gm82save: ignore create (our own saves stop the watcher anyway)
-                case FILE_ACTION_REMOVED:
-                    foreign = true;
-                    break;
-                case FILE_ACTION_RENAMED_OLD_NAME:
-                case FILE_ACTION_RENAMED_NEW_NAME:
-                    foreign = true;
-                    break;
-                case FILE_ACTION_MODIFIED: {
-                    std::wstring name(fni->FileName, fni->FileNameLength / 2);
-                    std::wstring full = g_watch_path + L"\\" + name;
-                    WIN32_FILE_ATTRIBUTE_DATA fd;
-                    if (GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &fd)) {
-                        ULONGLONG mtime =
-                            ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
-                        if (mtime > g_save_end_ft) foreign = true;
-                    } else {
-                        foreign = true; // file gone mid-notify — treat as foreign
-                    }
-                    break;
+            switch (fni->Action)
+            {
+            case FILE_ACTION_ADDED:
+                break;     // gm82save: ignore create (our own saves stop the watcher anyway)
+            case FILE_ACTION_REMOVED:
+                foreign = true;
+                break;
+            case FILE_ACTION_RENAMED_OLD_NAME:
+            case FILE_ACTION_RENAMED_NEW_NAME:
+                foreign = true;
+                break;
+            case FILE_ACTION_MODIFIED:
+            {
+                std::wstring name(fni->FileName, fni->FileNameLength / 2);
+                std::wstring full = g_watch_path + L"\\" + name;
+                WIN32_FILE_ATTRIBUTE_DATA fd;
+                if (GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &fd))
+                {
+                    ULONGLONG mtime = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime
+                        << 32) |
+                        fd.ftLastWriteTime.dwLowDateTime;
+                    if (mtime > g_save_end_ft) foreign = true;
                 }
-                default:
-                    break;
+                else
+                {
+                    foreign = true;     // file gone mid-notify — treat as foreign
+                }
+                break;
             }
-            if (foreign) {
+            default:
+                break;
+            }
+            if (foreign)
+            {
                 if (InterlockedExchange(&g_pending_foreign, 1) == 0)
                     gm_log("Watcher: foreign change detected");
             }
@@ -123,9 +136,11 @@ static DWORD WINAPI watch_thread(LPVOID) {
     return 0;
 }
 
-void project_watcher_stop() {
+void project_watcher_stop()
+{
     g_watching = false;
-    if (g_watch_thread) {
+    if (g_watch_thread)
+    {
         WaitForSingleObject(g_watch_thread, 2000);
         CloseHandle(g_watch_thread);
         g_watch_thread = NULL;
@@ -134,7 +149,8 @@ void project_watcher_stop() {
     gm_log("Watcher: stopped");
 }
 
-void project_watcher_start(const std::wstring& path) {
+void project_watcher_start(const std::wstring& path)
+{
     // Lazy-create the main-thread timer window here (first start). Called on the
     // main thread during a project load/save — never from DllMain, so creating a
     // window is safe (no loader lock).
@@ -148,7 +164,8 @@ void project_watcher_start(const std::wstring& path) {
     gm_log("Watcher: start requested for '%S'", path.c_str());
 }
 
-bool project_watcher_is_running() {
+bool project_watcher_is_running()
+{
     return g_watching;
 }
 
@@ -163,10 +180,15 @@ void project_watcher_ensure_timer_window(); // defined below (lazy, main thread)
 //    Win32 window class at runtime (no static string ref in the binary), so
 //    FindWindow("TMainForm") locates the main window; a focused modal/editor has a
 //    different foreground window → defer.
-static bool editor_form_open() {
+static bool editor_form_open()
+{
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return false;
-    const struct { uint32_t arr; uint32_t cnt; } F[] = {
+    const struct
+    {
+        uint32_t arr;
+        uint32_t cnt;
+    } F[] = {
         {0x1E910C, 0x1E911C}, // sprites
         {0x1E927C, 0x1E9288}, // sounds
         {0x1E9098, 0x1E90A8}, // backgrounds
@@ -177,7 +199,8 @@ static bool editor_form_open() {
         {0x1E9358, 0x1E9364}, // objects
         {0x1E9298, 0x1E92A4}, // rooms
     };
-    for (auto& f : F) {
+    for (auto& f : F)
+    {
         uint32_t cnt = *(uint32_t*)(b + f.cnt);
         uint32_t* arr = *(uint32_t**)(b + f.arr);
         // Guard the 0xFFFFFFFF "uninitialized dynamic array" sentinel too.
@@ -188,7 +211,8 @@ static bool editor_form_open() {
     return false;
 }
 
-static bool safe_to_act() {
+static bool safe_to_act()
+{
     if (editor_form_open()) return false;
     HWND main = FindWindowW(L"TMainForm", NULL);
     if (!main) return false;
@@ -196,7 +220,8 @@ static bool safe_to_act() {
 }
 
 // ==== "User has unsaved changes" via the 16 updated/dirty flags ====
-static bool user_has_unsaved_changes() {
+static bool user_has_unsaved_changes()
+{
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return false;
     static const uint32_t flags[] = ADDR_DIRTY_FLAGS;
@@ -211,13 +236,18 @@ static bool user_has_unsaved_changes() {
 // 0x59B91B routes .gm80 → gm80_load_project, then reloads action libraries.
 // Our load hook re-starts the watcher (project_watcher_start) after a successful
 // load, so no explicit re-arm is needed here.
-static void do_reload() {
+static void do_reload()
+{
     project_watcher_stop();
     project_watcher_mark_saved();
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return;
     char** pp = (char**)(b + 0x1EA27C);
-    if (!pp || !*pp) { gm_log("Watcher: reload aborted, no project path"); return; }
+    if (!pp || !*pp)
+    {
+        gm_log("Watcher: reload aborted, no project path");
+        return;
+    }
     char* path = *pp;
     uint32_t fn = (uint32_t)b + 0x19B860; // GM80_LoadRecentProject
     uint32_t pathVal = (uint32_t)path;
@@ -237,26 +267,34 @@ static void do_reload() {
 // The main window as MessageBox owner: the prompt is then modal to the IDE
 // (main window + its controls are disabled while it is up) and stays in front.
 // Falls back to the foreground window (the gate already requires it == main).
-HWND gm80_prompt_owner() {
+HWND gm80_prompt_owner()
+{
     HWND main = FindWindowW(L"TMainForm", NULL);
     if (!main) main = GetForegroundWindow();
     return main;
 }
 
-static void project_watcher_act() {
-    if (user_has_unsaved_changes()) {
+static void project_watcher_act()
+{
+    if (user_has_unsaved_changes())
+    {
         gm_log("Watcher: unsaved changes present → prompting");
         int r = MessageBoxW(gm80_prompt_owner(),
             L"Project files have been modified outside Game Maker. Reload project? "
             L"Unsaved changes will be lost.\r\n"
             L"If you click \"No\", saving will overwrite any foreign changes.",
             L"Game Maker 8.0", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
-        if (r == IDYES) {
+        if (r == IDYES)
+        {
             do_reload();
-        } else {
+        }
+        else
+        {
             gm_log("Watcher: user chose No — keeping unsaved changes");
         }
-    } else {
+    }
+    else
+    {
         gm_log("Watcher: no unsaved changes → silent reload");
         do_reload();
     }
@@ -266,7 +304,8 @@ static void project_watcher_act() {
 // project (GM80_ProjectPath, 0x1EA27C — the metadata FILE inside that folder) no
 // longer resolves to the same folder, the project changed (e.g. File > New) and
 // a stale watch must not reload the old one.
-static bool watcher_path_current() {
+static bool watcher_path_current()
+{
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return false;
     char** pp = (char**)(b + 0x1EA27C);
@@ -276,18 +315,26 @@ static bool watcher_path_current() {
     if (_stricmp(proj.c_str() + proj.size() - 5, ".gm80") != 0) return false;
     size_t slash = proj.find_last_of("\\/");
     std::wstring wdir;
-    if (slash != std::string::npos)
-        wdir.assign(proj.begin(), proj.begin() + slash);
+    if (slash != std::string::npos) wdir.assign(proj.begin(), proj.begin() + slash);
     else
         wdir.assign(proj.begin(), proj.end());
     return _wcsicmp(wdir.c_str(), g_watch_path.c_str()) == 0;
 }
 
-void project_watcher_tick() {
+void project_watcher_tick()
+{
     if (!g_pending_foreign) return;
-    if (!g_watching) { InterlockedExchange(&g_pending_foreign, 0); return; }
+    if (!g_watching)
+    {
+        InterlockedExchange(&g_pending_foreign, 0);
+        return;
+    }
     // The project changed under us (File > New / switched project) → stop watching.
-    if (!watcher_path_current()) { project_watcher_stop(); return; }
+    if (!watcher_path_current())
+    {
+        project_watcher_stop();
+        return;
+    }
     if (!safe_to_act()) return; // defer: modal focused or an editor is open
     InterlockedExchange(&g_pending_foreign, 0);
     project_watcher_act();
@@ -301,15 +348,18 @@ static const wchar_t* kWatcherWndClass = L"GMSave.Watcher";
 static HWND g_timer_wnd = NULL;
 static const UINT kTimerId = 1;
 
-static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_TIMER && wp == kTimerId) {
+static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_TIMER && wp == kTimerId)
+    {
         project_watcher_tick();
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-void project_watcher_ensure_timer_window() {
+void project_watcher_ensure_timer_window()
+{
     if (g_timer_wnd) return;
     HINSTANCE inst = (HINSTANCE)GetModuleHandle(NULL);
     WNDCLASSEXW wc = {};
@@ -318,12 +368,15 @@ void project_watcher_ensure_timer_window() {
     wc.hInstance = inst;
     wc.lpszClassName = kWatcherWndClass;
     RegisterClassExW(&wc); // harmless if already registered
-    g_timer_wnd = CreateWindowExW(0, kWatcherWndClass, L"",
-        0, 0, 0, 0, 0, HWND_MESSAGE, NULL, inst, NULL);
-    if (g_timer_wnd) {
+    g_timer_wnd = CreateWindowExW(
+        0, kWatcherWndClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, inst, NULL);
+    if (g_timer_wnd)
+    {
         SetTimer(g_timer_wnd, kTimerId, 1000, NULL);
         gm_log("Watcher: timer window created");
-    } else {
+    }
+    else
+    {
         gm_log("Watcher: timer window create FAILED err=%u", GetLastError());
     }
 }

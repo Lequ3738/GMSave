@@ -8,25 +8,31 @@
 #include <cstdio>
 
 static std::vector<std::string> g_diag;
-static std::set<std::string>    g_diag_seen;
+static std::set<std::string> g_diag_seen;
 
-void gm80_diag_reset() {
+void gm80_diag_reset()
+{
     g_diag.clear();
     g_diag_seen.clear();
 }
 
-void gm80_diag_add(const char* fmt, ...) {
+void gm80_diag_add(const char* fmt, ...)
+{
     char buf[512];
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    if (g_diag_seen.insert(buf).second)
-        g_diag.push_back(buf);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_diag_seen.insert(buf).second) g_diag.push_back(buf);
 }
 
-bool gm80_diag_any() {
+bool gm80_diag_any()
+{
     return !g_diag.empty();
 }
 
-void gm80_diag_show(const char* title) {
+void gm80_diag_show(const char* title)
+{
     if (g_diag.empty()) return;
     const size_t kMaxShown = 15;
     std::string msg;

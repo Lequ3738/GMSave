@@ -4,12 +4,20 @@
 #include "gm_log.h"
 
 #ifdef _DEBUG
-void gm_log(const char* fmt, ...) {
+void gm_log(const char* fmt, ...)
+{
     char path[MAX_PATH], buf[1024];
     GetEnvironmentVariableA("TEMP", path, sizeof(path));
     strcat_s(path, "\\GMSave.log");
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
     FILE* f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+    if (f)
+    {
+        fprintf(f, "%s\n", buf);
+        fclose(f);
+    }
 }
 #endif

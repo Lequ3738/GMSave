@@ -9,9 +9,11 @@
 
 static HMODULE g_gm_base = NULL;
 
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+{
     (void)lpvReserved;
-    if (fdwReason == DLL_PROCESS_ATTACH) {
+    if (fdwReason == DLL_PROCESS_ATTACH)
+    {
         g_gm_base = GetModuleHandle(NULL);
         DisableThreadLibraryCalls(hinstDLL);
 
@@ -26,10 +28,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         bool hooks_ok = ide_hooks_install(g_gm_base);
 
         gm_log("GMSave v5 loaded | FoxPlugin.txt: %s | Hooks: %s | Base: 0x%p",
-               config_ok ? "FOUND" : "MISSING",
-               hooks_ok ? "OK" : "FAIL",
-               g_gm_base);
-    } else if (fdwReason == DLL_PROCESS_DETACH) {
+            config_ok ? "FOUND" : "MISSING", hooks_ok ? "OK" : "FAIL", g_gm_base);
+    }
+    else if (fdwReason == DLL_PROCESS_DETACH)
+    {
         project_watcher_stop();
         ide_hooks_uninstall();
         gm_log("GMSave unloaded");
@@ -38,4 +40,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 }
 
 // Required export for FoxPluginLoader DLL injection mechanism
-extern "C" __declspec(dllexport) void Fake() {}
+extern "C" __declspec(dllexport) void Fake()
+{
+}
