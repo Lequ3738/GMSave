@@ -735,9 +735,29 @@ static const char k_gm80_filter[] = "GameMaker 8.0 files (*.gmk)\0*.gmk\0"
     "GameMaker 8.0 project (*.gm80)\0*.gm80\0"
     "All files (*.*)\0*.*\0\0";
 
+// lpstrFilter 是 NUL 分隔的多段串（"名称\0*.ext\0名称2\0*.ext2\0\0"）。
+// strstr() 在第一个 NUL 处停止，只搜首段——项目 filter 首段是 "Game Maker
+// files"，搜 "*.gmk" 永远命中不了第二段。必须逐段遍历（2026-08-16）。
+static bool filter_has_gmk(LPCSTR f)
+{
+    if (!f) return false;
+    while (*f)
+    {
+        if (strstr(f, "*.gmk")) return true;
+        f += strlen(f) + 1;
+    }
+    return false;
+}
+
 static BOOL WINAPI gm80_get_save_file_name(LPOPENFILENAMEA ofn)
 {
-    if (ofn && ofn->lpstrFilter && strstr(ofn->lpstrFilter, "Game Maker"))
+    // 2026-08-16: 逐段匹配 "*.gmk"。旧版 strstr(filter, "Game Maker")
+    // 误伤保存精灵/背景/输入输出资源（filter 首段都含 "Game Maker" 字样）；
+    // 首次改 strstr(filter, "*.gmk") 也不行——strstr 在首段 "Game Maker files"
+    // 内的 NUL 处截断，永远到不了第二段的 *.gmk。项目对话框 filter：
+    //   SAVE [Game Maker files][*.gmk]
+    //   OPEN [Game Maker files][*.gm6;*.gmk][Old Game Maker files][*.gmd]...
+    if (ofn && filter_has_gmk(ofn->lpstrFilter))
     {
         ofn->lpstrFilter = k_gm80_filter;
         if (ofn->lpstrDefExt && ofn->lpstrDefExt[0]) ofn->lpstrDefExt = "gm80";
@@ -747,7 +767,8 @@ static BOOL WINAPI gm80_get_save_file_name(LPOPENFILENAMEA ofn)
 
 static BOOL WINAPI gm80_get_open_file_name(LPOPENFILENAMEA ofn)
 {
-    if (ofn && ofn->lpstrFilter && strstr(ofn->lpstrFilter, "Game Maker"))
+    // 2026-08-16: 逐段匹配 "*.gmk"，理由同上。
+    if (ofn && filter_has_gmk(ofn->lpstrFilter))
     {
         ofn->lpstrFilter = k_gm80_filter;
     }
