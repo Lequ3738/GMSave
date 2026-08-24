@@ -2893,13 +2893,13 @@ static void load_room_instances(void* rm, const fs::path& subDir,
         {
             struct InstRow
             {
-                int32_t obj;
-                int32_t x;
-                int32_t y;
+                int32_t obj = 0;
+                int32_t x = 0;
+                int32_t y = 0;
                 std::string hash;
-                bool locked;
-                int32_t xscale, yscale, blend, angle;
-                bool hasCode;
+                bool locked = false;
+                int32_t xscale = 0, yscale = 0, blend = 0, angle = 0;
+                bool hasCode = false;
             };
             std::vector<InstRow> rows;
             std::istringstream iss(instTxt);
