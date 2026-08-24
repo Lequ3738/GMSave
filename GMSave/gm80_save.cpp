@@ -1584,6 +1584,100 @@ static void* tree_get_root(void* base, uint32_t kind)
     return nullptr;
 }
 
+// ==== Resource-tree expansion state (tree_state.yyd) ====
+// GM 8.0 persists NOTHING about the tree's expanded folders (.gmk tree section
+// = structure only, verified sub_59F094), so every load/reload collapses the
+// tree. We persist the expanded folders ourselves.
+// Control plumbing verified from GM's own expand/collapse (sub_496BC8):
+//   hWnd  = [treeView + 0x1B4]   (treeView = [base + 0x1F6288])
+//   hItem = [node + 0x10]
+//   read  : SendMessage(hWnd, TVM_GETITEMSTATE(0x1127), hItem, TVIS_EXPANDED(0x20))
+//   set   : SendMessage(hWnd, TVM_EXPAND(0x1102), TVE_EXPAND(2), hItem)
+
+static HWND tree_view_hwnd(uint8_t* base)
+{
+    void* tv = *(void**)(base + 0x1F6288);
+    if (!tv || (uintptr_t)tv < 0x10000) return NULL;
+    HWND h = *(HWND*)((uint8_t*)tv + 0x1B4);
+    return (h && (uintptr_t)h >= 0x10000) ? h : NULL;
+}
+
+static bool tree_node_expanded(uint8_t* base, void* node)
+{
+    HWND h = tree_view_hwnd(base);
+    if (!h || !node) return false;
+    uint32_t hItem = *(uint32_t*)((uint8_t*)node + 0x10);
+    if (!hItem) return false;
+    LRESULT st = SendMessageW(h, 0x1127 /*TVM_GETITEMSTATE*/, hItem, 0x20 /*TVIS_EXPANDED*/);
+    return (st & 0x20) != 0;
+}
+
+static void tree_collect_expanded(uint8_t* base, void* parent, std::string& tabs,
+    std::set<std::string>& out)
+{
+    uint32_t cnt = tree_get_count(parent);
+    for (uint32_t i = 0; i < cnt; i++)
+    {
+        void* child = tree_get_item(parent, i);
+        if (!child) continue;
+        if (tree_read_rtype(child) == 2)
+        {
+            // Line format matches load_resource_tree's matching: tab*level + name
+            // (name as stored in tree.yyd = UTF-8).
+            if (tree_node_expanded(base, child))
+                out.insert(tabs + ansi_to_utf8(tree_read_name(child)));
+            tabs += "\t";
+            tree_collect_expanded(base, child, tabs, out);
+            tabs.pop_back();
+        }
+    }
+}
+
+// Capture the expanded-folder state of all 9 resource trees and write it to
+// <projDir>\cache\tree_state.yyd. Called at the end of every save and just
+// before a watcher-triggered reload, so the tree survives reloads and project
+// reopen. The cache/ folder holds generated IDE state only — safe to ignore
+// in git.
+bool gm80_capture_tree_state(void* gm_base, const std::wstring& projDir)
+{
+    uint8_t* base = (uint8_t*)gm_base;
+    if (!base || projDir.empty()) return false;
+    if (!tree_view_hwnd(base)) return false; // tree view not ready — nothing to capture
+
+    std::string s;
+    for (int i = 0; i < 9; i++)
+    {
+        void* root = tree_get_root(base, rt_kinds[i]);
+        if (!root) continue;
+        std::set<std::string> lines;
+        // The type root itself (e.g. the "Scripts" root folder) can be
+        // expanded/collapsed too — record it with a dedicated marker line.
+        if (tree_node_expanded(base, root))
+            lines.insert("root_expanded");
+        std::string tabs;
+        tree_collect_expanded(base, root, tabs, lines);
+        if (!lines.empty())
+        {
+            s += "kind=" + to_str(rt_kinds[i]) + "\n";
+            for (auto& line : lines)
+                s += line + "\n";
+        }
+    }
+
+    std::wstring statePath = projDir + L"\\cache\\tree_state.yyd";
+    if (s.empty())
+    {
+        // Nothing expanded — remove any stale state file, or the next load
+        // would restore folders the user has since collapsed.
+        DeleteFileW(statePath.c_str());
+        return true;
+    }
+    CreateDirectoryW((projDir + L"\\cache").c_str(), NULL);
+    wf(statePath, s);
+    gm_log("TreeState: wrote %s (%zu bytes)", "cache\\tree_state.yyd", s.size());
+    return true;
+}
+
 // Extract the F1 help text from the GameInfo RichEdit control.
 // Chain: [0x5EAEE8] → [p] → +0x360 → +0x298 → vtable+0x78 (SaveToStream).
 // __try lives here in a POD-only frame (no C++ object unwinding).
@@ -2334,6 +2428,11 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
             "SmartSave: I/O error during save — baseline NOT updated (next save full)");
         return true;
     }
+
+    // ==== Resource-tree expansion state ====
+    // Persist expanded folders so the tree survives project reopen. Written
+    // AFTER the baseline update point above — a failed save skips it too.
+    gm80_capture_tree_state(gm_base, path);
     g_last_save = now_t();
     for (int t = 0; t < 10; t++)
     {

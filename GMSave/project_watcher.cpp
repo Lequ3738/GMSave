@@ -11,6 +11,7 @@
 #include "pch.h"
 #include "project_watcher.h"
 #include "gm80_addresses.h"
+#include "gm80_save.h"
 #include "gm_log.h"
 #include <windows.h>
 #include <string>
@@ -88,6 +89,17 @@ static DWORD WINAPI watch_thread(LPVOID)
         while (p < buf + got)
         {
             FILE_NOTIFY_INFORMATION* fni = (FILE_NOTIFY_INFORMATION*)p;
+            // Ignore the generated cache/ directory (IDE state, e.g.
+            // tree_state.yyd) — foreign changes to it must not count as
+            // project modifications.
+            std::wstring name(fni->FileName, fni->FileNameLength / 2);
+            if (name == L"cache" ||
+                (name.size() > 6 && name.compare(0, 6, L"cache\\") == 0))
+            {
+                if (!fni->NextEntryOffset) break;
+                p += fni->NextEntryOffset;
+                continue;
+            }
             bool foreign = false;
             switch (fni->Action)
             {
@@ -102,7 +114,6 @@ static DWORD WINAPI watch_thread(LPVOID)
                 break;
             case FILE_ACTION_MODIFIED:
             {
-                std::wstring name(fni->FileName, fni->FileNameLength / 2);
                 std::wstring full = g_watch_path + L"\\" + name;
                 WIN32_FILE_ATTRIBUTE_DATA fd;
                 if (GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &fd))
@@ -251,6 +262,11 @@ static void do_reload()
     char* path = *pp;
     uint32_t fn = (uint32_t)b + 0x19B860; // GM80_LoadRecentProject
     uint32_t pathVal = (uint32_t)path;
+    // Preserve the resource tree's expanded folders across the reload — GM 8.0
+    // persists no tree state, so capture the current expansion into
+    // tree_state.yyd now; load_resource_tree restores it after the reload.
+    if (!g_watch_path.empty())
+        gm80_capture_tree_state(b, g_watch_path);
     gm_log("Watcher: reloading project '%s'", path);
     __asm {
         mov eax, pathVal

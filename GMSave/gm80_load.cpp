@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <set>
 #include <vector>
 #include <array>
 #include <algorithm>
@@ -680,11 +681,167 @@ static void* tree_add_child(void* nodes, void* parent, const std::string& name,
         call fnInit
     }
 
+    // No icon setup here: GM derives node icons from the TreeNodeData
+    // (kind/rtype) on its own when the tree is shown. Setting images via
+    // TVM_SETITEM here corrupted comctl32's internal state on the first load,
+    // which made the second in-process load's TVM_INSERTITEM crash.
     return node;
 }
 
 // Read a tree.yyd file and build TTreeNode hierarchy (matches gm82save's
 // read_resource_tree: AddChild per line, rtype 2=folder 3=leaf, stack depth)
+// ==== Resource-tree expansion state (tree_state.yyd) ====
+// GM 8.0 persists no tree expansion state (.gmk tree = structure only), so we
+// restore folders marked expanded in tree_state.yyd, written by
+// gm80_capture_tree_state at the end of every save and before watcher reloads.
+// Control plumbing verified from GM's own expand/collapse (sub_496BC8):
+//   hWnd  = [treeView + 0x1B4]   (treeView = [base + 0x1F6288])
+//   hItem = [node + 0x10]
+static std::map<uint32_t, std::set<std::string>> g_tree_state; // kind → expanded lines
+
+static void load_tree_state(const fs::path& root)
+{
+    g_tree_state.clear();
+    std::string txt = read_file(root / "cache" / "tree_state.yyd");
+    if (txt.empty()) return;
+    uint32_t curKind = 0;
+    std::set<std::string>* cur = nullptr;
+    std::istringstream ss(txt);
+    std::string line;
+    while (std::getline(ss, line))
+    {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line.rfind("kind=", 0) == 0)
+        {
+            curKind = (uint32_t)std::stoul(line.c_str() + 5);
+            cur = &g_tree_state[curKind];
+        }
+        else if (cur)
+        {
+            cur->insert(line);
+        }
+    }
+    gm_log("TreeState: loaded %zu kinds from tree_state.yyd", g_tree_state.size());
+}
+
+// Restore one folder node's expanded state. Safe no-op when the node isn't in
+// the persisted state.
+//
+// Expand via GM's own expand function (sub_496BC8: eax=node, edx=expanded,
+// ecx=recurse). Before expanding we must mark the node as having children via
+// GM's SetHasChildren (sub_496EA8: eax=node, dl=haschildren): GM's expand gate
+// (sub_496E38) checks the haschildren flag at TVITEM offset 32 (GM's 40-byte
+// TTVItem), which freshly inserted nodes don't have set yet — without it the
+// gate rejects the expansion and the tree stays collapsed.
+static void tree_set_expanded_gm(uint8_t* base, void* node, bool expanded)
+{
+    if (!node) return;
+    uint32_t fn = (uint32_t)base + 0x96BC8;
+    uint32_t exp = expanded ? 1 : 0;
+    __asm {
+        mov eax, node
+        mov edx, exp
+        xor ecx, ecx
+        call fn
+    }
+}
+
+// Convert ANSI (CP_ACP / GBK) → UTF-8, matching gm80_save.cpp's ansi_to_utf8 so
+// the sig keys built from live tree nodes match tree_state.yyd exactly.
+static std::string ansi_to_utf8(const std::string& ansi)
+{
+    if (ansi.empty()) return ansi;
+    int wlen = MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), (int)ansi.size(), NULL, 0);
+    if (wlen <= 0) return ansi;
+    std::wstring wide(wlen, 0);
+    MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), (int)ansi.size(), &wide[0], wlen);
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wlen, NULL, 0, NULL, NULL);
+    if (u8len <= 0) return ansi;
+    std::string u8(u8len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wlen, &u8[0], u8len, NULL, NULL);
+    return u8;
+}
+
+// Live-tree helpers (RVA of GM's sub_497254 GetCount / sub_497178 GetItem —
+// same as gm80_save.cpp). Walk the ACTUAL current tree, never stale pointers.
+static uint32_t tree_get_count(uint8_t* base, void* node)
+{
+    if (!node || (uintptr_t)node < 0x10000) return 0;
+    uint32_t func = (uint32_t)base + 0x97254;
+    uint32_t out;
+    __asm {
+        mov eax, node
+        call func
+        mov out, eax
+    }
+    return out;
+}
+static void* tree_get_item(uint8_t* base, void* node, uint32_t idx)
+{
+    uint32_t func = (uint32_t)base + 0x97178;
+    uint32_t out;
+    __asm {
+        mov eax, node
+        mov edx, idx
+        call func
+        mov out, eax
+    }
+    return (void*)out;
+}
+static std::string tree_read_name(uint8_t* base, void* node)
+{
+    (void)base;
+    if (!node) return "";
+    char** pp = (char**)((uint8_t*)node + 8);
+    char* data = *pp;
+    if (!data) return "";
+    uint32_t len = (uint32_t)*(int32_t*)(data - 4);
+    if (len > 2000) return "";
+    return std::string(data, len);
+}
+static uint32_t tree_read_rtype(uint8_t* base, void* node)
+{
+    (void)base;
+    if (!node) return 0;
+    uint32_t* td = *(uint32_t**)((uint8_t*)node + 12);
+    return td ? td[1] : 0;
+}
+
+// Phase-2 restore: walk the live tree (root → folders), matching each folder's
+// tab-indented sig against tree_state.yyd (same format as gm80_capture_tree_state
+// writes) and expanding matches. Walking the live tree avoids the dangling
+// pointers a build-time snapshot would hold — Delphi may rehouse node objects
+// while children are being inserted.
+static void tree_restore_expand_walk(uint8_t* base, void* parent, std::string& tabs,
+    uint32_t kind)
+{
+    uint32_t cnt = tree_get_count(base, parent);
+    for (uint32_t i = 0; i < cnt; i++)
+    {
+        void* child = tree_get_item(base, parent, i);
+        if (!child) continue;
+        if (tree_read_rtype(base, child) == 2)
+        {
+            std::string sig = tabs + ansi_to_utf8(tree_read_name(base, child));
+            auto it = g_tree_state.find(kind);
+            if (it != g_tree_state.end() && it->second.count(sig))
+            {
+                uint32_t fnSet = (uint32_t)base + 0x96EA8;
+                __asm {
+                    mov eax, child
+                    mov dl, 1
+                    call fnSet
+                }
+                tree_set_expanded_gm(base, child, true);
+            }
+            tabs += "\t";
+            tree_restore_expand_walk(base, child, tabs, kind);
+            tabs.pop_back();
+        }
+    }
+}
+
 static void load_resource_tree(const std::vector<std::string>& names, int kind,
     const char* dirName, const fs::path& root)
 {
@@ -724,6 +881,16 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
         return;
     }
 
+    // Restore the type root's own expanded state (marker written by
+    // gm80_capture_tree_state when the "Scripts"-style root folder is open).
+    // Deferred until the whole tree is built (see pending below).
+    bool rootExpand = false;
+    {
+        auto it = g_tree_state.find((uint32_t)kind);
+        if (it != g_tree_state.end() && it->second.count("root_expanded"))
+            rootExpand = true;
+    }
+
     // Parse tree.yyd: tab-indented, + for group (rtype=2), | for leaf (rtype=3)
     std::vector<void*> stack;
     stack.push_back(rootNode);
@@ -758,13 +925,34 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
             // the file stores UTF-8, the tree node keeps an AnsiString.
             childNode = tree_add_child(nodes, parent, utf8_to_ansi_if_valid(name), 2,
                 (uint32_t)kind, 0);
-            if (childNode) stack.push_back(childNode);
+            if (childNode)
+            {
+                stack.push_back(childNode);
+            }
         }
         else if (rtype == '|' && idx >= 0)
         {
             tree_add_child(nodes, parent, name, 3, (uint32_t)kind, (uint32_t)idx);
         }
     }
+
+    // Phase 2: whole tree is built (children present, haschildren flags set by
+    // the insert path) — walk the LIVE tree and expand every folder that was
+    // expanded on save. Walking the live tree (rather than a build-time snapshot
+    // of node pointers) is essential: Delphi may rehouse node objects while
+    // children are inserted, leaving collected pointers dangling.
+    if (rootExpand)
+    {
+        uint32_t fnSet = (uint32_t)base + 0x96EA8;
+        __asm {
+            mov eax, rootNode
+            mov dl, 1
+            call fnSet
+        }
+        tree_set_expanded_gm(base, rootNode, true);
+    }
+    std::string tabs;
+    tree_restore_expand_walk(base, rootNode, tabs, (uint32_t)kind);
 }
 
 // ==== Load settings ====
@@ -3094,6 +3282,8 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath)
     gm80_diag_reset();
     fs::path root(wpath);
     if (!fs::is_directory(root)) return false;
+    // 0. Resource-tree expansion state (tree_state.yyd) — restore after load.
+    load_tree_state(root);
     // Ensure GM's id counters start in the valid ranges: instance ids < 100001
     // would collide with the object namespace (0-100000), tile ids < 10000001
     // with backgrounds. GM's room load post-process re-assigns ids from these
@@ -3109,6 +3299,20 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath)
     //    calling it again would double-reset and corrupt.
     // 1b. Cache real VMTs from GM's array objects BEFORE SetLength replaces them
     cache_vmts();
+
+    // 1c. Ensure the resource tree is empty before we build it. A second
+    //     in-process load can leave the first load's nodes behind (stale
+    //     TTreeNodes make TVM_INSERTITEM crash comctl32 with a NULL+0x54 read).
+    //     sub_59FFB8 is InitializeProject's tree reset: Clear both tree node
+    //     containers, clear the thumbnail ImageList, recreate the 9 type roots
+    //     — idempotent, safe even right after InitializeProject.
+    {
+        uint8_t* tb = (uint8_t*)g_load_base;
+        uint32_t fnReset = (uint32_t)tb + 0x19FFB8;
+        __asm {
+            call fnReset
+        }
+    }
 
     // 2. Read root .gm80 metadata
     auto stem = root.filename();
