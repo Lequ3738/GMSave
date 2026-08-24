@@ -166,6 +166,21 @@ static std::string validate_name_list(
             snprintf(buf, sizeof(buf), "%s '%s' %s", what, n.c_str(), why);
             return buf;
         }
+        // GM 8.0 resource names must be referenceable in code, which only
+        // works for ASCII — reject non-ASCII names instead of silently
+        // writing GBK bytes into the UTF-8 project files.
+        for (unsigned char c : n)
+        {
+            if (c >= 0x80)
+            {
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "%s '%s' contains non-ASCII characters (resource names "
+                    "must be English)",
+                    what, n.c_str());
+                return buf;
+            }
+        }
         std::string l = n;
         for (auto& c : l)
             c = (char)tolower((unsigned char)c);
@@ -727,7 +742,7 @@ static void save_font(void* obj, const std::wstring& outPath)
             t += v;
             t += "\n";
         };
-    L("name", RS(obj, 4));
+    L("name", ansi_to_utf8(RS(obj, 4)));
     L("size", to_str(R4(obj, 8)));
     L("bold", to_str(R1(obj, 12)));
     L("italic", to_str(R1(obj, 13)));
@@ -934,7 +949,7 @@ static void save_script(void* obj, const std::string& source, const std::wstring
 static void save_trigger(void* obj, const std::wstring& outPath)
 {
     std::string t;
-    t += "constant=" + RS(obj, 12) + "\n"; // constant_name
+    t += "constant=" + ansi_to_utf8(RS(obj, 12)) + "\n"; // constant_name
     t += "kind=" + to_str(R4(obj, 16)) + "\n"; // kind
     wf(outPath + L".txt", t);
     wf(outPath + L".gml", encode_gml(RS(obj, 8))); // condition
@@ -1001,15 +1016,16 @@ static void save_timeline(
                 for (int j = 0; j < argCount && j < 8; j++)
                 {
                     std::string pval = RS(act, 76 + j * 4);     // +76 = param_strings[j]
-                    gml += "arg" + to_str(j) + "=" + encode_delimit(pval) + "\r\n";
+                    gml += "arg" + to_str(j) + "=" +
+                        encode_delimit(ansi_to_utf8(pval)) + "\r\n";
                 }
                 break;
             case 5:     // repeat
-                gml += "repeats=" + RS(act, 76) + "\r\n";     // param_strings[0]
+                gml += "repeats=" + ansi_to_utf8(RS(act, 76)) + "\r\n"; // param_strings[0]
                 break;
             case 6:     // variable
-                gml += "var_name=" + RS(act, 76) + "\r\n";
-                gml += "var_value=" + RS(act, 80) + "\r\n";     // param_strings[1]
+                gml += "var_name=" + ansi_to_utf8(RS(act, 76)) + "\r\n";
+                gml += "var_value=" + ansi_to_utf8(RS(act, 80)) + "\r\n"; // param_strings[1]
                 break;
                 // case 7: code — write nothing before */
             }
@@ -1185,16 +1201,16 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
                                         ? tlNames[idx]
                                         : "";
                         }
-                        gml += "arg" + to_str(j) + "=" + encode_delimit(pval) +
-                            "\r\n";
+                        gml += "arg" + to_str(j) + "=" +
+                            encode_delimit(ansi_to_utf8(pval)) + "\r\n";
                     }
                     break;
                 case 5:     // repeat
-                    gml += "repeats=" + RS(act, 76) + "\r\n";
+                    gml += "repeats=" + ansi_to_utf8(RS(act, 76)) + "\r\n";
                     break;
                 case 6:     // variable
-                    gml += "var_name=" + RS(act, 76) + "\r\n";
-                    gml += "var_value=" + RS(act, 80) + "\r\n";
+                    gml += "var_name=" + ansi_to_utf8(RS(act, 76)) + "\r\n";
+                    gml += "var_value=" + ansi_to_utf8(RS(act, 80)) + "\r\n";
                     break;
                 }
                 gml += "*/\r\n";
@@ -1243,7 +1259,7 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
             t += "\n";
         };
 
-    L("caption", RS(obj, 4));
+    L("caption", ansi_to_utf8(RS(obj, 4)));
     L("width", to_str(R4(obj, 12)));
     L("height", to_str(R4(obj, 16)));
     // snap at +20/+24, clear at +28/+29 — verified from sub_5480A4 room init
@@ -1521,7 +1537,10 @@ static void tree_write_recurse(void* parent, const std::vector<std::string>& nam
         uint32_t index = tree_read_index(child);
         if (rtype == 2)
         {
-            out += tabs + "+" + name + "\n";
+            // Group (folder) names are free text — GM 8.0 allows Chinese folder
+            // names in the resource tree (not referenceable in code, not used
+            // as file names), so convert ANSI → UTF-8 like other text fields.
+            out += tabs + "+" + ansi_to_utf8(name) + "\n";
             tabs += "\t";
             tree_write_recurse(child, names, tabs, out);
             tabs.pop_back();
@@ -1773,13 +1792,14 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         std::string m;
         m += "gm80_version=" + to_str(GM80_VERSION) + "\n";
         m += "gameid=" + to_str(GU32(0x1F6218)) + "\n\n";
-        m += "info_author=" + GS(0x1E9430) + "\n";
-        m += "info_version=" + GS(0x1E9434) + "\n";
-        m += "info_information=" + encode_delimit(GS(0x1E9438)) + "\n\n";
-        m += "exe_company=" + GS(0x1E944C) + "\n";
-        m += "exe_product=" + GS(0x1E9450) + "\n";
-        m += "exe_copyright=" + GS(0x1E9454) + "\n";
-        m += "exe_description=" + GS(0x1E9458) + "\n";
+        m += "info_author=" + ansi_to_utf8(GS(0x1E9430)) + "\n";
+        m += "info_version=" + ansi_to_utf8(GS(0x1E9434)) + "\n";
+        m += "info_information=" +
+            encode_delimit(ansi_to_utf8(GS(0x1E9438))) + "\n\n";
+        m += "exe_company=" + ansi_to_utf8(GS(0x1E944C)) + "\n";
+        m += "exe_product=" + ansi_to_utf8(GS(0x1E9450)) + "\n";
+        m += "exe_copyright=" + ansi_to_utf8(GS(0x1E9454)) + "\n";
+        m += "exe_description=" + ansi_to_utf8(GS(0x1E9458)) + "\n";
         // Version number quad from GM 8.0 globals dword_5E943C/40/44/48
         // (verified from sub_59E648 .gmk save: 4×u32 after the strings).
         m += "exe_version=" + to_str(GU32(0x1E943C)) + "." + to_str(GU32(0x1E9440)) +
@@ -1873,7 +1893,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
                                                    : "";
                         const char* v = valArr[i] ? (const char*)(uintptr_t)valArr[i]
                                                   : "";
-                        c += std::string(n) + "=" + std::string(v) + "\n";
+                        c += ansi_to_utf8(std::string(n)) + "=" + ansi_to_utf8(std::string(v)) +
+                            "\n";
                     }
                     wf(sub(L"settings\\constants.txt"), c);
                 }
@@ -1901,7 +1922,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
                 uint32_t ed = obj ? *(uint32_t*)(obj + 0x360) : 0;
                 GL("color", to_str(ed && ed >= 0x10000 ? *(uint32_t*)(ed + 0x70) : 0));
             }
-            GL("caption", encode_delimit(GS(0x1E936C)));
+            GL("caption", encode_delimit(ansi_to_utf8(GS(0x1E936C))));
             // 5 flag bytes (verified 2026-08-03 via GM80_SaveGameInfo 0x5991A0 /
             // GM80_LoadGameInfo 0x599024 read order — matches GM 8.1's layout):
             //   +9368 new_window, +9380 border, +9384 resizable,
@@ -2039,7 +2060,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
                 ML("remove", to_str((unsigned)*(uint8_t*)((uint8_t*)f + 38)));
                 uint32_t exportSetting = R4(f, 28);
                 ML("export", to_str(exportSetting));
-                if (exportSetting == 3) ML("export_folder", RS(f, 32));
+                if (exportSetting == 3) ML("export_folder", ansi_to_utf8(RS(f, 32)));
                 wf(sub((L"datafiles\\" + wname + L".txt").c_str()), meta);
             }
             wf(sub(L"datafiles\\index.yyd"), index);

@@ -84,6 +84,19 @@ static std::string utf8_to_ansi(const std::string& utf8)
     return ansi;
 }
 
+// Convert UTF-8 → ANSI only when the input is valid UTF-8; otherwise the text
+// is already CP_ACP bytes (older .gm80 files stored action args / captions
+// raw, without conversion) and must be kept as-is — decoding them as UTF-8
+// would turn them into U+FFFD ('锟斤拷' when displayed) on the next save.
+static std::string utf8_to_ansi_if_valid(const std::string& s)
+{
+    if (s.empty()) return s;
+    int wlen = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), NULL, 0);
+    if (wlen <= 0) return s; // not valid UTF-8 → already ANSI
+    return utf8_to_ansi(s);
+}
+
 // ==== File I/O ====
 static std::string read_file(const fs::path& p)
 {
@@ -741,7 +754,10 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
 
         if (rtype == '+')
         {
-            childNode = tree_add_child(nodes, parent, name, 2, (uint32_t)kind, 0);
+            // Group (folder) name: free text (Chinese allowed in GM 8.0) —
+            // the file stores UTF-8, the tree node keeps an AnsiString.
+            childNode = tree_add_child(nodes, parent, utf8_to_ansi_if_valid(name), 2,
+                (uint32_t)kind, 0);
             if (childNode) stack.push_back(childNode);
         }
         else if (rtype == '|' && idx >= 0)
@@ -1103,8 +1119,12 @@ static void load_settings(const fs::path& root)
             uint32_t* valArr = *(uint32_t**)(b + 0x1F1C94);
             for (uint32_t i = 0; i < cnt; i++)
             {
-                if (nameArr) nameArr[i] = (uint32_t)(uintptr_t)make_delphi_str(names[i]);
-                if (valArr) valArr[i] = (uint32_t)(uintptr_t)make_delphi_str(values[i]);
+                if (nameArr)
+                    nameArr[i] = (uint32_t)(uintptr_t)make_delphi_str(
+                        utf8_to_ansi_if_valid(names[i]));
+                if (valArr)
+                    valArr[i] = (uint32_t)(uintptr_t)make_delphi_str(
+                        utf8_to_ansi_if_valid(values[i]));
             }
         }
     }
@@ -1194,7 +1214,7 @@ static void load_gameinfo(const fs::path& root)
         {
             if (k == "color") restore_gameinfo_color(b, (uint32_t)std::stoul(v));
             else if (k == "caption" || k == "text")
-                write_glob_str(0x1E936C, decode_delimit(v));
+                write_glob_str(0x1E936C, utf8_to_ansi_if_valid(decode_delimit(v)));
             // Old byte_XXXX keys still accepted for files saved by earlier builds.
             else if (k == "byte_9368" || k == "new_window")
                 *(uint8_t*)(b + 0x1E9368) = (uint8_t)std::stoul(v);
@@ -1328,7 +1348,7 @@ static void load_included_files(const fs::path& root)
         set_obj_str(f, 4, names[i]);
         set_obj_str(f, 8, (root / "datafiles" / "include" / names[i]).string());
         set_obj_u32(f, 28, exportSetting);
-        if (!exportFolder.empty()) set_obj_str(f, 32, exportFolder);
+        if (!exportFolder.empty()) set_obj_str(f, 32, utf8_to_ansi_if_valid(exportFolder));
         *(uint8_t*)((uint8_t*)f + 36) = overwrite ? 1 : 0;
         *(uint8_t*)((uint8_t*)f + 37) = freeMem ? 1 : 0;
         *(uint8_t*)((uint8_t*)f + 38) = removeAtEnd ? 1 : 0;
@@ -1418,7 +1438,7 @@ static void* load_trigger(const std::string& name, const fs::path& trigDir)
         else if (k == "kind")
             kind = v;
     });
-    set_obj_str(trig, 12, cnst);
+    set_obj_str(trig, 12, utf8_to_ansi_if_valid(cnst));
     set_obj_u32(trig, 16, kind.empty() ? 0 : (uint32_t)std::stoul(kind));
 
     return trig;
@@ -1464,7 +1484,7 @@ static void* load_font(const std::string& name, const fs::path& fontDir)
         [&](auto& k, auto& v)
     {
         // GM 8.0 has no charset/aa_level fields (save side hardcodes 0)
-        if (k == "name") set_obj_str(font, 4, v);
+        if (k == "name") set_obj_str(font, 4, utf8_to_ansi_if_valid(v));
         else if (k == "size")
             set_obj_u32(font, 8, (uint32_t)std::stoul(v));
         else if (k == "bold")
@@ -2190,6 +2210,14 @@ static void parse_actions_into_event(void* ev, const std::string& body,
                 }
                 pv = std::to_string(idx);
             }
+            else
+            {
+                // Text parameter (comment text, expression, ...): the file
+                // stores UTF-8, GM keeps AnsiString (CP_ACP). Older .gm80
+                // files hold raw CP_ACP bytes here — utf8_to_ansi_if_valid
+                // leaves those untouched instead of mangling them to U+FFFD.
+                pv = utf8_to_ansi_if_valid(pv);
+            }
             set_obj_str(act, 76 + j * 4, pv);
         }
 
@@ -2491,7 +2519,7 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     parse_kv(txt,
         [&](auto& k, auto& v)
     {
-        if (k == "caption") set_obj_str(rm, 4, v);
+        if (k == "caption") set_obj_str(rm, 4, utf8_to_ansi_if_valid(v));
         else if (k == "roomspeed")
             set_obj_u32(rm, 8, (uint32_t)std::stoul(v));
         else if (k == "width")
@@ -3105,19 +3133,20 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath)
                     else if (k == "gameid")
                         write_glob_u32(ADDR_GAME_ID, (uint32_t)std::stoul(v));
                     else if (k == "info_author")
-                        write_glob_str(ADDR_SETTING_AUTHOR, v);
+                        write_glob_str(ADDR_SETTING_AUTHOR, utf8_to_ansi_if_valid(v));
                     else if (k == "info_version")
-                        write_glob_str(ADDR_SETTING_VERSION, v);
+                        write_glob_str(ADDR_SETTING_VERSION, utf8_to_ansi_if_valid(v));
                     else if (k == "info_information")
-                        write_glob_str(ADDR_SETTING_INFO, decode_delimit(v));
+                        write_glob_str(ADDR_SETTING_INFO,
+                        utf8_to_ansi_if_valid(decode_delimit(v)));
                     else if (k == "exe_company")
-                        write_glob_str(ADDR_SETTING_COMPANY, v);
+                        write_glob_str(ADDR_SETTING_COMPANY, utf8_to_ansi_if_valid(v));
                     else if (k == "exe_copyright")
-                        write_glob_str(ADDR_SETTING_COPYRIGHT, v);
+                        write_glob_str(ADDR_SETTING_COPYRIGHT, utf8_to_ansi_if_valid(v));
                     else if (k == "exe_product")
-                        write_glob_str(ADDR_SETTING_PRODUCT, v);
+                        write_glob_str(ADDR_SETTING_PRODUCT, utf8_to_ansi_if_valid(v));
                     else if (k == "exe_description")
-                        write_glob_str(ADDR_SETTING_DESCRIPTION, v);
+                        write_glob_str(ADDR_SETTING_DESCRIPTION, utf8_to_ansi_if_valid(v));
                 });
                 break;
             }
