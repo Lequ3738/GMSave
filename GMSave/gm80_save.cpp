@@ -351,12 +351,18 @@ static std::string GS(uint32_t off)
     return std::string(data, len);
 }
 
-// Read names from a DelphiList of Delphi string pointers
-static void read_names_global(
+// Read names from a DelphiList of Delphi string pointers.
+// Returns false when the array looks invalid (null / GM's 0xFFFFFFFF
+// "uninitialized dynamic array" sentinel / absurd count). Callers MUST treat
+// false as "read failed", not as "zero resources" — cleanup_type_dir with an
+// empty live set would DELETE every file of that type, and dereferencing the
+// sentinel pointer is an instant read-AV (2026-09-09).
+static bool read_names_global(
     uint32_t name_off, uint32_t cnt_off, std::vector<std::string>& out)
 {
     uint32_t* names = *(uint32_t**)((uint8_t*)g_save_base + name_off);
     uint32_t cnt = *(uint32_t*)((uint8_t*)g_save_base + cnt_off);
+    if (!names || names == (uint32_t*)0xFFFFFFFF || cnt > 50000) return false;
     out.reserve(cnt);
     for (uint32_t i = 0; i < cnt; i++)
     {
@@ -395,6 +401,7 @@ static void read_names_global(
         }
         out.push_back(std::string(p, nlen));
     }
+    return true;
 }
 
 // Read a DelphiList header from object field and return items array + count
@@ -496,6 +503,20 @@ static bool wf(const std::wstring& fp, const std::string& content)
 // 5E941C) to a file via SaveToStream (vtable+0x58 — 8.0: LoadFromStream is
 // vtable+0x54 per sub_59DCD0, SaveToStream follows it) into a TMemoryStream
 // whose memory (FMemory=+4, FSize=+8) we dump to file.
+// Free a Delphi OBJECT via GM's own TObject.Free (sub_404590: `if Self<>nil
+// then call vmt[-4]` = virtual Destroy — verified in IDA 2026-09-09). Used for
+// scratch TMemoryStreams; raw FreeMem would skip the destructor.
+static void free_delphi_obj(void* obj)
+{
+    if (!obj) return;
+    uint32_t fn = (uint32_t)g_save_base + 0x4590; // TObject.Free
+    __asm {
+        mov eax, obj
+        mov ecx, fn
+        call ecx
+    }
+}
+
 static void save_bitmap_to_file(uint32_t bmpPtr, const wchar_t* fname)
 {
     if (!bmpPtr) return;
@@ -524,6 +545,7 @@ static void save_bitmap_to_file(uint32_t bmpPtr, const wchar_t* fname)
     {
         wf(fname, std::string((char*)mem, size));
     }
+    free_delphi_obj(stream); // scratch stream (leak fix — 4 per save otherwise)
 }
 
 static bool wb(const std::wstring& fp, const void* data, size_t len)
@@ -975,7 +997,7 @@ static void save_timeline(
         if (!evList) continue;
         uint32_t actCount = *(uint32_t*)((uint8_t*)evList + 8);
         void** actions = *(void***)((uint8_t*)evList + 4);
-        if (!actions || actCount == 0) continue;
+        if (!actions || actCount == 0 || actCount > 10000) continue;
 
         gml += "#define " + to_str(step) + "\r\n";
         for (uint32_t a = 0; a < actCount; a++)
@@ -1088,7 +1110,9 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
         if (!evArray) continue;
         uint32_t evCount = *(uint32_t*)((uint8_t*)evArray - 4);
         void** events = (void**)evArray;
-        if (evCount == 0) continue;
+        // Event numbers are small (keyboard/mouse codes ≤ 255); a garbage
+        // count would make the loop below scan far past the array (read-AV).
+        if (evCount == 0 || evCount > 4096) continue;
 
         for (uint32_t ei = 0; ei < evCount; ei++)
         {
@@ -1097,7 +1121,7 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
             // Event: +4=Action*[] raw array, +8=action_count
             uint32_t actCount = *(uint32_t*)((uint8_t*)ev + 8);
             void** actions = (void**)*(void**)((uint8_t*)ev + 4);
-            if (!actions || actCount == 0) continue;
+            if (!actions || actCount == 0 || actCount > 10000) continue;
 
             // Event name
             std::string evName = evNames[evType];
@@ -1163,7 +1187,17 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
                             act, 76 + j * 4);     // +76 = param_strings[j]
                         if (ptype >= 5 && ptype <= 14)
                         {
-                            int idx = pval.empty() ? -1 : std::stoi(pval);
+                            // Non-throwing numeric parse (std::stoi throws on a
+                            // corrupted param string and aborts the whole save).
+                            // Garbage → -1 → written as "no reference".
+                            int idx = -1;
+                            if (!pval.empty())
+                            {
+                                char* end = nullptr;
+                                long v = strtol(pval.c_str(), &end, 10);
+                                if (end && *end == '\0' && v >= 0 && v < 1000000)
+                                    idx = (int)v;
+                            }
                             if (ptype == 5)
                                 pval = (idx >= 0 && idx < (int)spriteNames.size())
                                         ? spriteNames[idx]
@@ -1710,11 +1744,10 @@ static bool extract_richtext(uint8_t* b, std::string* out)
         }
         uint8_t* mem = *(uint8_t**)((uint8_t*)stream + 4);
         uint32_t size = *(uint32_t*)((uint8_t*)stream + 8);
-        if (mem && size > 0 && size < 64 * 1024 * 1024)
-        {
-            out->assign((char*)mem, size);
-            return true;
-        }
+        bool ok = mem && size > 0 && size < 64 * 1024 * 1024;
+        if (ok) out->assign((char*)mem, size);
+        free_delphi_obj(stream); // scratch stream (leak fix)
+        return ok;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -1747,19 +1780,20 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     uint32_t roomCnt = GU32(0x1E92A4);
     uint32_t triggerCnt = GU32(0x1E92EC);
 
-    // Read resource names
+    // Read resource names (ok=false → array unreadable: skip the type AND its
+    // stale-file cleanup — see read_names_global)
     std::vector<std::string> spriteNames, soundNames, bgNames, pathNames;
     std::vector<std::string> scriptNames, fontNames, tlNames, objectNames, roomNames,
         triggerNames;
-    read_names_global(0x1E9110, 0x1E911C, spriteNames);
-    read_names_global(0x1E909C, 0x1E90A8, bgNames);
-    read_names_global(0x1E92B4, 0x1E92BC, pathNames);
-    read_names_global(0x1E92DC, 0x1E92E4, scriptNames);
-    read_names_global(0x1E92C8, 0x1E92D0, fontNames);
-    read_names_global(0x1E9308, 0x1E9310, tlNames);
-    read_names_global(0x1E935C, 0x1E9364, objectNames);
-    read_names_global(0x1E929C, 0x1E92A4, roomNames);
-    read_names_global(0x1E9280, 0x1E9288, soundNames); // 0x1E9280 names / 0x1E9288 count
+    bool spriteNamesOk = read_names_global(0x1E9110, 0x1E911C, spriteNames);
+    bool bgNamesOk = read_names_global(0x1E909C, 0x1E90A8, bgNames);
+    bool pathNamesOk = read_names_global(0x1E92B4, 0x1E92BC, pathNames);
+    bool scriptNamesOk = read_names_global(0x1E92DC, 0x1E92E4, scriptNames);
+    bool fontNamesOk = read_names_global(0x1E92C8, 0x1E92D0, fontNames);
+    bool tlNamesOk = read_names_global(0x1E9308, 0x1E9310, tlNames);
+    bool objectNamesOk = read_names_global(0x1E935C, 0x1E9364, objectNames);
+    bool roomNamesOk = read_names_global(0x1E929C, 0x1E92A4, roomNames);
+    bool soundNamesOk = read_names_global(0x1E9280, 0x1E9288, soundNames); // 0x1E9280 names / 0x1E9288 count
 
     // Triggers: names inside object at +4
     {
@@ -2447,16 +2481,19 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     // Renames and deletions in the IDE leave old .gm80 files; remove them now
     // so a rename doesn't accumulate stale files and git stays clean. Runs on
     // every save; when nothing changed it's a cheap no-op scan.
+    // A type whose name array could NOT be read is skipped entirely: its live
+    // set would be empty and cleanup would delete the type's whole directory
+    // (2026-09-09).
     int removed = 0;
-    removed += cleanup_type_dir(path, L"sprites", spriteNames, true);
-    removed += cleanup_type_dir(path, L"backgrounds", bgNames, false);
-    removed += cleanup_type_dir(path, L"paths", pathNames, true);
-    removed += cleanup_type_dir(path, L"scripts", scriptNames, false);
-    removed += cleanup_type_dir(path, L"fonts", fontNames, false);
-    removed += cleanup_type_dir(path, L"timelines", tlNames, false);
-    removed += cleanup_type_dir(path, L"objects", objectNames, false);
-    removed += cleanup_type_dir(path, L"rooms", roomNames, true);
-    removed += cleanup_type_dir(path, L"sounds", soundNames, false);
+    if (spriteNamesOk) removed += cleanup_type_dir(path, L"sprites", spriteNames, true);
+    if (bgNamesOk) removed += cleanup_type_dir(path, L"backgrounds", bgNames, false);
+    if (pathNamesOk) removed += cleanup_type_dir(path, L"paths", pathNames, true);
+    if (scriptNamesOk) removed += cleanup_type_dir(path, L"scripts", scriptNames, false);
+    if (fontNamesOk) removed += cleanup_type_dir(path, L"fonts", fontNames, false);
+    if (tlNamesOk) removed += cleanup_type_dir(path, L"timelines", tlNames, false);
+    if (objectNamesOk) removed += cleanup_type_dir(path, L"objects", objectNames, false);
+    if (roomNamesOk) removed += cleanup_type_dir(path, L"rooms", roomNames, true);
+    if (soundNamesOk) removed += cleanup_type_dir(path, L"sounds", soundNames, false);
     gm_log("SmartSave: cleanup removed %d stale entries", removed);
 
     return true;

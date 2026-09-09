@@ -367,6 +367,23 @@ static void delphi_free(void* p)
     }
 }
 
+// Free a Delphi OBJECT via GM's own TObject.Free (sub_404590: `if Self<>nil
+// then call vmt[-4]` = virtual Destroy — verified in IDA 2026-09-09). Raw
+// FreeMem on an object would skip the destructor and leak its internals.
+// Use this for TEMPORARY objects we created (e.g. scratch TMemoryStreams);
+// objects stored into GM's structures stay GM-owned.
+static void free_delphi_obj(void* obj)
+{
+    if (!obj) return;
+    uint8_t* b = glob_base();
+    uint32_t fn = (uint32_t)b + 0x4590; // TObject.Free
+    __asm {
+        mov eax, obj
+        mov ecx, fn
+        call ecx
+    }
+}
+
 // Construct a Delphi object: reads VMT from data offset, calls constructor via naked wrapper
 // Read REAL VMT from GM's own blank object in the resource array.
 // InitializeProject already ran before our hook, so arrays have blank entries.
@@ -1020,6 +1037,7 @@ static void load_image_file_core(
         mov ecx, [eax]
         call dword ptr [ecx+0x54]
     }
+    free_delphi_obj(stream); // scratch stream: contents are copied out (leak fix)
     *(uint32_t*)(base + globOff) = (uint32_t)img;
     gm_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
 }
@@ -1082,6 +1100,7 @@ static void load_icon_file(const fs::path& root, const char* fname, uint32_t glo
         mov ecx, [eax]
         call dword ptr [ecx+0x54]
     }
+    free_delphi_obj(stream); // scratch stream: contents are copied out (leak fix)
     *(uint32_t*)(base + globOff) = (uint32_t)img;
     gm_log("load_image: %s -> 0x%X at 0x%X", fname, (uint32_t)img, globOff);
 }
@@ -1362,6 +1381,7 @@ static void restore_richtext(uint8_t* b, const uint8_t* data, uint32_t len)
             mov ecx, [eax]
             call dword ptr [ecx+0x6C] // RichEdit.LoadFromStream
         }
+        free_delphi_obj(stream); // scratch stream: text was copied out (leak fix)
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -3233,7 +3253,8 @@ static bool load_assets_simple(
                     }
                     int32_t* extra = (int32_t*)get_asset_array(extraArr);
                     if (extra) extra[i] = (int32_t)idx;
-                    delphi_free(thumb); // GM frees the TBitmap after registering
+                    free_delphi_obj(thumb); // GM frees the TBitmap after registering
+                                            // (object destroy, not raw FreeMem)
                 }
             }
         }
@@ -3275,7 +3296,51 @@ static bool load_assets_ctx(const char* dirName, LoadFnCtx loader, const ResInfo
 }
 
 // ==== Main load entry point ====
+// Two guard layers (added 2026-09-09 — both close real crash paths):
+//  1. C++ try/catch: dozens of parse sites throw std::stoi/stoul/stod on
+//     malformed or half-written files (git checkout mid-load, external edits).
+//     Without a catch the exception unwinds through the naked-asm hook thunks
+//     and Delphi stack frames — undefined behavior, observed as sporadic
+//     read-AV dialogs during heavy file loading.
+//  2. SEH __except: the project does not use /EHa, so catch(...) does NOT
+//     intercept access violations raised inside the Delphi interop calls;
+//     without this they surface in the IDE process as crash dialogs.
+static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath);
+
+static bool gm80_load_project_cpp(void* gm_base, const std::wstring& wpath)
+{
+    try
+    {
+        return gm80_load_project_inner(gm_base, wpath);
+    }
+    catch (const std::exception& e)
+    {
+        gm_log("Load: EXCEPTION: %s", e.what());
+        return false;
+    }
+    catch (...)
+    {
+        gm_log("Load: UNKNOWN EXCEPTION");
+        return false;
+    }
+}
+
+// SEH frame must live in its own function: __try cannot coexist with C++
+// objects that require unwinding (C2712).
 bool gm80_load_project(void* gm_base, const std::wstring& wpath)
+{
+    __try
+    {
+        return gm80_load_project_cpp(gm_base, wpath);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        gm_log("Load: SEH exception 0x%X", GetExceptionCode());
+        return false;
+    }
+}
+
+static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
 {
     g_load_base = gm_base;
     gm80_instance_hashes_clear();

@@ -264,6 +264,26 @@ static void gm80_progress_show();
 static void gm80_progress_step(int pos);
 static void gm80_progress_close();
 
+// SEH guard for the save pass (2026-09-09): the project has no /EHa, so an
+// access violation inside the Delphi interop (e.g. a corrupt AnsiString read
+// via RS) would surface in the IDE process as a crash dialog. C++ exceptions
+// (0xE06D7363) pass through so do_gm80_save_if_needed's catch(...) still
+// performs proper unwinding. Must be its own function (C2712).
+static bool gm80_save_seh(void* base, const std::wstring& path)
+{
+    __try
+    {
+        return gm80_save_to_path(base, path);
+    }
+    __except (GetExceptionCode() == 0xE06D7363 /* MS C++ EH */
+                  ? EXCEPTION_CONTINUE_SEARCH
+                  : EXCEPTION_EXECUTE_HANDLER)
+    {
+        gm_log("Save: SEH exception 0x%X", GetExceptionCode());
+        return false;
+    }
+}
+
 static void __stdcall do_gm80_save_if_needed()
 {
     // Stop the file watcher first so our own writes are never seen as foreign.
@@ -274,7 +294,7 @@ static void __stdcall do_gm80_save_if_needed()
     bool ok = false;
     try
     {
-        if (!gm80_save_to_path(g_gm_base, g_gm80_save_path)) gm_log("Save: ERROR");
+        if (!gm80_save_seh(g_gm_base, g_gm80_save_path)) gm_log("Save: ERROR");
         else
         {
             gm_log("Save: .gm80 complete");
@@ -382,6 +402,21 @@ static void gm80_progress_close()
     __asm { call fn }
 }
 
+// Free a Delphi OBJECT via GM's own TObject.Free (sub_404590: `if Self<>nil
+// then call vmt[-4]` = virtual Destroy — verified in IDA 2026-09-09).
+static void free_delphi_obj(void* obj)
+{
+    if (!obj) return;
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    if (!base) return;
+    uint32_t fn = (uint32_t)base + 0x4590; // TObject.Free
+    __asm {
+        mov eax, obj
+        mov ecx, fn
+        call ecx
+    }
+}
+
 // gm82save-style .gmk save: create the stream the same way Outer does
 // (ClassCreate on off_4EA854), run GM's save Inner on it, then dump the
 // stream memory to the project file. Bypasses Outer entirely — its SEH
@@ -439,6 +474,7 @@ static void __stdcall do_gmk_save_direct()
     if (!ok)
     {
         gm_log("GMK direct save: Inner returned 0");
+        free_delphi_obj(stream); // leak fix
         gm80_progress_close();
         return;
     }
@@ -450,6 +486,7 @@ static void __stdcall do_gmk_save_direct()
     if (!mem || size == 0 || size > 64 * 1024 * 1024)
     {
         gm_log("GMK direct save: bad stream content");
+        free_delphi_obj(stream); // leak fix
         gm80_progress_close();
         return;
     }
@@ -458,11 +495,13 @@ static void __stdcall do_gmk_save_direct()
     if (!f)
     {
         gm_log("GMK direct save: fopen fail err=%u", GetLastError());
+        free_delphi_obj(stream); // leak fix
         gm80_progress_close();
         return;
     }
     size_t w = fwrite(mem, 1, size, f);
     fclose(f);
+    free_delphi_obj(stream); // scratch stream (leak fix)
     gm80_progress_step(90);
     gm80_progress_close();
     gm_log("GMK direct save: wrote %u bytes to '%s'", (uint32_t)w, gmkPath);
@@ -665,6 +704,11 @@ __declspec(naked) static void load_func_hook()
 handled:
         // [esp] = original EAX, [esp+4] = ret_addr
         pop eax // Discard saved file path
+        mov eax, 1 // sub_5D453C returns a bool (tail: movzx eax,[ebp+var_9]);
+        // callers do `test al, al` (0x5D4973). Returning the popped path
+        // pointer left AL = pointer's low byte — 0 about once in 64 calls,
+        // making the compile flow sporadically treat the load as failed
+        // (verified in IDA 2026-09-09).
         ret // Return directly to sub_5D453C's caller
     }
 }

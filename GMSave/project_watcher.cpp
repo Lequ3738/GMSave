@@ -19,7 +19,19 @@
 // ==== Shared state ====
 static HANDLE g_watch_thread = NULL;
 static volatile bool g_watching = false;
-static std::wstring g_watch_path;
+static std::wstring g_watch_path; // only mutated while NO watcher thread is alive
+
+// Opened by the watcher thread, cancelled AND closed by project_watcher_stop()
+// (after joining the thread). Letting stop() own the close removes the
+// handle-recycle race of an in-thread CloseHandle.
+static volatile HANDLE g_watch_dir = NULL;
+
+// Manual-reset event, created once and reused across start/stop cycles.
+// Set by stop() to break the thread out of every wait, so shutdown is
+// deterministic (no polling timeout that a slow loop can outlive — the old
+// 2s-timeout join could leave a zombie thread reading g_watch_path while the
+// next start() reassigned it: use-after-free read).
+static HANDLE g_watch_wake = NULL;
 
 // SAVE_END as FILETIME (64-bit): any file whose last-write time is <= this was
 // written by us and is NOT a foreign change. Set at end of our saves/loads.
@@ -49,7 +61,12 @@ void project_watcher_mark_saved()
 //   FILE_ACTION_REMOVED / RENAMED -> foreign.
 static DWORD WINAPI watch_thread(LPVOID)
 {
-    HANDLE hDir = CreateFileW(g_watch_path.c_str(), FILE_LIST_DIRECTORY,
+    // Private copy of the path: the shared g_watch_path is only reassigned by
+    // project_watcher_start after stop() has JOINED this thread, but the local
+    // copy guarantees a cross-thread std::wstring race is impossible even if
+    // that invariant ever slips.
+    std::wstring watchPath = g_watch_path;
+    HANDLE hDir = CreateFileW(watchPath.c_str(), FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
     if (hDir == INVALID_HANDLE_VALUE)
@@ -57,10 +74,13 @@ static DWORD WINAPI watch_thread(LPVOID)
         gm_log("Watcher: cannot open dir err=%u", GetLastError());
         return 1;
     }
+    g_watch_dir = hDir;
     uint8_t buf[64 * 1024];
     OVERLAPPED ov = {};
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    gm_log("Watcher: started on '%S'", g_watch_path.c_str());
+    HANDLE wake = g_watch_wake;
+    HANDLE hs[2] = {ov.hEvent, wake};
+    gm_log("Watcher: started on '%S'", watchPath.c_str());
 
     while (g_watching)
     {
@@ -71,16 +91,21 @@ static DWORD WINAPI watch_thread(LPVOID)
             &bytes, &ov, NULL))
         {
             // e.g. ERROR_NOTIFY_ENUM_DIR (buffer overflow from a big batch of
-            // changes). Retry instead of dying silently, so the watcher survives.
+            // changes) — the call FAILED, nothing is pending. Retry instead of
+            // dying silently, but wait on the wake event (not Sleep) so stop()
+            // stays responsive.
             gm_log("Watcher: ReadDirectoryChangesW failed err=%u — retrying",
                 GetLastError());
-            Sleep(500);
+            if (WaitForSingleObject(wake, 500) != WAIT_TIMEOUT) break;
             continue;
         }
-        DWORD wait = WaitForSingleObject(ov.hEvent, 2000);
+        // Blocking wait, woken by either a change or the stop() event. No
+        // polling timeout → the loop can never outlive stop() and re-issue
+        // ReadDirectoryChangesW while a previous operation is still pending.
+        DWORD wait = WaitForMultipleObjects(2, hs, FALSE, INFINITE);
         ResetEvent(ov.hEvent);
-        if (!g_watching) break;
-        if (wait == WAIT_TIMEOUT) continue;
+        if (!g_watching || wait == WAIT_OBJECT_0 + 1) break;
+        if (wait != WAIT_OBJECT_0) continue;
         DWORD got = 0;
         if (!GetOverlappedResult(hDir, &ov, &got, FALSE)) continue;
         if (got == 0) continue;
@@ -114,7 +139,7 @@ static DWORD WINAPI watch_thread(LPVOID)
                 break;
             case FILE_ACTION_MODIFIED:
             {
-                std::wstring full = g_watch_path + L"\\" + name;
+                std::wstring full = watchPath + L"\\" + name;
                 WIN32_FILE_ATTRIBUTE_DATA fd;
                 if (GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &fd))
                 {
@@ -142,7 +167,7 @@ static DWORD WINAPI watch_thread(LPVOID)
         }
     }
     CloseHandle(ov.hEvent);
-    CloseHandle(hDir);
+    // hDir is NOT closed here — project_watcher_stop() owns it after the join.
     gm_log("Watcher: thread exited");
     return 0;
 }
@@ -150,11 +175,25 @@ static DWORD WINAPI watch_thread(LPVOID)
 void project_watcher_stop()
 {
     g_watching = false;
+    if (g_watch_wake) SetEvent(g_watch_wake);
+    // Cancel any pending directory read so the thread's wait completes now
+    // (harmless no-op when nothing is pending).
+    if (g_watch_dir) CancelIoEx((HANDLE)g_watch_dir, NULL);
     if (g_watch_thread)
     {
-        WaitForSingleObject(g_watch_thread, 2000);
+        // Unbounded join is safe: every blocking wait in the thread is released
+        // by the wake event / CancelIoEx above, and the notify loop is bounded
+        // (64KB buffer), so the thread always makes progress towards exit.
+        DWORD w = WaitForSingleObject(g_watch_thread, INFINITE);
+        if (w != WAIT_OBJECT_0)
+            gm_log("Watcher: join FAILED err=%u", GetLastError());
         CloseHandle(g_watch_thread);
         g_watch_thread = NULL;
+    }
+    if (g_watch_dir)
+    {
+        CloseHandle((HANDLE)g_watch_dir);
+        g_watch_dir = NULL;
     }
     InterlockedExchange(&g_pending_foreign, 0);
     gm_log("Watcher: stopped");
@@ -167,7 +206,11 @@ void project_watcher_start(const std::wstring& path)
     // window is safe (no loader lock).
     project_watcher_ensure_timer_window();
     project_watcher_stop();
+    if (!g_watch_wake)
+        g_watch_wake = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ResetEvent(g_watch_wake);
     InterlockedExchange(&g_pending_foreign, 0);
+    // Safe to mutate: stop() guarantees the previous thread has fully exited.
     g_watch_path = path;
     g_save_end_ft = now_ft(); // everything we load/read predates now → not foreign
     g_watching = true;
