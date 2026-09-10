@@ -1501,25 +1501,25 @@ static uint32_t __fastcall tree_get_count(void* node)
 {
     if (!node || (uintptr_t)node < 0x10000) return 0;
     uint32_t func = (uint32_t)g_save_base + 0x97254;
-    uint32_t out;
+    uint32_t retVal; // not "out" — OUT is an x86 mnemonic (C4405 in __asm)
     __asm {
         mov eax, node
         call func
-        mov out, eax
+        mov retVal, eax
     }
-    return out;
+    return retVal;
 }
 static void* __fastcall tree_get_item(void* node, uint32_t idx)
 {
     uint32_t func = (uint32_t)g_save_base + 0x97178;
-    uint32_t out;
+    uint32_t retVal;
     __asm {
         mov eax, node
         mov edx, idx
         call func
-        mov out, eax
+        mov retVal, eax
     }
-    return (void*)out;
+    return (void*)retVal;
 }
 
 // Read TTreeNode fields (no asm needed)

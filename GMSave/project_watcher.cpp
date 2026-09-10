@@ -78,6 +78,14 @@ static DWORD WINAPI watch_thread(LPVOID)
     uint8_t buf[64 * 1024];
     OVERLAPPED ov = {};
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent)
+    {
+        // Without the event, WaitForMultipleObjects returns WAIT_FAILED and the
+        // loop would re-issue ReadDirectoryChangesW while the previous one is
+        // still pending. Bail — hDir is already owned by stop() via g_watch_dir.
+        gm_log("Watcher: CreateEvent failed err=%u", GetLastError());
+        return 1;
+    }
     HANDLE wake = g_watch_wake;
     HANDLE hs[2] = {ov.hEvent, wake};
     gm_log("Watcher: started on '%S'", watchPath.c_str());
@@ -374,9 +382,20 @@ static bool watcher_path_current()
     if (_stricmp(proj.c_str() + proj.size() - 5, ".gm80") != 0) return false;
     size_t slash = proj.find_last_of("\\/");
     std::wstring wdir;
-    if (slash != std::string::npos) wdir.assign(proj.begin(), proj.begin() + slash);
-    else
-        wdir.assign(proj.begin(), proj.end());
+    {
+        // proj is CP_ACP (GBK on Chinese systems). A per-char char→wchar_t
+        // assign SIGN-EXTENDS bytes ≥ 0x80 (0xC4 → 0xFFC4), so a Chinese
+        // project path never matched the real wide watch dir and the watcher
+        // silently stopped. Convert through CP_ACP like the load path does.
+        size_t dlen = (slash != std::string::npos) ? slash : proj.size();
+        int wl = MultiByteToWideChar(CP_ACP, 0, proj.c_str(), (int)dlen, NULL, 0);
+        if (wl > 0)
+        {
+            wdir.resize(wl);
+            MultiByteToWideChar(CP_ACP, 0, proj.c_str(), (int)dlen, &wdir[0], wl);
+        }
+    }
+    if (wdir.empty()) return false;
     return _wcsicmp(wdir.c_str(), g_watch_path.c_str()) == 0;
 }
 

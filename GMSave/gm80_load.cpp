@@ -69,6 +69,50 @@ bool gm80_valid_code_hash(const std::string& h)
 // with the object namespace (0-100000); tile ids < 10000001 with backgrounds.
 // Load re-assigns ids from these counters exactly like GM's room post-process.
 
+// ==== Non-throwing numeric field parsers ====
+// std::stoul/stoi/stod throw std::invalid_argument/out_of_range on malformed
+// values. Inside a parse_kv callback that exception escapes and aborts the
+// WHOLE project load (in Release, with no message at all) — one bad number in
+// any settings.txt/points.txt/instances.txt killed everything. These helpers
+// are the C++ equivalent of Rust's parse::<u32>() being a Result that must be
+// handled: a bad value skips that one field (default) instead of killing the
+// load. Same semantics as the throwers for well-formed input (strtoul even
+// accepts a leading '-' like std::stoul does, wrapping to u32).
+static uint32_t p_u32(const char* s, uint32_t def = 0)
+{
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s) return def; // no digits at all
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end != '\0') return def; // trailing junk
+    return (uint32_t)v;
+}
+static uint32_t p_u32(const std::string& v, uint32_t def = 0)
+{
+    return p_u32(v.c_str(), def);
+}
+static int32_t p_i32(const std::string& v, int32_t def = 0)
+{
+    if (v.empty()) return def;
+    char* end = nullptr;
+    long l = strtol(v.c_str(), &end, 10);
+    if (end == v.c_str()) return def;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end != '\0') return def;
+    return (int32_t)l;
+}
+static double p_f64(const std::string& v, double def = 0.0)
+{
+    if (v.empty()) return def;
+    char* end = nullptr;
+    double d = strtod(v.c_str(), &end);
+    if (end == v.c_str()) return def;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end != '\0') return def;
+    return d;
+}
+
 // ==== UTF-8 → ANSI conversion for GML files ====
 // GM 8.0 uses AnsiString (CP_ACP/GBK). .gml files use UTF-8.
 static std::string utf8_to_ansi(const std::string& utf8)
@@ -300,7 +344,9 @@ static void verify_fonts()
     if (!b) return;
     uint32_t cnt = *(uint32_t*)(b + 0x1E92D0); // font count
     uint32_t* arr = *(uint32_t**)(b + 0x1E92C0); // font objects
-    if (!arr || cnt == 0 || cnt > 10000) return;
+    // Same 0xFFFFFFFF "uninitialized dynamic array" sentinel guard as
+    // editor_form_open / cache_vmts — dereferencing the sentinel is an AV.
+    if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 10000) return;
     std::string missing;
     for (uint32_t i = 0; i < cnt; i++)
     {
@@ -691,11 +737,12 @@ static void* tree_add_child(void* nodes, void* parent, const std::string& name,
     }
 
     // 5. init: sub_49699C(node, -1) (RVA 0x9699C)
-    uint32_t fnInit = (uint32_t)b + 0x9699C;
+    // (named fnInitNode: "fnInit" lowercases to the x87 FNINIT mnemonic → C4405)
+    uint32_t fnInitNode = (uint32_t)b + 0x9699C;
     __asm {
         mov eax, node
         mov edx, 0xFFFFFFFF
-        call fnInit
+        call fnInitNode
     }
 
     // No icon setup here: GM derives node icons from the TreeNodeData
@@ -731,7 +778,7 @@ static void load_tree_state(const fs::path& root)
         if (line.empty()) continue;
         if (line.rfind("kind=", 0) == 0)
         {
-            curKind = (uint32_t)std::stoul(line.c_str() + 5);
+            curKind = (uint32_t)p_u32(line.c_str() + 5);
             cur = &g_tree_state[curKind];
         }
         else if (cur)
@@ -786,25 +833,25 @@ static uint32_t tree_get_count(uint8_t* base, void* node)
 {
     if (!node || (uintptr_t)node < 0x10000) return 0;
     uint32_t func = (uint32_t)base + 0x97254;
-    uint32_t out;
+    uint32_t retVal; // not "out" — OUT is an x86 mnemonic (C4405 in __asm)
     __asm {
         mov eax, node
         call func
-        mov out, eax
+        mov retVal, eax
     }
-    return out;
+    return retVal;
 }
 static void* tree_get_item(uint8_t* base, void* node, uint32_t idx)
 {
     uint32_t func = (uint32_t)base + 0x97178;
-    uint32_t out;
+    uint32_t retVal;
     __asm {
         mov eax, node
         mov edx, idx
         call func
-        mov out, eax
+        mov retVal, eax
     }
-    return (void*)out;
+    return (void*)retVal;
 }
 static std::string tree_read_name(uint8_t* base, void* node)
 {
@@ -1151,36 +1198,36 @@ static void load_settings(const fs::path& root)
         else if (k == "display_cursor")
             write_glob_bool(ADDR_SETTING_DISPLAY_CURSOR, v == "1");
         else if (k == "color_depth")
-            write_glob_u32(ADDR_SETTING_COLOR_DEPTH, (uint32_t)std::stoul(v));
+            write_glob_u32(ADDR_SETTING_COLOR_DEPTH, (uint32_t)p_u32(v));
         else if (k == "resolution")
-            write_glob_u32(ADDR_SETTING_RESOLUTION, (uint32_t)std::stoul(v));
+            write_glob_u32(ADDR_SETTING_RESOLUTION, (uint32_t)p_u32(v));
         else if (k == "frequency")
-            write_glob_u32(ADDR_SETTING_FREQUENCY, (uint32_t)std::stoul(v));
+            write_glob_u32(ADDR_SETTING_FREQUENCY, (uint32_t)p_u32(v));
         else if (k == "scaling")
             write_glob_i32(ADDR_SETTING_SCALING,
-            (int32_t)std::stoul(v));         // signed; stoi throws on u32-encoded -1
+            (int32_t)p_u32(v));         // signed; stoi throws on u32-encoded -1
         else if (k == "clear_color")
-            write_glob_u32(ADDR_SETTING_CLEAR_COLOR, (uint32_t)std::stoul(v));
+            write_glob_u32(ADDR_SETTING_CLEAR_COLOR, (uint32_t)p_u32(v));
         else if (k == "dont_show_buttons")
-            write_glob_u8(ADDR_SETTING_DONT_SHOW_BUTTONS, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_DONT_SHOW_BUTTONS, (uint8_t)p_u32(v));
         else if (k == "vsync")
-            write_glob_u8(ADDR_SETTING_VSYNC, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_VSYNC, (uint8_t)p_u32(v));
         else if (k == "disable_screensaver")
-            write_glob_u8(ADDR_SETTING_DISABLE_SCREENSAVER, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_DISABLE_SCREENSAVER, (uint8_t)p_u32(v));
         else if (k == "f4_fullscreen_toggle")
-            write_glob_u8(ADDR_SETTING_F4_FULLSCREEN, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_F4_FULLSCREEN, (uint8_t)p_u32(v));
         else if (k == "f1_help_menu")
-            write_glob_u8(ADDR_SETTING_F1_HELP, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_F1_HELP, (uint8_t)p_u32(v));
         else if (k == "esc_close_game")
-            write_glob_u8(ADDR_SETTING_ESC_CLOSE, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_ESC_CLOSE, (uint8_t)p_u32(v));
         else if (k == "f5_save_f6_load")
-            write_glob_u8(ADDR_SETTING_F5_SAVE_F6_LOAD, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_F5_SAVE_F6_LOAD, (uint8_t)p_u32(v));
         else if (k == "f9_screenshot")
-            write_glob_u8(ADDR_SETTING_F9_SCREENSHOT, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_F9_SCREENSHOT, (uint8_t)p_u32(v));
         else if (k == "treat_close_as_esc")
-            write_glob_u8(ADDR_SETTING_TREAT_CLOSE_AS_ESC, (uint8_t)std::stoul(v));
+            write_glob_u8(ADDR_SETTING_TREAT_CLOSE_AS_ESC, (uint8_t)p_u32(v));
         else if (k == "priority")
-            write_glob_u32(ADDR_SETTING_PRIORITY, (uint32_t)std::stoul(v));
+            write_glob_u32(ADDR_SETTING_PRIORITY, (uint32_t)p_u32(v));
         else if (k == "freeze_on_lose_focus")
             write_glob_bool(ADDR_SETTING_FREEZE_ON_LOSE_FOCUS, v == "1");
         else if (k == "allow_resize")
@@ -1192,24 +1239,24 @@ static void load_settings(const fs::path& root)
         // gm82save writes the loading-bar type as "custom_bar"; accept the old
         // "loading_bar" key too for files saved by earlier versions of this plugin.
         else if (k == "custom_bar" || k == "loading_bar")
-            write_glob_u32(ADDR_SETTING_LOADING_BAR, (uint32_t)std::stoul(v));
+            write_glob_u32(ADDR_SETTING_LOADING_BAR, (uint32_t)p_u32(v));
         else if (k == "show_error_messages")
-            write_glob_u8(0x1E9420, (uint8_t)std::stoul(v));     // byte_5E9420
+            write_glob_u8(0x1E9420, (uint8_t)p_u32(v));     // byte_5E9420
         else if (k == "log_errors")
-            write_glob_u8(0x1E9424, (uint8_t)std::stoul(v));     // byte_5E9424
+            write_glob_u8(0x1E9424, (uint8_t)p_u32(v));     // byte_5E9424
         else if (k == "always_abort")
-            write_glob_u8(0x1E9428, (uint8_t)std::stoul(v));     // byte_5E9428
+            write_glob_u8(0x1E9428, (uint8_t)p_u32(v));     // byte_5E9428
         else if (k == "zero_uninitialized_vars")
-            write_glob_u8(0x1E942C, (uint8_t)std::stoul(v));     // byte_5E942C
+            write_glob_u8(0x1E942C, (uint8_t)p_u32(v));     // byte_5E942C
         // Loading-bar look (GM 8.0 globals verified from sub_59DD5C):
         else if (k == "custom_loader")
-            write_glob_u8(0x1E9400, (uint8_t)std::stoul(v));     // byte_5E9400
+            write_glob_u8(0x1E9400, (uint8_t)p_u32(v));     // byte_5E9400
         else if (k == "transparent")
-            write_glob_u8(0x1E9410, (uint8_t)std::stoul(v));     // byte_5E9410
+            write_glob_u8(0x1E9410, (uint8_t)p_u32(v));     // byte_5E9410
         else if (k == "translucency")
-            write_glob_u32(0x1E9414, (uint32_t)std::stoul(v));     // dword_5E9414
+            write_glob_u32(0x1E9414, (uint32_t)p_u32(v));     // dword_5E9414
         else if (k == "scale_progress_bar")
-            write_glob_u8(0x1E9418, (uint8_t)std::stoul(v));     // byte_5E9418
+            write_glob_u8(0x1E9418, (uint8_t)p_u32(v));     // byte_5E9418
         // Version number quad (dword_5E943C/40/44/48 — .gmk save writes 4×u32)
         else if (k == "exe_version")
         {
@@ -1420,28 +1467,28 @@ static void load_gameinfo(const fs::path& root)
         parse_kv(txt,
             [&](auto& k, auto& v)
         {
-            if (k == "color") restore_gameinfo_color(b, (uint32_t)std::stoul(v));
+            if (k == "color") restore_gameinfo_color(b, (uint32_t)p_u32(v));
             else if (k == "caption" || k == "text")
                 write_glob_str(0x1E936C, utf8_to_ansi_if_valid(decode_delimit(v)));
             // Old byte_XXXX keys still accepted for files saved by earlier builds.
             else if (k == "byte_9368" || k == "new_window")
-                *(uint8_t*)(b + 0x1E9368) = (uint8_t)std::stoul(v);
+                *(uint8_t*)(b + 0x1E9368) = (uint8_t)p_u32(v);
             else if (k == "left")
-                *(uint32_t*)(b + 0x1E9370) = (uint32_t)std::stoul(v);
+                *(uint32_t*)(b + 0x1E9370) = (uint32_t)p_u32(v);
             else if (k == "top")
-                *(uint32_t*)(b + 0x1E9374) = (uint32_t)std::stoul(v);
+                *(uint32_t*)(b + 0x1E9374) = (uint32_t)p_u32(v);
             else if (k == "width")
-                *(uint32_t*)(b + 0x1E9378) = (uint32_t)std::stoul(v);
+                *(uint32_t*)(b + 0x1E9378) = (uint32_t)p_u32(v);
             else if (k == "height")
-                *(uint32_t*)(b + 0x1E937C) = (uint32_t)std::stoul(v);
+                *(uint32_t*)(b + 0x1E937C) = (uint32_t)p_u32(v);
             else if (k == "byte_9380" || k == "border")
-                *(uint8_t*)(b + 0x1E9380) = (uint8_t)std::stoul(v);
+                *(uint8_t*)(b + 0x1E9380) = (uint8_t)p_u32(v);
             else if (k == "byte_9384" || k == "resizable")
-                *(uint8_t*)(b + 0x1E9384) = (uint8_t)std::stoul(v);
+                *(uint8_t*)(b + 0x1E9384) = (uint8_t)p_u32(v);
             else if (k == "byte_9388" || k == "window_on_top")
-                *(uint8_t*)(b + 0x1E9388) = (uint8_t)std::stoul(v);
+                *(uint8_t*)(b + 0x1E9388) = (uint8_t)p_u32(v);
             else if (k == "byte_938C" || k == "freeze_game")
-                *(uint8_t*)(b + 0x1E938C) = (uint8_t)std::stoul(v);
+                *(uint8_t*)(b + 0x1E938C) = (uint8_t)p_u32(v);
         });
     }
     // F1 help text (RichEdit content) from settings/gameinfo.rtf.
@@ -1549,7 +1596,7 @@ static void load_included_files(const fs::path& root)
             else if (k == "remove")
                 removeAtEnd = (v == "1");
             else if (k == "export")
-                exportSetting = (uint32_t)std::stoul(v);
+                exportSetting = (uint32_t)p_u32(v);
             else if (k == "export_folder")
                 exportFolder = v;
         });
@@ -1593,7 +1640,10 @@ static void load_extensions(const fs::path& root)
     uint32_t cnt = *(uint32_t*)(b + 0x1E9464);
     uint32_t* arr = *(uint32_t**)(b + 0x1E9460);
     uint8_t* flags = *(uint8_t**)(b + 0x2000BC); // deref the dynamic array var!
-    if (!arr || !flags || cnt == 0 || cnt > 1000) return;
+    // Sentinel guard: 0xFFFFFFFF = uninitialized Delphi dynamic array.
+    if (!arr || !flags || (uintptr_t)arr == 0xFFFFFFFF ||
+        (uintptr_t)flags == 0xFFFFFFFF || cnt == 0 || cnt > 1000)
+        return;
     std::istringstream ss(txt);
     std::string line;
     while (std::getline(ss, line))
@@ -1647,7 +1697,7 @@ static void* load_trigger(const std::string& name, const fs::path& trigDir)
             kind = v;
     });
     set_obj_str(trig, 12, utf8_to_ansi_if_valid(cnst));
-    set_obj_u32(trig, 16, kind.empty() ? 0 : (uint32_t)std::stoul(kind));
+    set_obj_u32(trig, 16, kind.empty() ? 0 : (uint32_t)p_u32(kind));
 
     return trig;
 }
@@ -1694,15 +1744,15 @@ static void* load_font(const std::string& name, const fs::path& fontDir)
         // GM 8.0 has no charset/aa_level fields (save side hardcodes 0)
         if (k == "name") set_obj_str(font, 4, utf8_to_ansi_if_valid(v));
         else if (k == "size")
-            set_obj_u32(font, 8, (uint32_t)std::stoul(v));
+            set_obj_u32(font, 8, (uint32_t)p_u32(v));
         else if (k == "bold")
             set_obj_bool(font, 12, v == "1");
         else if (k == "italic")
             set_obj_bool(font, 13, v == "1");
         else if (k == "range_start")
-            set_obj_u32(font, 16, (uint32_t)std::stoul(v));
+            set_obj_u32(font, 16, (uint32_t)p_u32(v));
         else if (k == "range_end")
-            set_obj_u32(font, 20, (uint32_t)std::stoul(v));
+            set_obj_u32(font, 20, (uint32_t)p_u32(v));
     });
 
     return font;
@@ -1737,13 +1787,13 @@ static void* load_sound(const std::string& name, const fs::path& sndDir)
         else if (k == "exists")
             exists = (v == "1");
         else if (k == "kind")
-            set_obj_u32(snd, 4, (uint32_t)std::stoul(v));
+            set_obj_u32(snd, 4, (uint32_t)p_u32(v));
         else if (k == "effects")
-            set_obj_i32(snd, 12, std::stoi(v));
+            set_obj_i32(snd, 12, p_i32(v));
         else if (k == "volume")
-            set_obj_f64(snd, 24, std::stod(v));
+            set_obj_f64(snd, 24, p_f64(v));
         else if (k == "pan")
-            set_obj_f64(snd, 32, std::stod(v));
+            set_obj_f64(snd, 32, p_f64(v));
         else if (k == "preload")
             set_obj_bool(snd, 40, v == "1");
     });
@@ -1842,27 +1892,27 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
     {
         try
         {
-            if (k == "origin_x") set_obj_i32(sp, 8, std::stoi(v));
+            if (k == "origin_x") set_obj_i32(sp, 8, p_i32(v));
             else if (k == "origin_y")
-                set_obj_i32(sp, 12, std::stoi(v));
+                set_obj_i32(sp, 12, p_i32(v));
             else if (k == "collision_shape")
-                set_obj_u32(sp, 16, (uint32_t)std::stoul(v));
+                set_obj_u32(sp, 16, (uint32_t)p_u32(v));
             else if (k == "alpha_tolerance")
-                set_obj_u32(sp, 20, (uint32_t)std::stoul(v));
+                set_obj_u32(sp, 20, (uint32_t)p_u32(v));
             else if (k == "per_frame_colliders")
                 set_obj_bool(sp, 24, v == "1");
             else if (k == "bbox_left")
-                set_obj_i32(sp, 28, std::stoi(v));
+                set_obj_i32(sp, 28, p_i32(v));
             else if (k == "bbox_top")
-                set_obj_i32(sp, 32, std::stoi(v));
+                set_obj_i32(sp, 32, p_i32(v));
             else if (k == "bbox_type")
-                set_obj_u32(sp, 36, (uint32_t)std::stoul(v));
+                set_obj_u32(sp, 36, (uint32_t)p_u32(v));
             else if (k == "bbox_right")
-                set_obj_i32(sp, 40, std::stoi(v));
+                set_obj_i32(sp, 40, p_i32(v));
             else if (k == "bbox_bottom")
-                set_obj_i32(sp, 44, std::stoi(v));
+                set_obj_i32(sp, 44, p_i32(v));
             else if (k == "frames")
-                frameCount = (uint32_t)std::stoul(v);
+                frameCount = (uint32_t)p_u32(v);
         }
         catch (...)
         {
@@ -1949,17 +1999,17 @@ static void* load_bg_obj(const std::string& name, const fs::path& bgDir)
         else if (k == "tileset")
             set_obj_bool(bg, 8, v == "1");
         else if (k == "tile_width")
-            set_obj_u32(bg, 12, (uint32_t)std::stoul(v));
+            set_obj_u32(bg, 12, (uint32_t)p_u32(v));
         else if (k == "tile_height")
-            set_obj_u32(bg, 16, (uint32_t)std::stoul(v));
+            set_obj_u32(bg, 16, (uint32_t)p_u32(v));
         else if (k == "tile_hoffset")
-            set_obj_u32(bg, 20, (uint32_t)std::stoul(v));
+            set_obj_u32(bg, 20, (uint32_t)p_u32(v));
         else if (k == "tile_voffset")
-            set_obj_u32(bg, 24, (uint32_t)std::stoul(v));
+            set_obj_u32(bg, 24, (uint32_t)p_u32(v));
         else if (k == "tile_hsep")
-            set_obj_u32(bg, 28, (uint32_t)std::stoul(v));
+            set_obj_u32(bg, 28, (uint32_t)p_u32(v));
         else if (k == "tile_vsep")
-            set_obj_u32(bg, 32, (uint32_t)std::stoul(v));
+            set_obj_u32(bg, 32, (uint32_t)p_u32(v));
     });
 
     if (exists)
@@ -2019,17 +2069,17 @@ static void* load_path_obj(const std::string& name, const fs::path& pathDir)
     parse_kv(txt,
         [&](auto& k, auto& v)
     {
-        if (k == "connection") set_obj_u32(pp, 12, (uint32_t)std::stoul(v));
+        if (k == "connection") set_obj_u32(pp, 12, (uint32_t)p_u32(v));
         else if (k == "closed")
             set_obj_bool(pp, 16, v == "1");
         else if (k == "precision")
-            set_obj_u32(pp, 20, (uint32_t)std::stoul(v));
+            set_obj_u32(pp, 20, (uint32_t)p_u32(v));
         else if (k == "background")
-            set_obj_i32(pp, 40, v.empty() ? -1 : std::stoi(v));
+            set_obj_i32(pp, 40, v.empty() ? -1 : p_i32(v));
         else if (k == "snap_x")
-            set_obj_u32(pp, 44, (uint32_t)std::stoul(v));
+            set_obj_u32(pp, 44, (uint32_t)p_u32(v));
         else if (k == "snap_y")
-            set_obj_u32(pp, 48, (uint32_t)std::stoul(v));
+            set_obj_u32(pp, 48, (uint32_t)p_u32(v));
     });
 
     // Load points into a Delphi dynamic array at +4
@@ -2047,12 +2097,12 @@ static void* load_path_obj(const std::string& name, const fs::path& pathDir)
             auto c1 = line.find(',');
             auto c2 = line.find(',', c1 + 1);
             if (c1 == std::string::npos) continue;
-            coords[ptCount * 3 + 0] = std::stod(line.substr(0, c1));
+            coords[ptCount * 3 + 0] = p_f64(line.substr(0, c1));
             coords[ptCount * 3 + 1] = (c2 != std::string::npos)
-                ? std::stod(line.substr(c1 + 1, c2 - c1 - 1))
-                : std::stod(line.substr(c1 + 1));
+                ? p_f64(line.substr(c1 + 1, c2 - c1 - 1))
+                : p_f64(line.substr(c1 + 1));
             coords[ptCount * 3 + 2] = (c2 != std::string::npos)
-                ? std::stod(line.substr(c2 + 1))
+                ? p_f64(line.substr(c2 + 1))
                 : 100.0;
             ptCount++;
         }
@@ -2280,9 +2330,9 @@ static void parse_actions_into_event(void* ev, const std::string& body,
         parse_kv(block,
             [&](auto& k, auto& v)
         {
-            if (k == "lib_id") libId = (uint32_t)std::stoul(v);
+            if (k == "lib_id") libId = (uint32_t)p_u32(v);
             else if (k == "action_id")
-                actionId = (uint32_t)std::stoul(v);
+                actionId = (uint32_t)p_u32(v);
         });
         bool templFound = false;
         if (libId != 0 || actionId != 0)
@@ -2485,6 +2535,15 @@ static int parse_event_header(const std::string& line, int& evIndex)
 // sub_4F1A18 — null slots crash the editor's event copy, sub_4F1A98).
 static void obj_add_event(void* obj, int evType, int evIndex, void* ev)
 {
+    // Event numbers come from file content (atoi / name lookup). A corrupt or
+    // negative number must not drive the array length: negative wraps to ~4G
+    // as uint32 (only the delphi_alloc failure saved us), huge values would
+    // try to allocate GBs. Skip instead.
+    if (evIndex < 0 || evIndex > 1000000)
+    {
+        gm_log("obj_add_event: bad event index %d — skipped", evIndex);
+        return;
+    }
     uint32_t off = 28 + evType * 4;
     void*** arrPtr = (void***)((uint8_t*)obj + off);
     void** arr = *arrPtr;
@@ -2535,7 +2594,7 @@ static void* load_object(const std::string& name, const fs::path& objDir,
         else if (k == "solid")
             set_obj_bool(obj, 8, v == "1");
         else if (k == "depth")
-            set_obj_i32(obj, 12, std::stoi(v));
+            set_obj_i32(obj, 12, p_i32(v));
         else if (k == "persistent")
             set_obj_bool(obj, 16, v == "1");
         else if (k == "parent")
@@ -2654,7 +2713,7 @@ static void* load_timeline(const std::string& name, const fs::path& tlDir)
         if (line.find("#define ") == 0)
         {
             flushMoment();
-            curTime = (uint32_t)std::stoul(line.substr(8));
+            curTime = (uint32_t)p_u32(line.substr(8));
             haveTime = true;
         }
         else
@@ -2729,21 +2788,21 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     {
         if (k == "caption") set_obj_str(rm, 4, utf8_to_ansi_if_valid(v));
         else if (k == "roomspeed")
-            set_obj_u32(rm, 8, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 8, (uint32_t)p_u32(v));
         else if (k == "width")
-            set_obj_u32(rm, 12, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 12, (uint32_t)p_u32(v));
         else if (k == "height")
-            set_obj_u32(rm, 16, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 16, (uint32_t)p_u32(v));
         else if (k == "snap_x")
-            set_obj_u32(rm, 20, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 20, (uint32_t)p_u32(v));
         else if (k == "snap_y")
-            set_obj_u32(rm, 24, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 24, (uint32_t)p_u32(v));
         else if (k == "isometric")
             set_obj_bool(rm, 28, v == "1");
         else if (k == "roompersistent")
             set_obj_bool(rm, 29, v == "1");
         else if (k == "bg_color")
-            set_obj_u32(rm, 32, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 32, (uint32_t)p_u32(v));
         else if (k == "clear_screen")
             set_obj_bool(rm, 36, v == "1");
         else if (k == "clear_view")
@@ -2774,17 +2833,17 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
                 set_obj_i32(rm, bo + 4,
                 resolve_name_warn(name.c_str(), "background", v, bgNames));
             else if (k == p3)
-                set_obj_i32(rm, bo + 8, std::stoi(v));
+                set_obj_i32(rm, bo + 8, p_i32(v));
             else if (k == p4)
-                set_obj_i32(rm, bo + 12, std::stoi(v));
+                set_obj_i32(rm, bo + 12, p_i32(v));
             else if (k == p5)
                 set_obj_bool(rm, bo + 16, v == "1");
             else if (k == p6)
                 set_obj_bool(rm, bo + 17, v == "1");
             else if (k == p7)
-                set_obj_i32(rm, bo + 20, std::stoi(v));
+                set_obj_i32(rm, bo + 20, p_i32(v));
             else if (k == p8)
-                set_obj_i32(rm, bo + 24, std::stoi(v));
+                set_obj_i32(rm, bo + 24, p_i32(v));
             else if (k == p9)
                 set_obj_bool(rm, bo + 28, v == "1");
         });
@@ -2818,29 +2877,29 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
         {
             if (k == p0) set_obj_bool(rm, vo, v == "1");
             else if (k == p1)
-                set_obj_i32(rm, vo + 4, std::stoi(v));
+                set_obj_i32(rm, vo + 4, p_i32(v));
             else if (k == p2)
-                set_obj_i32(rm, vo + 8, std::stoi(v));
+                set_obj_i32(rm, vo + 8, p_i32(v));
             else if (k == p3)
-                set_obj_u32(rm, vo + 12, (uint32_t)std::stoul(v));
+                set_obj_u32(rm, vo + 12, (uint32_t)p_u32(v));
             else if (k == p4)
-                set_obj_u32(rm, vo + 16, (uint32_t)std::stoul(v));
+                set_obj_u32(rm, vo + 16, (uint32_t)p_u32(v));
             else if (k == p5)
-                set_obj_i32(rm, vo + 20, std::stoi(v));
+                set_obj_i32(rm, vo + 20, p_i32(v));
             else if (k == p6)
-                set_obj_i32(rm, vo + 24, std::stoi(v));
+                set_obj_i32(rm, vo + 24, p_i32(v));
             else if (k == p7)
-                set_obj_u32(rm, vo + 28, (uint32_t)std::stoul(v));
+                set_obj_u32(rm, vo + 28, (uint32_t)p_u32(v));
             else if (k == p8)
-                set_obj_u32(rm, vo + 32, (uint32_t)std::stoul(v));
+                set_obj_u32(rm, vo + 32, (uint32_t)p_u32(v));
             else if (k == p9)
-                set_obj_i32(rm, vo + 36, std::stoi(v));
+                set_obj_i32(rm, vo + 36, p_i32(v));
             else if (k == p10)
-                set_obj_i32(rm, vo + 40, std::stoi(v));
+                set_obj_i32(rm, vo + 40, p_i32(v));
             else if (k == p11)
-                set_obj_i32(rm, vo + 44, std::stoi(v));
+                set_obj_i32(rm, vo + 44, p_i32(v));
             else if (k == p12)
-                set_obj_i32(rm, vo + 48, std::stoi(v));
+                set_obj_i32(rm, vo + 48, p_i32(v));
             else if (k == p13)
                 set_obj_i32(rm, vo + 52,
                 resolve_name_warn(
@@ -2870,9 +2929,9 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     {
         if (k == "remember") set_obj_bool(rm, 768, v == "1");
         else if (k == "editor_width")
-            set_obj_u32(rm, 772, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 772, (uint32_t)p_u32(v));
         else if (k == "editor_height")
-            set_obj_u32(rm, 776, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 776, (uint32_t)p_u32(v));
         else if (k == "show_grid")
             set_obj_bool(rm, 780, v == "1");
         else if (k == "show_objects")
@@ -2890,11 +2949,11 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
         else if (k == "delete_underlying_tiles")
             set_obj_bool(rm, 787, v == "1");
         else if (k == "tab")
-            set_obj_u32(rm, 788, (uint32_t)std::stoul(v));
+            set_obj_u32(rm, 788, (uint32_t)p_u32(v));
         else if (k == "editor_x")
-            set_obj_i32(rm, 792, std::stoi(v));
+            set_obj_i32(rm, 792, p_i32(v));
         else if (k == "editor_y")
-            set_obj_i32(rm, 796, std::stoi(v));
+            set_obj_i32(rm, 796, p_i32(v));
     });
 
     return rm;
@@ -2941,14 +3000,14 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                 InstRow r;
                 r.obj = resolve_name_warn(
                     roomName.c_str(), "instance object", cols[0], objectNames);
-                r.x = std::stoi(cols[1]);
-                r.y = std::stoi(cols[2]);
+                r.x = p_i32(cols[1]);
+                r.y = p_i32(cols[2]);
                 r.hash = cols[3];
                 r.locked = (cols[4] == "1");
-                r.xscale = cols.size() > 5 ? std::stoi(cols[5]) : 1;
-                r.yscale = cols.size() > 6 ? std::stoi(cols[6]) : 1;
-                r.blend = cols.size() > 7 ? (int32_t)std::stoul(cols[7]) : 0xFFFFFFFF;
-                r.angle = cols.size() > 8 ? std::stoi(cols[8]) : 0;
+                r.xscale = cols.size() > 5 ? p_i32(cols[5]) : 1;
+                r.yscale = cols.size() > 6 ? p_i32(cols[6]) : 1;
+                r.blend = cols.size() > 7 ? (int32_t)p_u32(cols[7]) : 0xFFFFFFFF;
+                r.angle = cols.size() > 8 ? p_i32(cols[8]) : 0;
                 r.hasCode = cols.size() > 9 ? (cols[9] == "1") : !r.hash.empty();
                 rows.push_back(r);
             }
@@ -3028,15 +3087,15 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                     cols.push_back(tline.substr(s));
                     if (cols.size() < 8) continue;
                     std::array<int32_t, 10> t = {};
-                    t[0] = std::stoi(cols[1]); // x
-                    t[1] = std::stoi(cols[2]); // y
+                    t[0] = p_i32(cols[1]); // x
+                    t[1] = p_i32(cols[2]); // y
                     t[2] = resolve_name_warn(roomName.c_str(), "tile background", cols[0],
                         bgNames); // source_bg
-                    t[3] = std::stoi(cols[3]); // u
-                    t[4] = std::stoi(cols[4]); // v
-                    t[5] = std::stoi(cols[5]); // width
-                    t[6] = std::stoi(cols[6]); // height
-                    t[7] = std::stoi(depthLine); // depth
+                    t[3] = p_i32(cols[3]); // u
+                    t[4] = p_i32(cols[4]); // v
+                    t[5] = p_i32(cols[5]); // width
+                    t[6] = p_i32(cols[6]); // height
+                    t[7] = p_i32(depthLine); // depth
                     t[8] = (int32_t)(++(*(uint32_t*)(glob_base() +
                         ADDR_LAST_TILE_ID))); // ++GM80_LAST_TILE_ID
                     t[9] = (cols.size() > 7 && cols[7] == "1") ? 1 : 0; // locked
@@ -3297,11 +3356,10 @@ static bool load_assets_ctx(const char* dirName, LoadFnCtx loader, const ResInfo
 
 // ==== Main load entry point ====
 // Two guard layers (added 2026-09-09 — both close real crash paths):
-//  1. C++ try/catch: dozens of parse sites throw std::stoi/stoul/stod on
-//     malformed or half-written files (git checkout mid-load, external edits).
-//     Without a catch the exception unwinds through the naked-asm hook thunks
-//     and Delphi stack frames — undefined behavior, observed as sporadic
-//     read-AV dialogs during heavy file loading.
+//  1. C++ try/catch: backstop for any exception escaping the load (bad_alloc,
+//     filesystem errors). Field-level number parsing used to throw
+//     std::stoi/stoul/stod through here and abort the whole load; it now uses
+//     the non-throwing p_u32/p_i32/p_f64 helpers above.
 //  2. SEH __except: the project does not use /EHa, so catch(...) does NOT
 //     intercept access violations raised inside the Delphi interop calls;
 //     without this they surface in the IDE process as crash dialogs.
@@ -3315,6 +3373,7 @@ static bool gm80_load_project_cpp(void* gm_base, const std::wstring& wpath)
     }
     catch (const std::exception& e)
     {
+        (void)e; // referenced only by the Debug log below; keep Release warning-free
         gm_log("Load: EXCEPTION: %s", e.what());
         return false;
     }
@@ -3398,9 +3457,9 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
                 parse_kv(meta,
                     [&](auto& k, auto& v)
                 {
-                    if (k == "gm80_version") fileVersion = (uint32_t)std::stoul(v);
+                    if (k == "gm80_version") fileVersion = (uint32_t)p_u32(v);
                     else if (k == "gameid")
-                        write_glob_u32(ADDR_GAME_ID, (uint32_t)std::stoul(v));
+                        write_glob_u32(ADDR_GAME_ID, (uint32_t)p_u32(v));
                     else if (k == "info_author")
                         write_glob_str(ADDR_SETTING_AUTHOR, utf8_to_ansi_if_valid(v));
                     else if (k == "info_version")
