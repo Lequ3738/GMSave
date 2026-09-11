@@ -1499,6 +1499,10 @@ static void save_room(void* obj, const std::vector<std::string>& bgNames,
 // sub_497178 (RVA 0x97178): GetItem(node, index) → child node
 static uint32_t __fastcall tree_get_count(void* node)
 {
+    // g_save_base is only assigned in gm80_save_to_path; capture_tree_state also
+    // runs from the watcher reload path — a session that never saved still has
+    // it null, and call base+RVA with base=0 jumps into low heap (AV 0x00097297).
+    if (!g_save_base) return 0;
     if (!node || (uintptr_t)node < 0x10000) return 0;
     uint32_t func = (uint32_t)g_save_base + 0x97254;
     uint32_t retVal; // not "out" — OUT is an x86 mnemonic (C4405 in __asm)
@@ -1511,6 +1515,7 @@ static uint32_t __fastcall tree_get_count(void* node)
 }
 static void* __fastcall tree_get_item(void* node, uint32_t idx)
 {
+    if (!g_save_base) return nullptr; // see tree_get_count
     uint32_t func = (uint32_t)g_save_base + 0x97178;
     uint32_t retVal;
     __asm {
@@ -1676,6 +1681,9 @@ bool gm80_capture_tree_state(void* gm_base, const std::wstring& projDir)
 {
     uint8_t* base = (uint8_t*)gm_base;
     if (!base || projDir.empty()) return false;
+    // The tree walkers below call through g_save_base; unlike the save path,
+    // capture also runs from the watcher reload before any save ever set it.
+    g_save_base = gm_base;
     if (!tree_view_hwnd(base)) return false; // tree view not ready — nothing to capture
 
     std::string s;
