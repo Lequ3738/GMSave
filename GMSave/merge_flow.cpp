@@ -468,7 +468,10 @@ enum FileStatus
     FS_LOCAL,       // only local changed / local-only → write local (auto)
     FS_AUTO,        // text three-way clean merge → write result (auto)
     FS_CONFLICT,    // needs the merge tool
-    FS_DELETED      // remote deleted & local untouched → nothing to do
+    FS_DELETED,     // gone on BOTH the disk side we track and staging — the
+                    // file is already absent where it matters, nothing to do
+    FS_DELETE_LOCAL // staging (IDE memory) dropped it and disk is untouched →
+                    // the disk copy must be removed on apply
 };
 
 struct MergeFile
@@ -512,6 +515,12 @@ static bool load_text_or_hash(MergeFile& mf, const fs::path& base,
         mf.hashBase = snapE->hash;
         if (!mf.binary) mf.baseB = read_bytes(base / mf.rel);
     }
+    // One encoding verdict per file, used by the tool for every side it
+    // shows. Must NOT live in the clean-merge branch only: early-returning
+    // classifications otherwise keep the "utf-8" default and the tool then
+    // renders our GBK-on-disk text as mojibake (2026-09-15 gameinfo.txt).
+    if (!mf.binary)
+        mf.enc = detect_encoding(!mf.remoteB.empty() ? mf.remoteB : mf.localB);
     return true;
 }
 
@@ -531,9 +540,12 @@ static void classify_and_merge(MergeFile& mf)
         bool lCh = mf.hasLocal && mf.hashLocal != mf.hashBase;
         bool rCh = mf.hasRemote && mf.hashRemote != mf.hashBase;
         if (!mf.hasRemote && lCh) { mf.status = FS_CONFLICT; return; } // del-vs-change
-        if (!mf.hasLocal && rCh) { mf.status = FS_CONFLICT; return; } // change-vs-del
         if (!mf.hasRemote) { mf.status = FS_DELETED; return; } // remote-gone, local==base
-        if (!mf.hasLocal) { mf.status = FS_REMOTE; return; }   // local-gone, remote==base
+        if (!mf.hasLocal && rCh) { mf.status = FS_CONFLICT; return; } // change-vs-del
+        // IDE memory dropped the file while disk is untouched — the disk copy
+        // is a stale orphan (e.g. Trigger0.* left behind by an older save) and
+        // must be removed, not kept. 2026-09-15: this used to be FS_REMOTE.
+        if (!mf.hasLocal) { mf.status = FS_DELETE_LOCAL; return; }
         if (lCh && rCh && mf.hashLocal != mf.hashRemote)
             mf.status = FS_CONFLICT;
         else if (lCh)
@@ -554,14 +566,15 @@ static void classify_and_merge(MergeFile& mf)
     }
     if (!mf.hasRemote && mf.hasLocal)
     {
-        mf.status = (!mf.hasBase || mf.localB != mf.baseB) ? FS_CONFLICT
-                                                           : FS_DELETED;
+        if (!mf.hasBase) { mf.status = FS_LOCAL; return; } // brand-new in IDE
+        mf.status = (mf.localB != mf.baseB) ? FS_CONFLICT : FS_DELETED;
         return;
     }
     if (!mf.hasLocal && mf.hasRemote)
     {
-        mf.status = (!mf.hasBase || mf.remoteB != mf.baseB) ? FS_CONFLICT
-                                                            : FS_REMOTE;
+        if (!mf.hasBase) { mf.status = FS_REMOTE; return; } // brand-new on disk
+        if (mf.remoteB != mf.baseB) { mf.status = FS_CONFLICT; return; }
+        mf.status = FS_DELETE_LOCAL; // IDE dropped it, disk untouched → orphan
         return;
     }
     if (!mf.hasLocal && !mf.hasRemote)
@@ -578,7 +591,6 @@ static void classify_and_merge(MergeFile& mf)
     std::vector<std::string> b = diff3::split_lines(mf.baseB);
     std::vector<std::string> l = diff3::split_lines(mf.localB);
     std::vector<std::string> r = diff3::split_lines(mf.remoteB);
-    mf.enc = detect_encoding(mf.remoteB.empty() ? mf.localB : mf.remoteB);
     switch (tm)
     {
     case TM_KEYED_CSV4:
@@ -669,7 +681,7 @@ static DWORD wait_tool_with_pump(HANDLE proc)
 // ==== Apply ====
 
 static bool apply_decisions(const std::wstring& projDir, const fs::path& session,
-    std::vector<MergeFile>& files,
+    const fs::path& staging, std::vector<MergeFile>& files,
     const std::map<std::wstring, std::string>& decisions,
     const std::set<std::wstring>& edited)
 {
@@ -711,7 +723,7 @@ static bool apply_decisions(const std::wstring& projDir, const fs::path& session
         else if (action == "local")
         {
             if (!mf.hasLocal) wantDelete = true; // local side deleted it
-            else src = session / L"local" / mf.rel;
+            else src = staging / mf.rel;
         }
         else // auto
         {
@@ -720,10 +732,11 @@ static bool apply_decisions(const std::wstring& projDir, const fs::path& session
             case FS_UNCHANGED:
             case FS_REMOTE:
             case FS_DELETED: skip = true; break;
-            case FS_LOCAL: src = session / L"local" / mf.rel; break;
+            case FS_LOCAL: src = staging / mf.rel; break;
             case FS_AUTO: useResult = true; break;
+            case FS_DELETE_LOCAL: wantDelete = true; break;
             case FS_CONFLICT: action = "local";
-                if (mf.hasLocal) src = session / L"local" / mf.rel;
+                if (mf.hasLocal) src = staging / mf.rel;
                 else wantDelete = true;
                 break;
             }
@@ -766,7 +779,14 @@ bool merge_flow_run(const std::wstring& projDir)
     fs::path session(session_dir());
     std::error_code ec;
     fs::remove_all(session, ec);
-    fs::path staging = session / L"local";
+    // The .gm80 convention names the metadata file after the project FOLDER
+    // (gm80_save writes <target>\<leaf(target)>). A staging dir called
+    // "local" made the save emit its metadata as a file named "local", which
+    // then looked like a phantom conflict. Stage under the project's own leaf
+    // name so the layout matches the real tree byte for byte.
+    fs::path projLeaf = fs::path(projDir).filename();
+    if (projLeaf.empty()) projLeaf = L"local";
+    fs::path staging = session / projLeaf;
     fs::create_directories(staging, ec);
 
     gm_log("MergeFlow: run (session '%S')", session.c_str());
@@ -838,6 +858,12 @@ bool merge_flow_run(const std::wstring& projDir)
             anyRemote = true;
             continue;
         }
+        if (mf.status == FS_DELETE_LOCAL)
+        {
+            // IDE memory dropped the file (stale disk orphan) — keep it in
+            // the list so apply removes the disk copy.
+            anyRemote = true;
+        }
         if (mf.status == FS_LOCAL || mf.status == FS_AUTO) anyLocal = true;
         if (mf.status == FS_REMOTE) anyRemote = true;
         if (mf.status == FS_CONFLICT) anyConflict = true;
@@ -901,9 +927,12 @@ bool merge_flow_run(const std::wstring& projDir)
                 nlohmann::json e = nlohmann::json::object();
                 e["path"] = wide_to_utf8(mf.rel);
                 e["kind"] = mf.binary ? "binary" : "text";
+                // FS_DELETE_LOCAL advertises as "local": following the IDE
+                // side means the file is gone, so apply removes it from disk.
                 e["status"] = mf.status == FS_CONFLICT ? "conflict"
                     : mf.status == FS_AUTO             ? "auto"
                     : mf.status == FS_LOCAL            ? "local"
+                    : mf.status == FS_DELETE_LOCAL     ? "local"
                                                        : "remote";
                 e["encoding"] = mf.enc;
                 if (!mf.binary && !mf.dres.conflicts.empty())
@@ -1013,7 +1042,8 @@ bool merge_flow_run(const std::wstring& projDir)
     }
 
     // 4. apply + reload
-    bool appliedOk = apply_decisions(projDir, session, files, decisions, edited);
+    bool appliedOk = apply_decisions(projDir, session, staging, files, decisions,
+        edited);
     if (!appliedOk)
         gm_log("MergeFlow: apply had errors — reloading anyway (backups in session\\backup)");
     else
