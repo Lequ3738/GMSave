@@ -293,6 +293,7 @@ HWND gm80_prompt_owner()
 static bool g_flow_active = false;
 static bool g_close_flow = false; // closing editors, waiting for modal unwind
 static int g_close_modal_result = 1; // 1 = mrOk (apply) / 2 = mrCancel (discard)
+static int g_close_attempts = 0; // ticks spent in close_flow (stuck-editor abort)
 
 // The watcher watches g_watch_path (a .gm80 project folder). If the current
 // project (GM80_ProjectPath, 0x1EA27C — the metadata FILE inside that folder) no
@@ -328,17 +329,23 @@ static bool watcher_path_current()
 
 void project_watcher_tick()
 {
-    if (!g_pending_foreign) return;
+    // While closing editors the pending flag is already consumed — the
+    // follow-up ticks (confirm editors closed, then merge_flow_run) are driven
+    // by g_close_flow alone. 2026-09-15: gating on g_pending_foreign here left
+    // the flow dead after the prompt — editors closed, reload never ran.
+    if (!g_pending_foreign && !g_close_flow) return;
     if (g_flow_active) return; // re-entrant tick while our UI pumps messages
     if (!g_watching)
     {
         InterlockedExchange(&g_pending_foreign, 0);
+        g_close_flow = false;
         return;
     }
     // The project changed under us (File > New / switched project) → stop watching.
     if (!watcher_path_current())
     {
         project_watcher_stop();
+        g_close_flow = false;
         return;
     }
     // A modal that is not a resource editor (message box, file dialog,
@@ -368,6 +375,7 @@ void project_watcher_tick()
         }
         g_close_modal_result = (r == IDYES) ? 1 : 2; // mrOk / mrCancel
         g_close_flow = true;
+        g_close_attempts = 0;
         merge_flow_close_editors(g_close_modal_result);
         g_flow_active = false;
         return; // modal loops unwind over the next message cycles
@@ -377,6 +385,19 @@ void project_watcher_tick()
         if (merge_flow_count_editor_windows() > 0)
         {
             // Keep closing (stacked modals unwind one message-loop at a time).
+            if (++g_close_attempts > 5)
+            {
+                gm_log("Watcher: editors still open after %d ticks — aborting the flow",
+                    g_close_attempts);
+                g_close_flow = false;
+                g_flow_active = false;
+                MessageBoxW(gm80_prompt_owner(),
+                    L"Some resource editor windows could not be closed "
+                    L"automatically, so the reload was cancelled.\r\n"
+                    L"Close them and make an external change again to retry.",
+                    L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                return;
+            }
             merge_flow_close_editors(g_close_modal_result);
             g_flow_active = false;
             return;

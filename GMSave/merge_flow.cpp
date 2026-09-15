@@ -22,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "../Librarys/json.hpp" // nlohmann::json — manifest + decisions protocol
 namespace fs = std::filesystem;
 
 // ==== Small utilities ====
@@ -83,158 +84,6 @@ static std::wstring utf8_to_wide(const std::string& s)
     std::wstring w(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
-}
-
-// JSON string escape (also used for the tiny parser below).
-static std::string json_escape(const std::string& s)
-{
-    std::string o = "\"";
-    for (unsigned char c : s)
-    {
-        switch (c)
-        {
-        case '"': o += "\\\""; break;
-        case '\\': o += "\\\\"; break;
-        case '\n': o += "\\n"; break;
-        case '\r': o += "\\r"; break;
-        case '\t': o += "\\t"; break;
-        default:
-            if (c < 0x20)
-            {
-                char b[8];
-                snprintf(b, sizeof(b), "\\u%04x", c);
-                o += b;
-            }
-            else o += (char)c;
-        }
-    }
-    return o + "\"";
-}
-
-// Minimal JSON value (objects / arrays / strings / numbers / bools / null).
-struct JVal
-{
-    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } type = NUL;
-    bool b = false;
-    double num = 0;
-    std::string str;
-    std::vector<JVal> arr;
-    std::vector<std::pair<std::string, JVal>> obj;
-    const JVal* get(const char* k) const
-    {
-        for (auto& p : obj)
-            if (p.first == k) return &p.second;
-        return nullptr;
-    }
-};
-
-// Tiny recursive-descent JSON parser — enough for decisions.json (written by
-// JSON.stringify in the tool). Returns NUL on parse failure.
-static JVal json_parse(const std::string& text)
-{
-    size_t pos = 0;
-    std::function<JVal()> parse = [&]() -> JVal
-    {
-        JVal v;
-        while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' ||
-                                     text[pos] == '\n' || text[pos] == '\r'))
-            pos++;
-        if (pos >= text.size()) return v;
-        char c = text[pos];
-        if (c == '{')
-        {
-            v.type = JVal::OBJ;
-            pos++;
-            while (pos < text.size())
-            {
-                while (pos < text.size() && (text[pos] == ' ' || text[pos] == ',' ||
-                                             text[pos] == ':' || text[pos] == '\n' ||
-                                             text[pos] == '\r' || text[pos] == '\t'))
-                    pos++;
-                if (pos >= text.size() || text[pos] == '}') break;
-                JVal key = parse(); // string
-                while (pos < text.size() && (text[pos] == ' ' || text[pos] == ':'))
-                    pos++;
-                JVal val = parse();
-                v.obj.push_back({key.str, val});
-            }
-            pos++; // consume }
-        }
-        else if (c == '[')
-        {
-            v.type = JVal::ARR;
-            pos++;
-            while (pos < text.size())
-            {
-                while (pos < text.size() && (text[pos] == ' ' || text[pos] == ',' ||
-                                             text[pos] == '\n' || text[pos] == '\r' ||
-                                             text[pos] == '\t'))
-                    pos++;
-                if (pos >= text.size() || text[pos] == ']') break;
-                v.arr.push_back(parse());
-            }
-            pos++; // consume ]
-        }
-        else if (c == '"')
-        {
-            v.type = JVal::STR;
-            pos++;
-            while (pos < text.size() && text[pos] != '"')
-            {
-                if (text[pos] == '\\' && pos + 1 < text.size())
-                {
-                    char e = text[pos + 1];
-                    if (e == 'n') { v.str += '\n'; pos += 2; }
-                    else if (e == 'r') { v.str += '\r'; pos += 2; }
-                    else if (e == 't') { v.str += '\t'; pos += 2; }
-                    else if (e == 'b') { v.str += '\b'; pos += 2; }
-                    else if (e == 'f') { v.str += '\f'; pos += 2; }
-                    else if (e == 'u' && pos + 5 < text.size())
-                    {
-                        unsigned cp = (unsigned)strtoul(
-                            text.substr(pos + 2, 4).c_str(), nullptr, 16);
-                        // encode UTF-8
-                        if (cp < 0x80) v.str += (char)cp;
-                        else if (cp < 0x800)
-                        {
-                            v.str += (char)(0xC0 | (cp >> 6));
-                            v.str += (char)(0x80 | (cp & 0x3F));
-                        }
-                        else
-                        {
-                            v.str += (char)(0xE0 | (cp >> 12));
-                            v.str += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            v.str += (char)(0x80 | (cp & 0x3F));
-                        }
-                        pos += 6;
-                    }
-                    else { v.str += e; pos += 2; }
-                }
-                else v.str += text[pos++];
-            }
-            pos++; // consume "
-        }
-        else if (c == 't' || c == 'f')
-        {
-            v.type = JVal::BOOL;
-            v.b = (c == 't');
-            pos += (c == 't') ? 4 : 5; // true / false
-        }
-        else
-        {
-            v.type = JVal::NUM;
-            size_t end = pos;
-            while (end < text.size() && (isdigit((unsigned char)text[end]) ||
-                                         text[end] == '-' || text[end] == '+' ||
-                                         text[end] == '.' || text[end] == 'e' ||
-                                         text[end] == 'E'))
-                end++;
-            v.num = strtod(text.c_str() + pos, nullptr);
-            pos = end;
-        }
-        return v;
-    };
-    return parse();
 }
 
 // ==== File-kind classification ====
@@ -325,24 +174,25 @@ static void enumerate_tree(const fs::path& root, const std::wstring& skipTop,
     }
 }
 
-// manifest.json lines are tiny; hand-emit (stable format, read back by the
-// mini parser).
 static void write_snapshot_manifest(const fs::path& manifest,
     const std::vector<SnapEntry>& entries)
 {
-    std::string j = "{\"version\":1,\"files\":[";
-    bool first = true;
+    // Explicit object()/array() construction throughout — nested brace
+    // init-lists are an nlohmann deduction trap (crashed once in tests).
+    nlohmann::json j = nlohmann::json::object();
+    j["version"] = 1;
+    j["files"] = nlohmann::json::array();
     for (auto& e : entries)
     {
-        if (!first) j += ",";
-        first = false;
-        j += "{\"path\":" + json_escape(wide_to_utf8(e.rel)) +
-             ",\"hash\":\"" + hex64(e.hash) + "\",\"size\":" +
-             std::to_string(e.size) + ",\"mtime\":" + std::to_string(e.mtime) +
-             ",\"text\":" + (e.text ? "true" : "false") + "}";
+        nlohmann::json f = nlohmann::json::object();
+        f["path"] = wide_to_utf8(e.rel);
+        f["hash"] = hex64(e.hash);
+        f["size"] = e.size;
+        f["mtime"] = e.mtime;
+        f["text"] = e.text;
+        j["files"].push_back(std::move(f));
     }
-    j += "]}";
-    write_bytes(manifest, j);
+    write_bytes(manifest, j.dump());
 }
 
 static bool read_snapshot_manifest(const fs::path& manifest,
@@ -350,26 +200,34 @@ static bool read_snapshot_manifest(const fs::path& manifest,
 {
     std::string j = read_bytes(manifest);
     if (j.empty()) return false;
-    JVal v = json_parse(j);
-    if (v.type != JVal::OBJ) return false;
-    const JVal* files = v.get("files");
-    if (!files || files->type != JVal::ARR) return false;
-    for (auto& f : files->arr)
+    try
     {
-        SnapEntry e;
-        if (const JVal* p = f.get("path"))
+        nlohmann::json v = nlohmann::json::parse(j);
+        auto files = v.find("files");
+        if (files == v.end() || !files->is_array()) return false;
+        for (auto& f : *files)
         {
-            std::string r = p->str;
-            e.rel.assign(r.begin(), r.end());
+            SnapEntry e;
+            auto p = f.find("path");
+            if (p == f.end() || !p->is_string()) continue;
+            // rel came in as UTF-8 from our own manifest; decoding it per-byte
+            // would corrupt every non-ASCII (Chinese) path.
+            e.rel = utf8_to_wide(p->get<std::string>());
+            if (auto h = f.find("hash"); h != f.end() && h->is_string())
+                e.hash = (uint64_t)_strtoui64(h->get<std::string>().c_str(),
+                    nullptr, 16);
+            if (auto s = f.find("size"); s != f.end() && s->is_number())
+                e.size = s->get<unsigned long long>();
+            if (auto m = f.find("mtime"); m != f.end() && m->is_number())
+                e.mtime = m->get<long long>();
+            if (auto t = f.find("text"); t != f.end() && t->is_boolean())
+                e.text = t->get<bool>();
+            if (!e.rel.empty()) out.push_back(std::move(e));
         }
-        if (const JVal* h = f.get("hash"))
-        {
-            e.hash = (uint64_t)_strtoui64(h->str.c_str(), nullptr, 16);
-        }
-        if (const JVal* s = f.get("size")) e.size = (unsigned long long)s->num;
-        if (const JVal* m = f.get("mtime")) e.mtime = (long long)m->num;
-        if (const JVal* t = f.get("text")) e.text = t->b;
-        if (!e.rel.empty()) out.push_back(e);
+    }
+    catch (const std::exception&)
+    {
+        return false; // malformed manifest = missing snapshot
     }
     return !out.empty();
 }
@@ -913,6 +771,29 @@ bool merge_flow_run(const std::wstring& projDir)
 
     gm_log("MergeFlow: run (session '%S')", session.c_str());
 
+    // 0. The base snapshot must exist — without it the three-way comparison is
+    //    meaningless (every file would look like an all-sides rewrite with an
+    //    empty base). Missing snapshot = first run after an upgrade or a failed
+    //    snapshot write: re-baseline from the current disk and skip this round;
+    //    the next external change merges correctly.
+    {
+        std::vector<SnapEntry> probe;
+        if (!read_snapshot_manifest(
+                snapshot_dir_of(projDir) / L"manifest.json", probe))
+        {
+            gm_log("MergeFlow: no base snapshot — re-baselining from disk, "
+                   "skipping this round");
+            merge_flow_snapshot_refresh(projDir);
+            MessageBoxW(gm80_prompt_owner(),
+                L"No merge baseline was found for this project (first run "
+                L"after an upgrade), so this external change was not applied.\r\n"
+                L"The baseline has been created — make the external change "
+                L"again to merge it.",
+                L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+            return false;
+        }
+    }
+
     // 1. staging save (full tree of current IDE memory)
     if (!stage_save(staging.wstring()))
     {
@@ -947,7 +828,16 @@ bool merge_flow_run(const std::wstring& projDir)
         load_text_or_hash(mf, snapshot_dir_of(projDir) / L"root", staging,
             fs::path(projDir), snapBy.count(rel) ? snapBy[rel] : nullptr);
         classify_and_merge(mf);
-        if (mf.status == FS_UNCHANGED || mf.status == FS_DELETED) continue;
+        if (mf.status == FS_UNCHANGED) continue;
+        if (mf.status == FS_DELETED)
+        {
+            // Disk deletion with local untouched — nothing to write, but the
+            // IDE memory still holds the resource, so a reload IS required.
+            // 2026-09-15: skipping these entirely left a pure external delete
+            // with nothing to do (flag-wise), and the flow silently returned.
+            anyRemote = true;
+            continue;
+        }
         if (mf.status == FS_LOCAL || mf.status == FS_AUTO) anyLocal = true;
         if (mf.status == FS_REMOTE) anyRemote = true;
         if (mf.status == FS_CONFLICT) anyConflict = true;
@@ -1003,42 +893,35 @@ bool merge_flow_run(const std::wstring& projDir)
 
         // manifest.json for the tool
         {
-            std::string j = "{\"version\":1,\"files\":[";
-            bool first = true;
+            nlohmann::json j = nlohmann::json::object();
+            j["version"] = 1;
+            j["files"] = nlohmann::json::array();
             for (auto& mf : files)
             {
-                if (!first) j += ",";
-                first = false;
-                const char* st = mf.status == FS_CONFLICT ? "conflict"
-                    : mf.status == FS_AUTO               ? "auto"
-                    : mf.status == FS_LOCAL              ? "local"
-                                                         : "remote";
-                j += "{\"path\":" +
-                    json_escape(wide_to_utf8(mf.rel)) +
-                    ",\"kind\":\"" + (mf.binary ? "binary" : "text") +
-                    "\",\"status\":\"" + st + "\",\"encoding\":" +
-                    json_escape(mf.enc);
+                nlohmann::json e = nlohmann::json::object();
+                e["path"] = wide_to_utf8(mf.rel);
+                e["kind"] = mf.binary ? "binary" : "text";
+                e["status"] = mf.status == FS_CONFLICT ? "conflict"
+                    : mf.status == FS_AUTO             ? "auto"
+                    : mf.status == FS_LOCAL            ? "local"
+                                                       : "remote";
+                e["encoding"] = mf.enc;
                 if (!mf.binary && !mf.dres.conflicts.empty())
                 {
-                    j += ",\"conflicts\":[";
-                    bool f2 = true;
+                    nlohmann::json cs = nlohmann::json::array();
                     for (auto& c : mf.dres.conflicts)
                     {
-                        if (!f2) j += ",";
-                        f2 = false;
-                        j += "{\"b\":[" + std::to_string(c.baseStart) + "," +
-                             std::to_string(c.baseLen) + "],\"l\":[" +
-                             std::to_string(c.localStart) + "," +
-                             std::to_string(c.localLen) + "],\"r\":[" +
-                             std::to_string(c.remoteStart) + "," +
-                             std::to_string(c.remoteLen) + "]}";
+                        nlohmann::json cc = nlohmann::json::object();
+                        cc["b"] = nlohmann::json::array({c.baseStart, c.baseLen});
+                        cc["l"] = nlohmann::json::array({c.localStart, c.localLen});
+                        cc["r"] = nlohmann::json::array({c.remoteStart, c.remoteLen});
+                        cs.push_back(std::move(cc));
                     }
-                    j += "]";
+                    e["conflicts"] = std::move(cs);
                 }
-                j += "}";
+                j["files"].push_back(std::move(e));
             }
-            j += "]}";
-            write_bytes(session / L"manifest.json", j);
+            write_bytes(session / L"manifest.json", j.dump());
         }
 
         std::wstring tool;
@@ -1089,20 +972,35 @@ bool merge_flow_run(const std::wstring& projDir)
             bool applied = false;
             if (!dj.empty())
             {
-                JVal v = json_parse(dj);
-                if (const JVal* res = v.get("result"))
-                    if (res->str == "apply") applied = true;
-                if (applied && v.get("files"))
-                    for (auto& f : v.get("files")->arr)
-                    {
-                        if (const JVal* p = f.get("path"))
-                        {
-                            std::wstring w = utf8_to_wide(p->str);
-                            const JVal* a = f.get("action");
-                            if (a) decisions[w] = a->str;
-                            if (a && a->str == "edited") edited.insert(w);
-                        }
-                    }
+                try
+                {
+                    nlohmann::json v = nlohmann::json::parse(dj);
+                    if (auto res = v.find("result");
+                        res != v.end() && res->is_string() &&
+                        res->get<std::string>() == "apply")
+                        applied = true;
+                    if (applied)
+                        if (auto fl = v.find("files");
+                            fl != v.end() && fl->is_array())
+                            for (auto& f : *fl)
+                            {
+                                auto p = f.find("path");
+                                auto a = f.find("action");
+                                if (p == f.end() || !p->is_string()) continue;
+                                std::wstring w = utf8_to_wide(
+                                    p->get<std::string>());
+                                if (a != f.end() && a->is_string())
+                                {
+                                    decisions[w] = a->get<std::string>();
+                                    if (decisions[w] == "edited") edited.insert(w);
+                                }
+                            }
+                }
+                catch (const std::exception&)
+                {
+                    gm_log("MergeFlow: decisions.json parse failed");
+                    applied = false;
+                }
             }
             gm_log("MergeFlow: tool exit=%u applied=%d decisions=%zu (code %u)",
                 code, (int)applied, decisions.size(), code);

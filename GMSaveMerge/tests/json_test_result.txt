@@ -1,0 +1,6 @@
+start
+PASS dump keeps raw UTF-8 for Chinese paths
+PASS all three Chinese paths round-trip losslessly
+PASS decisions.json shape round-trips
+PASS malformed JSON throws (caught by caller)
+all JSON round-trip tests passed

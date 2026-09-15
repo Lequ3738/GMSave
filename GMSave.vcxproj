@@ -47,7 +47,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" /><ClInclude Include="pch.h" />
-    <ClInclude Include="Librarys\delphi.h" />
+    <ClInclude Include="Librarys\delphi.h" /><ClInclude Include="Librarys\json.hpp" />
     <ClInclude Include="GMSave\ide_hooks.h" /><ClInclude Include="GMSave\gm80_addresses.h" />
     <ClInclude Include="GMSave\gm80_load.h" /><ClInclude Include="GMSave\gm80_save.h" />
     <ClInclude Include="GMSave\gm_log.h" />
