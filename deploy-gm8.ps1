@@ -1,4 +1,4 @@
-# GMSave 部署脚本（需 GM8 关闭后，以管理员身份运行）
+﻿# GMSave 部署脚本（需 GM8 关闭后，以管理员身份运行）
 # 用法：右键"使用 PowerShell 运行"，或在管理员终端:
 #   powershell -ExecutionPolicy Bypass -File deploy-gm8.ps1          # Release 版
 #   powershell -ExecutionPolicy Bypass -File deploy-gm8.ps1 -Debug   # Debug 版（带 %TEMP%\GMSave.log 日志）

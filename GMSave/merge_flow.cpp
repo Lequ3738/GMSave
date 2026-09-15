@@ -652,10 +652,10 @@ static std::wstring session_dir()
 
 static bool find_merge_tool(std::wstring& out)
 {
-    // gmsave-merge.exe is the Cargo default artifact name (current). The
-    // CamelCase spelling is a legacy deployment name kept for compatibility;
-    // a stale copy of it must not shadow the newer build.
-    const wchar_t* names[] = {L"gmsave-merge.exe", L"GMSaveMerge.exe", nullptr};
+    // GMSaveMerge.exe is the deployed name (deploy-gm8.ps1 copies the Cargo
+    // artifact gmsave-merge.exe under this name). The lowercase artifact name
+    // stays as a fallback so a tree laid out by hand still works.
+    const wchar_t* names[] = {L"GMSaveMerge.exe", L"gmsave-merge.exe", nullptr};
     wchar_t exeDir[MAX_PATH], dllDir[MAX_PATH];
     GetModuleFileNameW(NULL, exeDir, MAX_PATH);
     wchar_t* s = wcsrchr(exeDir, L'\\');
