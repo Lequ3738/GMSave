@@ -35,6 +35,7 @@ interface FileState {
     // cached split lines
     localLines: string[];
     remoteLines: string[];
+    baseLines: string[];
 }
 
 let manifest: Manifest | null = null;
@@ -220,9 +221,11 @@ async function renderDetail() {
     // ---- text ----
     const localText = await invoke<string>('read_side', { side: 'local', rel: mf.path }).catch(() => '');
     const remoteText = await invoke<string>('read_side', { side: 'remote', rel: mf.path }).catch(() => '');
+    const baseText = await invoke<string>('read_side', { side: 'base', rel: mf.path }).catch(() => '');
     const st2 = states.get(mf.path)!;
     st2.localLines = splitLines(localText);
     st2.remoteLines = splitLines(remoteText);
+    st2.baseLines = splitLines(baseText);
 
     // side-by-side diff overview
     const wrap = document.createElement('div');
@@ -301,7 +304,7 @@ async function renderDetail() {
 
             const cols = document.createElement('div');
             cols.className = 'cc-cols';
-            const mkCol = (cls: 'local-col' | 'remote-col', label: string, lines: string[]) => {
+            const mkCol = (cls: 'local-col' | 'remote-col' | 'base-col', label: string, lines: string[]) => {
                 const col = document.createElement('div');
                 col.className = 'cc-col ' + cls;
                 const lab = document.createElement('div');
@@ -315,6 +318,7 @@ async function renderDetail() {
             };
             cols.append(
                 mkCol('local-col', '本地', st2.localLines.slice(c.l[0], c.l[0] + c.l[1])),
+                mkCol('base-col', '原始（基线）', st2.baseLines.slice(c.b[0], c.b[0] + c.b[1])),
                 mkCol('remote-col', '外部', st2.remoteLines.slice(c.r[0], c.r[0] + c.r[1])),
             );
             card.append(head2, cols);
@@ -411,6 +415,7 @@ document.getElementById('btn-cancel')!.addEventListener('click', () => finish(fa
             manual: null,
             localLines: [],
             remoteLines: [],
+            baseLines: [],
         });
     }
     const firstConflict = manifest.files.find((f) => f.status === 'conflict');

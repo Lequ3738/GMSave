@@ -44,14 +44,15 @@ const std::string& gm80_save_last_error()
 //   0 sprites, 1 sounds, 2 backgrounds, 3 paths, 4 scripts, 5 fonts,
 //   6 timelines, 7 objects, 8 rooms, 9 triggers
 static double g_last_save = 0.0;
+// Staging-save flag (see gm80_save.h): full output + frozen baseline.
+static bool g_force_full = false;
 static uint64_t g_last_names_hash[10] = {0};
 static bool g_has_last_names[10] = {false};
 // Included files have their own name-space (index.yyd); track it separately.
 static uint64_t g_last_data_hash = 0;
 static bool g_has_last_data = false;
 
-double gm80_save_last_save_time() { return g_last_save; }
-void gm80_save_set_last_save_time(double t) { g_last_save = t; }
+void gm80_save_set_force_full(bool on) { g_force_full = on; }
 
 // Delphi Now() → TDateTime in ST(0) (sub_40CF18). Same clock GM uses for the
 // per-resource timestamps, so ts[i] and LAST_SAVE are directly comparable.
@@ -1899,7 +1900,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     bool anyChanged = false;
     for (int t = 0; t < 10; t++)
     {
-        changed[t] = !g_has_last_names[t] || g_last_names_hash[t] != curHash[t];
+        changed[t] = g_force_full || !g_has_last_names[t] ||
+            g_last_names_hash[t] != curHash[t];
         if (changed[t]) anyChanged = true;
     }
     // Clock went backwards → timestamps untrustworthy → full save everything.
@@ -2146,7 +2148,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
             }
         }
         dataHash = names_hash(dataNames);
-        bool dataFull = !g_has_last_data || g_last_data_hash != dataHash;
+        bool dataFull = g_force_full || !g_has_last_data ||
+            g_last_data_hash != dataHash;
         gm_log("SmartSave: included files dataFull=%d (count=%u)", dataFull, ifCnt);
         if (ifCnt > 0 && ifCnt < 10000 && ifArr)
         {
@@ -2478,6 +2481,15 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     // Persist expanded folders so the tree survives project reopen. Written
     // AFTER the baseline update point above — a failed save skips it too.
     gm80_capture_tree_state(gm_base, path);
+    if (g_force_full)
+    {
+        // Staging save: the tree just written mirrors the IDE memory, but the
+        // disk (and a possibly-cancelled merge) must not advance the
+        // smart-save baseline — otherwise the user's next real Ctrl+S would
+        // consider their unsaved edits "already saved" and drop them.
+        gm_log("SmartSave: staging save — baseline frozen, no watermark/cleanup");
+        return true;
+    }
     g_last_save = now_t();
     for (int t = 0; t < 10; t++)
     {

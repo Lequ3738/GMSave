@@ -134,7 +134,8 @@ html, body {
 .cc-btns { margin-left: auto; display: flex; gap: 6px; }
 .cc-cols { display: flex; }
 .cc-col { flex: 1; min-width: 0; }
-.cc-col.local-col { border-right: 1px solid var(--border); }
+.cc-col.local-col, .cc-col.base-col { border-right: 1px solid var(--border); }
+.cc-col.base-col { flex: 0.8; background: #fafafa; }
 .cc-col .cc-label {
     padding: 3px 10px;
     font-size: 11px;
@@ -142,6 +143,7 @@ html, body {
     border-bottom: 1px solid var(--border);
 }
 .cc-col.local-col .cc-label { color: var(--local); background: #f0f6fc; }
+.cc-col.base-col .cc-label { color: var(--muted); background: #f2f2f2; }
 .cc-col.remote-col .cc-label { color: var(--remote); background: #fdf6ee; }
 .cc-col pre {
     margin: 0;

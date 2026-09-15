@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 static SESSION: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -159,18 +159,20 @@ pub fn run() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     tauri::Builder::default()
-        .setup(move |app| {
+        .setup(move |_app| {
             if let Some(mp) = &manifest_path {
                 if let Some(parent) = Path::new(mp).parent() {
                     *SESSION.lock().unwrap() = Some(parent.to_path_buf());
                 }
             }
-            // Debug aid: open devtools so console errors are visible when
-            // driving the UI externally. Harmless in normal use.
-            #[cfg(feature = "devtools")]
+            // Debug aid: auto-open devtools in DEBUG builds only, so console
+            // errors are visible while driving the UI externally. Release
+            // builds keep the devtools feature enabled (press F12 — WebView2
+            // opens it on demand) but start clean.
+            #[cfg(all(feature = "devtools", debug_assertions))]
             {
                 use tauri::Manager;
-                if let Some(w) = app.get_webview_window("main") {
+                if let Some(w) = _app.get_webview_window("main") {
                     w.open_devtools();
                 }
             }

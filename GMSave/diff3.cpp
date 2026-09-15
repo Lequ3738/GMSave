@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "diff3.h"
+#include <algorithm>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -95,89 +96,206 @@ static std::vector<std::pair<size_t, size_t>> patience_anchors(
     return out;
 }
 
-// ==== Line-level three-way merge ====
+// ==== Line-level three-way merge (xdiff/xmerge model) ====
+//
+// Mirrors git: diff base→local and base→remote independently (two-way
+// patience diff), then merge the two hunk lists over base coordinates.
+// Hunks whose base ranges touch or overlap form one conflict group; disjoint
+// hunks apply cleanly. Each conflict group is refined by re-diffing the two
+// side projections so shared lines leave the conflict block (git's
+// xdl_refine_conflicts / zdiff3 behaviour).
 
-static bool seg_eq(const std::vector<std::string>& a, size_t a0, size_t a1,
-    const std::vector<std::string>& b, size_t b0, size_t b1)
+struct Hunk
 {
-    if (a1 - a0 != b1 - b0) return false;
-    for (size_t i = 0; i < a1 - a0; i++)
-        if (a[a0 + i] != b[b0 + i]) return false;
-    return true;
+    size_t b0, b1; // base range [b0,b1) being replaced
+    size_t s0, s1; // side range [s0,s1) replacing it
+};
+
+struct SideDiff
+{
+    std::vector<Hunk> hunks;                        // sorted by b0, disjoint
+    std::vector<std::pair<size_t, size_t>> anchors; // (baseIdx, sideIdx) matches
+};
+
+static SideDiff diff_side(const std::vector<std::string>& base,
+    const std::vector<std::string>& side)
+{
+    SideDiff d;
+    d.anchors = patience_anchors(base, side);
+    size_t bPrev = 0, sPrev = 0;
+    auto flush = [&](size_t bEnd, size_t sEnd)
+    {
+        // Peel equal prefix/suffix rows so matched lines never join a hunk.
+        size_t b0 = bPrev, s0 = sPrev;
+        while (b0 < bEnd && s0 < sEnd && base[b0] == side[s0])
+        {
+            b0++;
+            s0++;
+        }
+        size_t b1 = bEnd, s1 = sEnd;
+        while (b1 > b0 && s1 > s0 && base[b1 - 1] == side[s1 - 1])
+        {
+            b1--;
+            s1--;
+        }
+        if (b1 > b0 || s1 > s0) d.hunks.push_back({b0, b1, s0, s1});
+    };
+    for (auto& a : d.anchors)
+    {
+        flush(a.first, a.second);
+        bPrev = a.first + 1;
+        sPrev = a.second + 1;
+    }
+    flush(base.size(), side.size());
+    return d;
+}
+
+// Position of base line b in the side, walking the un-hunked alignment
+// (nearest anchor at or before b, plus the offset).
+static size_t align_pos(const SideDiff& d, size_t b)
+{
+    size_t lo = 0, hi = d.anchors.size();
+    while (lo < hi)
+    {
+        size_t mid = (lo + hi) / 2;
+        if (d.anchors[mid].first <= b) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return b; // before the first anchor the head is 1:1
+    auto& a = d.anchors[lo - 1];
+    return a.second + (b - a.first);
+}
+
+// Apply one side's hunks to base range [g0,g1). Returns the projected rows
+// and their index range inside that side.
+static void project_side(const std::vector<std::string>& base,
+    const std::vector<std::string>& side, const SideDiff& d,
+    const std::vector<Hunk>& group, size_t g0, size_t g1,
+    std::vector<std::string>& out, size_t& sStart, size_t& sLen)
+{
+    size_t s = align_pos(d, g0);
+    sStart = s;
+    size_t cur = g0;
+    for (auto& h : group)
+    {
+        while (cur < h.b0)
+        {
+            out.push_back(base[cur]);
+            cur++;
+            s++;
+        }
+        for (size_t k = h.s0; k < h.s1; k++) out.push_back(side[k]);
+        s = h.s1;
+        cur = h.b1;
+    }
+    while (cur < g1)
+    {
+        out.push_back(base[cur]);
+        cur++;
+        s++;
+    }
+    sLen = s - sStart;
 }
 
 Result merge_lines(const std::vector<std::string>& base,
     const std::vector<std::string>& local, const std::vector<std::string>& remote)
 {
-    auto al = patience_anchors(base, local);
-    auto ar = patience_anchors(base, remote);
-
-    // base index -> side index when anchored (line matched) on that side
-    std::unordered_map<size_t, size_t> ml, mr;
-    for (auto& p : al) ml[p.first] = p.second;
-    for (auto& p : ar) mr[p.first] = p.second;
-
+    SideDiff dl = diff_side(base, local);
+    SideDiff dr = diff_side(base, remote);
     Result res;
-    size_t bi = 0, li = 0, ri = 0;
-    size_t nB = base.size(), nL = local.size(), nR = remote.size();
 
-    auto emitConflict = [&](size_t b0, size_t b1, size_t l0, size_t l1, size_t r0,
-                            size_t r1)
+    size_t i = 0, j = 0, bPos = 0;
+    while (i < dl.hunks.size() || j < dr.hunks.size())
     {
-        res.conflicts.push_back({b0, b1 - b0, l0, l1 - l0, r0, r1 - r0});
-        res.lines.push_back("<<<<<<< local");
-        for (size_t i = l0; i < l1; i++) res.lines.push_back(local[i]);
-        res.lines.push_back("=======");
-        for (size_t i = r0; i < r1; i++) res.lines.push_back(remote[i]);
-        res.lines.push_back(">>>>>>> remote");
-    };
-
-    // Walk stable lines: base positions anchored in BOTH sides.
-    while (bi < nB || li < nL || ri < nR)
-    {
-        // Advance to the next base line stable in both sides.
-        size_t sbi = bi, sli = li, sri = ri;
-        bool found = false;
-        while (sbi < nB)
+        // Start a group with whichever hunk comes first in base order.
+        bool takeL = (j >= dr.hunks.size()) ||
+            (i < dl.hunks.size() && dl.hunks[i].b0 <= dr.hunks[j].b0);
+        size_t g0, g1;
+        std::vector<Hunk> gl, gr;
+        if (takeL)
         {
-            auto fl = ml.find(sbi);
-            auto fr = mr.find(sbi);
-            if (fl != ml.end() && fr != mr.end())
+            g0 = dl.hunks[i].b0;
+            g1 = dl.hunks[i].b1;
+            gl.push_back(dl.hunks[i]);
+            i++;
+        }
+        else
+        {
+            g0 = dr.hunks[j].b0;
+            g1 = dr.hunks[j].b1;
+            gr.push_back(dr.hunks[j]);
+            j++;
+        }
+        // Absorb every hunk whose base range touches the group (xmerge uses
+        // strict inequality: touching ranges are ONE conflict, not two clean
+        // edits — verified against `git merge-file`).
+        for (;;)
+        {
+            bool grew = false;
+            while (i < dl.hunks.size() && dl.hunks[i].b0 <= g1)
             {
-                sli = fl->second;
-                sri = fr->second;
-                found = true;
-                break;
+                g1 = std::max(g1, dl.hunks[i].b1);
+                gl.push_back(dl.hunks[i]);
+                i++;
+                grew = true;
             }
-            sbi++;
+            while (j < dr.hunks.size() && dr.hunks[j].b0 <= g1)
+            {
+                g1 = std::max(g1, dr.hunks[j].b1);
+                gr.push_back(dr.hunks[j]);
+                j++;
+                grew = true;
+            }
+            if (!grew) break;
         }
-        size_t nextB = found ? sbi : nB;
-        size_t nextL = found ? sli : nL;
-        size_t nextR = found ? sri : nR;
 
-        // Region [cur, next) differs somewhere.
-        if (bi < nextB || li < nextL || ri < nextR)
+        // Stable rows before the group.
+        for (size_t b = bPos; b < g0; b++) res.lines.push_back(base[b]);
+
+        if (gr.empty() || gl.empty())
         {
-            bool lEqB = seg_eq(local, li, nextL, base, bi, nextB);
-            bool rEqB = seg_eq(remote, ri, nextR, base, bi, nextB);
-            bool lEqR = seg_eq(local, li, nextL, remote, ri, nextR);
-            if (lEqR)
-                for (size_t i = li; i < nextL; i++) res.lines.push_back(local[i]);
-            else if (rEqB)
-                for (size_t i = li; i < nextL; i++) res.lines.push_back(local[i]);
-            else if (lEqB)
-                for (size_t i = ri; i < nextR; i++) res.lines.push_back(remote[i]);
-            else
-                emitConflict(bi, nextB, li, nextL, ri, nextR);
+            // Only one side touched this region → clean, apply that side.
+            bool useLocal = gr.empty();
+            size_t s0, sl;
+            project_side(base, useLocal ? local : remote,
+                useLocal ? dl : dr, useLocal ? gl : gr, g0, g1, res.lines, s0,
+                sl);
         }
-
-        if (!found) break;
-        // Emit the stable line itself.
-        res.lines.push_back(base[nextB]);
-        bi = nextB + 1;
-        li = nextL + 1;
-        ri = nextR + 1;
+        else
+        {
+            // Both sides touched the region → conflict group.
+            std::vector<std::string> oursP, theirsP;
+            size_t l0, ll, r0, rl;
+            project_side(base, local, dl, gl, g0, g1, oursP, l0, ll);
+            project_side(base, remote, dr, gr, g0, g1, theirsP, r0, rl);
+            // Refine: re-diff the projections; shared rows leave the conflict
+            // block(s). Sub-block records share the group's base range (the
+            // tool renders the exact local/remote ranges per block).
+            auto ranchors = patience_anchors(oursP, theirsP);
+            size_t p = 0, q = 0;
+            auto flushSub = [&](size_t pEnd, size_t qEnd)
+            {
+                if (pEnd == p && qEnd == q) return;
+                res.conflicts.push_back(
+                    {g0, g1 - g0, l0 + p, pEnd - p, r0 + q, qEnd - q});
+                res.lines.push_back("<<<<<<< local");
+                for (size_t k = p; k < pEnd; k++) res.lines.push_back(oursP[k]);
+                res.lines.push_back("=======");
+                for (size_t k = q; k < qEnd; k++) res.lines.push_back(theirsP[k]);
+                res.lines.push_back(">>>>>>> remote");
+            };
+            for (auto& a : ranchors)
+            {
+                flushSub(a.first, a.second);
+                res.lines.push_back(oursP[a.first]); // == theirsP[a.second]
+                p = a.first + 1;
+                q = a.second + 1;
+            }
+            flushSub(oursP.size(), theirsP.size());
+        }
+        bPos = g1;
     }
+    for (size_t b = bPos; b < base.size(); b++) res.lines.push_back(base[b]);
     return res;
 }
 

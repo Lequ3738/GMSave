@@ -448,13 +448,15 @@ static bool stage_save_seh(void* base, const std::wstring& path)
 static bool stage_save(const std::wstring& stagingDir)
 {
     void* base = GetModuleHandle(NULL);
-    // Defeat the smart-skip: with LAST_SAVE = 0 every resource timestamp is
-    // "newer", so the staging tree is COMPLETE. Restore afterwards so the
-    // next real save still skips untouched resources.
-    double saved = gm80_save_last_save_time();
-    gm80_save_set_last_save_time(0.0);
+    // Force-full: write every type regardless of the smart-skip baseline and
+    // freeze that baseline. (Zeroing LAST_SAVE — the previous trick — stopped
+    // working after a reload: per-resource timestamps come back as 0 while
+    // the name-hash baseline survives, so every type was skipped and the
+    // staging tree shipped as a stub whose missing files then read as
+    // IDE-side deletions — 2026-09-15, nearly deleted 7 real files.)
+    gm80_save_set_force_full(true);
     bool ok = stage_save_seh(base, stagingDir);
-    gm80_save_set_last_save_time(saved);
+    gm80_save_set_force_full(false);
     if (!ok) gm_log("MergeFlow: staging save FAILED (%s)", gm80_save_last_error().c_str());
     return ok;
 }
@@ -628,8 +630,10 @@ static std::wstring session_dir()
 
 static bool find_merge_tool(std::wstring& out)
 {
-    // Tauri names the binary after the Cargo package; accept both spellings.
-    const wchar_t* names[] = {L"GMSaveMerge.exe", L"gmsave-merge.exe", nullptr};
+    // gmsave-merge.exe is the Cargo default artifact name (current). The
+    // CamelCase spelling is a legacy deployment name kept for compatibility;
+    // a stale copy of it must not shadow the newer build.
+    const wchar_t* names[] = {L"gmsave-merge.exe", L"GMSaveMerge.exe", nullptr};
     wchar_t exeDir[MAX_PATH], dllDir[MAX_PATH];
     GetModuleFileNameW(NULL, exeDir, MAX_PATH);
     wchar_t* s = wcsrchr(exeDir, L'\\');
@@ -833,6 +837,26 @@ bool merge_flow_run(const std::wstring& projDir)
     std::vector<std::wstring> localRels, remoteRels;
     enumerate_tree(staging, L"cache", localRels);
     enumerate_tree(fs::path(projDir), L"cache", remoteRels);
+
+    // Guard: a staging tree far smaller than the snapshot means the staging
+    // save skipped types anyway (a future smart-skip regression) — applying
+    // that would read every missing file as an IDE-side deletion. Abort
+    // instead; nothing has been written to the project yet.
+    if (snap.size() > 8 && localRels.size() * 2 < snap.size())
+    {
+        gm_log("MergeFlow: staging tree suspiciously small (%zu files vs %zu "
+               "snapshotted) — aborting, nothing applied",
+            localRels.size(), snap.size());
+        MessageBoxW(gm80_prompt_owner(),
+            L"The plugin's internal snapshot of the project state came out "
+            L"incomplete (plugin bug).\r\n"
+            L"The merge was cancelled and NOTHING was changed.\r\n"
+            L"Saving the project once and retrying the external change "
+            L"usually clears this.",
+            L"Game Maker 8.0", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        return false;
+    }
+
     std::set<std::wstring> all;
     for (auto& r : localRels) all.insert(r);
     for (auto& r : remoteRels) all.insert(r);

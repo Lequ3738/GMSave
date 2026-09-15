@@ -183,6 +183,77 @@ static void test_keyed_gbk_key()
     CHECK(key_instances_csv4(line) == "abcd1234", "csv4 key on gbk line");
 }
 
+static void test_xmerge_adjacent_insert_vs_change()
+{
+    // git case A (verified with `git merge-file`): local appends after line 1,
+    // remote changes line 1. The hunks' base ranges touch → ONE conflict, not
+    // a clean merge and not a whole-file rewrite.
+    auto b = V({"// test test test ss"});
+    auto l = V({"// test test test ss", "// ddd"});
+    auto r = V({"// test test test ssssttt"});
+    auto res = merge_lines(b, l, r);
+    CHECK(!res.clean(), "adjacent insert vs change conflicts (git case A)");
+    CHECK(res.conflicts.size() == 1, "single conflict block");
+    CHECK(res.conflicts[0].baseLen == 1, "base range is the one line");
+    CHECK(res.conflicts[0].localLen == 2, "local projection keeps both rows");
+    CHECK(res.conflicts[0].remoteLen == 1, "remote projection one row");
+}
+
+static void test_xmerge_disjoint_far_apart()
+{
+    // git case B: changes far apart merge clean, both taken.
+    auto b = V({"1", "2", "3", "4", "5", "6", "7", "8", "9"});
+    auto l = V({"1x", "2", "3", "4", "5", "6", "7", "8", "9"});
+    auto r = V({"1", "2", "3", "4", "5", "6", "7", "8", "9x"});
+    auto res = merge_lines(b, l, r);
+    CHECK(res.clean(), "far-apart edits clean (git case B)");
+    CHECK(res.lines.front() == "1x" && res.lines.back() == "9x", "both taken");
+}
+
+static void test_xmerge_refine_common_rows()
+{
+    // git case G: both append "same" + a distinct row; refine lifts "same"
+    // out of the conflict so only the distinct rows block.
+    auto b = V({"x"});
+    auto l = V({"x", "same", "ours"});
+    auto r = V({"x", "same", "theirs"});
+    auto res = merge_lines(b, l, r);
+    CHECK(!res.clean(), "conflict present (git case G)");
+    CHECK(res.conflicts.size() == 1, "one refined block");
+    CHECK(res.conflicts[0].localLen == 1 && res.conflicts[0].remoteLen == 1,
+        "block shrunk to the distinct rows");
+    // "same" appears exactly once, outside markers.
+    int same = 0;
+    for (auto& s : res.lines)
+        if (s == "same") same++;
+    CHECK(same == 1, "shared row emitted once as merged text");
+}
+
+static void test_xmerge_delete_vs_change()
+{
+    // git case F: local deletes line 2, remote changes line 2 → conflict with
+    // an empty local block.
+    auto b = V({"1", "2", "3"});
+    auto l = V({"1", "3"});
+    auto r = V({"1", "2x", "3"});
+    auto res = merge_lines(b, l, r);
+    CHECK(!res.clean(), "delete vs change conflicts (git case F)");
+    CHECK(res.conflicts.size() == 1 && res.conflicts[0].localLen == 0,
+        "deleted side projects empty");
+    CHECK(res.conflicts[0].remoteLen == 1, "changed side one row");
+}
+
+static void test_xmerge_both_same_change()
+{
+    // Both sides make the identical change → clean, no conflict.
+    auto b = V({"a", "b", "c"});
+    auto l = V({"a", "B2", "c"});
+    auto r = V({"a", "B2", "c"});
+    auto res = merge_lines(b, l, r);
+    CHECK(res.clean(), "identical changes merge clean");
+    CHECK(res.lines == l, "changed line once");
+}
+
 int main()
 {
     test_split_join();
@@ -190,6 +261,11 @@ int main()
     test_merge_conflict();
     test_merge_one_side();
     test_merge_insert_both();
+    test_xmerge_adjacent_insert_vs_change();
+    test_xmerge_disjoint_far_apart();
+    test_xmerge_refine_common_rows();
+    test_xmerge_delete_vs_change();
+    test_xmerge_both_same_change();
     test_keyed_instances();
     test_keyed_same_instance_conflict();
     test_keyed_add_delete();

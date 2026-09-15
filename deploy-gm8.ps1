@@ -20,7 +20,7 @@ try {
     Write-Host "复制 GMSave.dll 失败（需要管理员权限？）：$_" -ForegroundColor Red
     exit 1
 }
-Copy-Item "$src\GMSaveMerge\src-tauri\target\release\gmsave-merge.exe" "$gmDir\GMSaveMerge.exe" -Force
+Copy-Item "$src\GMSaveMerge\src-tauri\target\release\gmsave-merge.exe" "$gmDir\gmsave-merge.exe" -Force
 if ($Debug) {
     Write-Host "已部署 DEBUG 版 GMSave.dll + GMSaveMerge.exe -> $gmDir" -ForegroundColor Green
     Write-Host "日志输出: %TEMP%\GMSave.log" -ForegroundColor Cyan
