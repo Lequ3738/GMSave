@@ -363,18 +363,40 @@ bool merge_flow_non_editor_modal_open()
     if (!b) return false;
     void* screen = *(void**)(b + ADDR_SCREEN);
     if (!screen || IsBadReadPtr(screen, 0x90)) return false;
-    uint32_t focused = *(uint32_t*)((uint8_t*)screen + OFF_SCREEN_FFOCUSEDFORM);
-    if (!focused || focused < 0x10000) return false;
-    // In any of the forms arrays → it IS a resource editor (modal one).
-    for (auto& f : kFormsArrays)
+    // Decide by the MODAL STACK (FSaveFocusedList, TList — ShowModal inserts
+    // itself at index 0), NOT by FFocusedForm: the main form itself occupies
+    // FFocusedForm whenever no editor is open, which made every tick defer and
+    // silently killed the no-editor reload path (2026-09-15). The modal stack
+    // only ever contains forms that are actually inside ShowModal.
+    uint32_t list = *(uint32_t*)((uint8_t*)screen + OFF_SCREEN_FSAVEFOCUSEDLIST);
+    if (!list || list < 0x10000 || IsBadReadPtr((void*)list, 0x10)) return false;
+    uint32_t count = *(uint32_t*)((uint8_t*)list + OFF_TLIST_FCOUNT);
+    if (count == 0 || count > 256) return false;
+    uint32_t items = *(uint32_t*)(list + 4); // TList.FItems (pointer array)
+    if (!items || items < 0x10000 ||
+        IsBadReadPtr((void*)items, count * sizeof(uint32_t)))
+        return false;
+    // Proceed only when EVERY open modal is a resource editor (present in the
+    // forms arrays — those get closed via the prompt flow). Anything else
+    // (Global Game Settings, a message box, a file dialog) defers the tick.
+    for (uint32_t k = 0; k < count; k++)
     {
-        uint32_t cnt = *(uint32_t*)(b + f.cnt);
-        uint32_t* arr = *(uint32_t**)(b + f.arr);
-        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000) continue;
-        for (uint32_t i = 0; i < cnt; i++)
-            if (arr[i] == focused) return false;
+        uint32_t form = ((uint32_t*)items)[k];
+        if (!form || form < 0x10000 || form == 0xFFFFFFFF) return true;
+        bool isEditor = false;
+        for (auto& f : kFormsArrays)
+        {
+            uint32_t cnt = *(uint32_t*)(b + f.cnt);
+            uint32_t* arr = *(uint32_t**)(b + f.arr);
+            if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000)
+                continue;
+            for (uint32_t i = 0; i < cnt; i++)
+                if (arr[i] == form) { isEditor = true; break; }
+            if (isEditor) break;
+        }
+        if (!isEditor) return true;
     }
-    return true;
+    return false;
 }
 
 // Free a Delphi object through GM's TObject.Free (sub_404590: virtual
@@ -896,10 +918,13 @@ bool merge_flow_run(const std::wstring& projDir)
     gm_log("MergeFlow: %zu changed files (conflicts=%d local=%d remote=%d)",
         files.size(), (int)anyConflict, (int)anyLocal, (int)anyRemote);
 
-    if (!anyRemote && !anyConflict)
+    if (files.empty() && !anyRemote)
     {
         // Nothing foreign after all (e.g. only mtimes moved): nothing to apply
         // and no reason to reload — the user's editor state stays put.
+        // NOTE: FS_AUTO (clean three-way merge) lands IN files, so a
+        // non-touching local+external edit pair applies and reloads here —
+        // gating on anyRemote alone used to skip it entirely (2026-09-15).
         gm_log("MergeFlow: no external difference found — nothing to do");
         return false;
     }
