@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GMSave — 合并外部更改</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div id="title">外部更改 — 三方合并</div>
+        <div id="summary"></div>
+      </header>
+      <div id="main">
+        <nav id="filelist"></nav>
+        <section id="detail">
+          <div id="placeholder">选择左侧文件查看差异</div>
+        </section>
+      </div>
+      <footer id="bar">
+        <div id="hint">所有冲突默认保留<b>本地（IDE）</b>版本；逐个冲突可改选外部版本，或手动编辑最终内容。</div>
+        <div id="actions">
+          <button id="btn-cancel">取消</button>
+          <button id="btn-apply" class="primary">确认并应用（重载项目）</button>
+        </div>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

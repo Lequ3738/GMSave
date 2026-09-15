@@ -1,0 +1,25 @@
+{
+    "name": "gmsave-merge",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview",
+        "tauri": "set PATH=%USERPROFILE%\\.cargo\\bin;%PATH% && set RUSTFLAGS=-C control-flow-guard=off && tauri"
+    },
+    "dependencies": {
+        "@codemirror/language": "^6.12.3",
+        "@codemirror/merge": "^6.11.0",
+        "@codemirror/state": "^6.6.0",
+        "@codemirror/view": "^6.40.0",
+        "@lezer/highlight": "^1.2.3",
+        "@tauri-apps/api": "^2"
+    },
+    "devDependencies": {
+        "@tauri-apps/cli": "^2",
+        "typescript": "^5.7.3",
+        "vite": "^8.0.3"
+    }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "gmsave-merge"
+version = "1.0.0"
+description = "Three-way merge tool for GMSave (.gm80 external-change conflicts)"
+edition = "2021"
+
+[lib]
+name = "gmsave_merge_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["devtools"]
+devtools = ["tauri/devtools"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+encoding_rs = "0.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
