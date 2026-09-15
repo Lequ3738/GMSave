@@ -12,6 +12,7 @@
 #include "project_watcher.h"
 #include "gm80_addresses.h"
 #include "gm80_save.h"
+#include "merge_flow.h"
 #include "gm_log.h"
 #include <windows.h>
 #include <string>
@@ -233,64 +234,10 @@ bool project_watcher_is_running()
 
 void project_watcher_ensure_timer_window(); // defined below (lazy, main thread)
 
-// ==== Safety gate ====
-// 1) No resource editor form may be open. GM stores one editor form instance per
-//    resource in the resource "forms" arrays (arr[1] of each AssetList — verified:
-//    rooms 0x1E9298 holds the room editor instance, sub_554354). If any slot is
-//    non-null, an editor is open (even if not focused) → defer.
-// 2) No modal dialog may be focused. Delphi forms register their class name as the
-//    Win32 window class at runtime (no static string ref in the binary), so
-//    FindWindow("TMainForm") locates the main window; a focused modal/editor has a
-//    different foreground window → defer.
-static bool editor_form_open()
-{
-    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
-    if (!b) return false;
-    const struct
-    {
-        uint32_t arr;
-        uint32_t cnt;
-    } F[] = {
-        {0x1E910C, 0x1E911C}, // sprites
-        {0x1E927C, 0x1E9288}, // sounds
-        {0x1E9098, 0x1E90A8}, // backgrounds
-        {0x1E92B0, 0x1E92BC}, // paths
-        {0x1E92D8, 0x1E92E4}, // scripts
-        {0x1E92C4, 0x1E92D0}, // fonts
-        {0x1E9304, 0x1E9310}, // timelines
-        {0x1E9358, 0x1E9364}, // objects
-        {0x1E9298, 0x1E92A4}, // rooms
-    };
-    for (auto& f : F)
-    {
-        uint32_t cnt = *(uint32_t*)(b + f.cnt);
-        uint32_t* arr = *(uint32_t**)(b + f.arr);
-        // Guard the 0xFFFFFFFF "uninitialized dynamic array" sentinel too.
-        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000) continue;
-        for (uint32_t i = 0; i < cnt; i++)
-            if (arr[i]) return true;
-    }
-    return false;
-}
-
-static bool safe_to_act()
-{
-    if (editor_form_open()) return false;
-    HWND main = FindWindowW(L"TMainForm", NULL);
-    if (!main) return false;
-    return GetForegroundWindow() == main;
-}
-
-// ==== "User has unsaved changes" via the 16 updated/dirty flags ====
-static bool user_has_unsaved_changes()
-{
-    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
-    if (!b) return false;
-    static const uint32_t flags[] = ADDR_DIRTY_FLAGS;
-    for (uint32_t f : flags)
-        if (*(uint8_t*)(b + f)) return true;
-    return false;
-}
+// (The old safety gate — "main window foreground + no editor form open" — was
+// replaced by the merge_flow model: non-editor modals defer the tick, editor
+// windows are closed through merge_flow_close_editors after one prompt, and
+// everything else runs regardless of focus. See merge_flow.h.)
 
 // ==== Reload ====
 // GM80_LoadRecentProject (RVA 0x19B860) with the current project path: it checks
@@ -298,7 +245,7 @@ static bool user_has_unsaved_changes()
 // 0x59B91B routes .gm80 → gm80_load_project, then reloads action libraries.
 // Our load hook re-starts the watcher (project_watcher_start) after a successful
 // load, so no explicit re-arm is needed here.
-static void do_reload()
+void project_watcher_reload_project()
 {
     project_watcher_stop();
     project_watcher_mark_saved();
@@ -341,31 +288,11 @@ HWND gm80_prompt_owner()
     return main;
 }
 
-static void project_watcher_act()
-{
-    if (user_has_unsaved_changes())
-    {
-        gm_log("Watcher: unsaved changes present → prompting");
-        int r = MessageBoxW(gm80_prompt_owner(),
-            L"Project files have been modified outside Game Maker. Reload project? "
-            L"Unsaved changes will be lost.\r\n"
-            L"If you click \"No\", saving will overwrite any foreign changes.",
-            L"Game Maker 8.0", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
-        if (r == IDYES)
-        {
-            do_reload();
-        }
-        else
-        {
-            gm_log("Watcher: user chose No — keeping unsaved changes");
-        }
-    }
-    else
-    {
-        gm_log("Watcher: no unsaved changes → silent reload");
-        do_reload();
-    }
-}
+// ==== Flow state (main thread only; g_flow_active also blocks re-entrant
+// ticks while our dialogs / the merge tool pump messages) ====
+static bool g_flow_active = false;
+static bool g_close_flow = false; // closing editors, waiting for modal unwind
+static int g_close_modal_result = 1; // 1 = mrOk (apply) / 2 = mrCancel (discard)
 
 // The watcher watches g_watch_path (a .gm80 project folder). If the current
 // project (GM80_ProjectPath, 0x1EA27C — the metadata FILE inside that folder) no
@@ -402,6 +329,7 @@ static bool watcher_path_current()
 void project_watcher_tick()
 {
     if (!g_pending_foreign) return;
+    if (g_flow_active) return; // re-entrant tick while our UI pumps messages
     if (!g_watching)
     {
         InterlockedExchange(&g_pending_foreign, 0);
@@ -413,9 +341,51 @@ void project_watcher_tick()
         project_watcher_stop();
         return;
     }
-    if (!safe_to_act()) return; // defer: modal focused or an editor is open
+    // A modal that is not a resource editor (message box, file dialog,
+    // preferences…) — defer politely; the pending flag stays set.
+    if (merge_flow_non_editor_modal_open()) return;
+
+    // Claim the event from here on.
+    g_flow_active = true;
     InterlockedExchange(&g_pending_foreign, 0);
-    project_watcher_act();
+
+    // Editor windows open → ask once how to treat their unapplied content.
+    if (!g_close_flow && merge_flow_count_editor_windows() > 0)
+    {
+        int r = MessageBoxW(gm80_prompt_owner(),
+            L"Project files have been modified outside Game Maker and the "
+            L"project must be reloaded.\r\n"
+            L"Resource editor windows are open.\r\n\r\n"
+            L"Yes = APPLY the changes in those windows and continue\r\n"
+            L"No = DISCARD the unapplied changes in those windows and continue\r\n"
+            L"Cancel = keep editing for now (you will be asked again on save)",
+            L"Game Maker 8.0", MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND);
+        if (r == IDCANCEL)
+        {
+            gm_log("Watcher: user cancelled — keeping IDE state");
+            g_flow_active = false;
+            return; // pending stays cleared; the save-side hook still guards
+        }
+        g_close_modal_result = (r == IDYES) ? 1 : 2; // mrOk / mrCancel
+        g_close_flow = true;
+        merge_flow_close_editors(g_close_modal_result);
+        g_flow_active = false;
+        return; // modal loops unwind over the next message cycles
+    }
+    if (g_close_flow)
+    {
+        if (merge_flow_count_editor_windows() > 0)
+        {
+            // Keep closing (stacked modals unwind one message-loop at a time).
+            merge_flow_close_editors(g_close_modal_result);
+            g_flow_active = false;
+            return;
+        }
+        g_close_flow = false;
+    }
+
+    merge_flow_run(g_watch_path);
+    g_flow_active = false;
 }
 
 // ==== Hidden timer window (main-thread polling, self-contained) ====

@@ -50,6 +50,9 @@ static bool g_has_last_names[10] = {false};
 static uint64_t g_last_data_hash = 0;
 static bool g_has_last_data = false;
 
+double gm80_save_last_save_time() { return g_last_save; }
+void gm80_save_set_last_save_time(double t) { g_last_save = t; }
+
 // Delphi Now() → TDateTime in ST(0) (sub_40CF18). Same clock GM uses for the
 // per-resource timestamps, so ts[i] and LAST_SAVE are directly comparable.
 static double now_t()

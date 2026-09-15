@@ -6,6 +6,7 @@
 #include "gm80_save.h"
 #include "gm80_load.h"
 #include "project_watcher.h"
+#include "merge_flow.h"
 #include "gm_log.h"
 #include "gm80_diag.h"
 #include <ctime>
@@ -288,6 +289,35 @@ static void __stdcall do_gm80_save_if_needed()
 {
     // Stop the file watcher first so our own writes are never seen as foreign.
     project_watcher_stop();
+    // Save-side conflict check: disk carries external changes our snapshot
+    // doesn't know about (e.g. the user dismissed the reload prompt earlier).
+    // Ask every time — a silent overwrite could discard unseen external edits.
+    if (merge_flow_disk_differs(g_gm80_save_path))
+    {
+        gm_log("Save: external changes detected on disk");
+        int r = MessageBoxW(gm80_prompt_owner(),
+            L"The project files on disk have been modified outside Game Maker.\r\n"
+            L"\r\n"
+            L"Yes = merge the external changes first (recommended)\r\n"
+            L"No = overwrite the external changes with this save\r\n"
+            L"Cancel = don't save now",
+            L"Game Maker 8.0", MB_YESNOCANCEL | MB_ICONWARNING | MB_SETFOREGROUND);
+        if (r == IDCANCEL)
+        {
+            gm_log("Save: cancelled at the conflict prompt");
+            return;
+        }
+        if (r == IDYES)
+        {
+            // Full merge flow (editor prompts → staging → tool → reload).
+            // After it returns the IDE holds the merged state — nothing left
+            // to save for this Ctrl+S.
+            merge_flow_run(g_gm80_save_path);
+            return;
+        }
+        // IDNO falls through: this save overwrites; the snapshot refresh
+        // below re-baselines so later external changes are detected cleanly.
+    }
     gm_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
     gm80_progress_show();
     gm80_progress_step(25);
@@ -302,6 +332,8 @@ static void __stdcall do_gm80_save_if_needed()
             // Re-arm the watcher + SAVE_END so subsequent foreign edits are seen.
             project_watcher_start(g_gm80_save_path);
             project_watcher_mark_saved();
+            // Disk == IDE memory now → this is the new three-way merge base.
+            merge_flow_snapshot_refresh(g_gm80_save_path);
             ok = true;
         }
     }
@@ -662,9 +694,11 @@ static int __stdcall check_and_do_gm80_load()
     if (gm80_load_project(g_gm_base, dirPath))
     {
         gm_log("Load: .gm80 direct Delphi objects — SUCCESS");
-        // Start the file watcher so external edits are detected (silent reload
-        // when the user hasn't changed anything; Yes/No prompt on conflict).
+        // Start the file watcher so external edits are detected (merge flow:
+        // silent auto-apply when clean, GMSaveMerge tool on conflicts).
         project_watcher_start(dirPath);
+        // Disk == IDE memory → snapshot the three-way merge base.
+        merge_flow_snapshot_refresh(dirPath);
         return 1;
     }
 

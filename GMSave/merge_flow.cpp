@@ -1,0 +1,1126 @@
+// Three-way merge flow for external .gm80 changes. See merge_flow.h.
+//
+// Layout conventions:
+//   snapshot : <projDir>\cache\gmsave-base\root\<rel>   (text file copies)
+//              <projDir>\cache\gmsave-base\manifest.json (all files hashed)
+//   session  : %TEMP%\gmsave-merge-<pid>\{local,base,remote,decisions,backup}
+//              + manifest.json (written by us) / decisions.json + decisions\
+//              (written by GMSaveMerge)
+#include "pch.h"
+#include "merge_flow.h"
+#include "gm80_addresses.h"
+#include "gm80_save.h"
+#include "diff3.h"
+#include "project_watcher.h"
+#include "gm_log.h"
+#include <windows.h>
+#include <shlobj.h>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+namespace fs = std::filesystem;
+
+// ==== Small utilities ====
+
+static std::string read_bytes(const fs::path& p)
+{
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static bool write_bytes(const fs::path& p, const std::string& data)
+{
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) return false;
+    size_t w = fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+    return w == data.size();
+}
+
+static uint64_t fnv1a(const std::string& d)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : d)
+    {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static std::string hex64(uint64_t v)
+{
+    char b[17];
+    snprintf(b, sizeof(b), "%016llx", (unsigned long long)v);
+    return b;
+}
+
+// Wide ↔ UTF-8 (JSON carries UTF-8; paths on disk are wide).
+static std::string wide_to_utf8(const std::wstring& w)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0,
+        nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr,
+        nullptr);
+    return s;
+}
+
+static std::wstring utf8_to_wide(const std::string& s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// JSON string escape (also used for the tiny parser below).
+static std::string json_escape(const std::string& s)
+{
+    std::string o = "\"";
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+        case '"': o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n"; break;
+        case '\r': o += "\\r"; break;
+        case '\t': o += "\\t"; break;
+        default:
+            if (c < 0x20)
+            {
+                char b[8];
+                snprintf(b, sizeof(b), "\\u%04x", c);
+                o += b;
+            }
+            else o += (char)c;
+        }
+    }
+    return o + "\"";
+}
+
+// Minimal JSON value (objects / arrays / strings / numbers / bools / null).
+struct JVal
+{
+    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } type = NUL;
+    bool b = false;
+    double num = 0;
+    std::string str;
+    std::vector<JVal> arr;
+    std::vector<std::pair<std::string, JVal>> obj;
+    const JVal* get(const char* k) const
+    {
+        for (auto& p : obj)
+            if (p.first == k) return &p.second;
+        return nullptr;
+    }
+};
+
+// Tiny recursive-descent JSON parser — enough for decisions.json (written by
+// JSON.stringify in the tool). Returns NUL on parse failure.
+static JVal json_parse(const std::string& text)
+{
+    size_t pos = 0;
+    std::function<JVal()> parse = [&]() -> JVal
+    {
+        JVal v;
+        while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' ||
+                                     text[pos] == '\n' || text[pos] == '\r'))
+            pos++;
+        if (pos >= text.size()) return v;
+        char c = text[pos];
+        if (c == '{')
+        {
+            v.type = JVal::OBJ;
+            pos++;
+            while (pos < text.size())
+            {
+                while (pos < text.size() && (text[pos] == ' ' || text[pos] == ',' ||
+                                             text[pos] == ':' || text[pos] == '\n' ||
+                                             text[pos] == '\r' || text[pos] == '\t'))
+                    pos++;
+                if (pos >= text.size() || text[pos] == '}') break;
+                JVal key = parse(); // string
+                while (pos < text.size() && (text[pos] == ' ' || text[pos] == ':'))
+                    pos++;
+                JVal val = parse();
+                v.obj.push_back({key.str, val});
+            }
+            pos++; // consume }
+        }
+        else if (c == '[')
+        {
+            v.type = JVal::ARR;
+            pos++;
+            while (pos < text.size())
+            {
+                while (pos < text.size() && (text[pos] == ' ' || text[pos] == ',' ||
+                                             text[pos] == '\n' || text[pos] == '\r' ||
+                                             text[pos] == '\t'))
+                    pos++;
+                if (pos >= text.size() || text[pos] == ']') break;
+                v.arr.push_back(parse());
+            }
+            pos++; // consume ]
+        }
+        else if (c == '"')
+        {
+            v.type = JVal::STR;
+            pos++;
+            while (pos < text.size() && text[pos] != '"')
+            {
+                if (text[pos] == '\\' && pos + 1 < text.size())
+                {
+                    char e = text[pos + 1];
+                    if (e == 'n') { v.str += '\n'; pos += 2; }
+                    else if (e == 'r') { v.str += '\r'; pos += 2; }
+                    else if (e == 't') { v.str += '\t'; pos += 2; }
+                    else if (e == 'b') { v.str += '\b'; pos += 2; }
+                    else if (e == 'f') { v.str += '\f'; pos += 2; }
+                    else if (e == 'u' && pos + 5 < text.size())
+                    {
+                        unsigned cp = (unsigned)strtoul(
+                            text.substr(pos + 2, 4).c_str(), nullptr, 16);
+                        // encode UTF-8
+                        if (cp < 0x80) v.str += (char)cp;
+                        else if (cp < 0x800)
+                        {
+                            v.str += (char)(0xC0 | (cp >> 6));
+                            v.str += (char)(0x80 | (cp & 0x3F));
+                        }
+                        else
+                        {
+                            v.str += (char)(0xE0 | (cp >> 12));
+                            v.str += (char)(0x80 | ((cp >> 6) & 0x3F));
+                            v.str += (char)(0x80 | (cp & 0x3F));
+                        }
+                        pos += 6;
+                    }
+                    else { v.str += e; pos += 2; }
+                }
+                else v.str += text[pos++];
+            }
+            pos++; // consume "
+        }
+        else if (c == 't' || c == 'f')
+        {
+            v.type = JVal::BOOL;
+            v.b = (c == 't');
+            pos += (c == 't') ? 4 : 5; // true / false
+        }
+        else
+        {
+            v.type = JVal::NUM;
+            size_t end = pos;
+            while (end < text.size() && (isdigit((unsigned char)text[end]) ||
+                                         text[end] == '-' || text[end] == '+' ||
+                                         text[end] == '.' || text[end] == 'e' ||
+                                         text[end] == 'E'))
+                end++;
+            v.num = strtod(text.c_str() + pos, nullptr);
+            pos = end;
+        }
+        return v;
+    };
+    return parse();
+}
+
+// ==== File-kind classification ====
+
+static bool is_binary_rel(const std::wstring& rel)
+{
+    static const wchar_t* kBinExt[] = {L".png", L".gif", L".jpg", L".jpeg",
+        L".bmp", L".ico", L".cur", L".wav", L".mp3", L".mid", L".midi", L".ogg",
+        L".bin", L".dat", L".rtf", nullptr};
+    // Included-file payloads are arbitrary user data.
+    if (rel.rfind(L"datafiles\\include\\", 0) == 0) return true;
+    size_t dot = rel.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = rel.substr(dot);
+    for (int i = 0; kBinExt[i]; i++)
+        if (_wcsicmp(ext.c_str(), kBinExt[i]) == 0) return true;
+    return false;
+}
+
+enum TextMode { TM_LINES, TM_KEYED_CSV4, TM_KEYED_LINE };
+
+// Encoding detection for the tool: strict-UTF-8 → "utf-8", high bytes →
+// "gbk", else plain ASCII ("utf-8" is fine).
+static std::string detect_encoding(const std::string& d)
+{
+    bool high = false;
+    for (unsigned char c : d)
+        if (c >= 0x80) { high = true; break; }
+    if (!high) return "utf-8";
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, d.c_str(),
+        (int)d.size(), nullptr, 0);
+    return wlen > 0 ? "utf-8" : "gbk";
+}
+
+static TextMode text_mode_for(const std::wstring& rel)
+{
+    size_t slash = rel.find_last_of(L'\\');
+    std::wstring name = (slash == std::wstring::npos) ? rel : rel.substr(slash + 1);
+    if (name == L"index.yyd" || name == L"tree.yyd") return TM_KEYED_LINE;
+    if (name == L"instances.txt") return TM_KEYED_CSV4;
+    if (name == L"layers.txt") return TM_KEYED_LINE;
+    // rooms/<name>/<depth>.txt tile layer files: numeric stem under rooms/
+    if (rel.rfind(L"rooms\\", 0) == 0 && name.size() > 4 &&
+        _wcsicmp(name.c_str() + name.size() - 4, L".txt") == 0)
+    {
+        bool allDigit = true;
+        for (size_t i = 0; i + 4 < name.size(); i++)
+            if (!iswdigit(name[i])) { allDigit = false; break; }
+        if (allDigit) return TM_KEYED_LINE;
+    }
+    return TM_LINES;
+}
+
+// ==== Snapshot ====
+
+struct SnapEntry
+{
+    std::wstring rel;
+    uint64_t hash = 0;
+    unsigned long long size = 0;
+    long long mtime = 0;
+    bool text = false;
+};
+
+static fs::path snapshot_dir_of(const std::wstring& projDir)
+{
+    return fs::path(projDir) / L"cache" / L"gmsave-base";
+}
+
+static void enumerate_tree(const fs::path& root, const std::wstring& skipTop,
+    std::vector<std::wstring>& out)
+{
+    std::error_code ec;
+    if (!fs::exists(root, ec)) return;
+    for (auto it = fs::recursive_directory_iterator(root, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec))
+    {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        std::wstring rel = it->path().lexically_relative(root).wstring();
+        if (!skipTop.empty() &&
+            (rel == skipTop || rel.rfind(skipTop + L"\\", 0) == 0))
+        {
+            it.disable_recursion_pending();
+            continue;
+        }
+        out.push_back(rel);
+    }
+}
+
+// manifest.json lines are tiny; hand-emit (stable format, read back by the
+// mini parser).
+static void write_snapshot_manifest(const fs::path& manifest,
+    const std::vector<SnapEntry>& entries)
+{
+    std::string j = "{\"version\":1,\"files\":[";
+    bool first = true;
+    for (auto& e : entries)
+    {
+        if (!first) j += ",";
+        first = false;
+        j += "{\"path\":" + json_escape(wide_to_utf8(e.rel)) +
+             ",\"hash\":\"" + hex64(e.hash) + "\",\"size\":" +
+             std::to_string(e.size) + ",\"mtime\":" + std::to_string(e.mtime) +
+             ",\"text\":" + (e.text ? "true" : "false") + "}";
+    }
+    j += "]}";
+    write_bytes(manifest, j);
+}
+
+static bool read_snapshot_manifest(const fs::path& manifest,
+    std::vector<SnapEntry>& out)
+{
+    std::string j = read_bytes(manifest);
+    if (j.empty()) return false;
+    JVal v = json_parse(j);
+    if (v.type != JVal::OBJ) return false;
+    const JVal* files = v.get("files");
+    if (!files || files->type != JVal::ARR) return false;
+    for (auto& f : files->arr)
+    {
+        SnapEntry e;
+        if (const JVal* p = f.get("path"))
+        {
+            std::string r = p->str;
+            e.rel.assign(r.begin(), r.end());
+        }
+        if (const JVal* h = f.get("hash"))
+        {
+            e.hash = (uint64_t)_strtoui64(h->str.c_str(), nullptr, 16);
+        }
+        if (const JVal* s = f.get("size")) e.size = (unsigned long long)s->num;
+        if (const JVal* m = f.get("mtime")) e.mtime = (long long)m->num;
+        if (const JVal* t = f.get("text")) e.text = t->b;
+        if (!e.rel.empty()) out.push_back(e);
+    }
+    return !out.empty();
+}
+
+void merge_flow_snapshot_refresh(const std::wstring& projDir)
+{
+    fs::path snap = snapshot_dir_of(projDir);
+    std::error_code ec;
+    fs::remove_all(snap, ec);
+    fs::path root = snap / L"root";
+    fs::create_directories(root, ec);
+
+    std::vector<std::wstring> rels;
+    enumerate_tree(fs::path(projDir), L"cache", rels);
+    std::vector<SnapEntry> entries;
+    for (auto& rel : rels)
+    {
+        fs::path src = fs::path(projDir) / rel;
+        SnapEntry e;
+        e.rel = rel;
+        e.text = !is_binary_rel(rel);
+        if (e.text)
+        {
+            std::string data = read_bytes(src);
+            e.hash = fnv1a(data);
+            e.size = data.size();
+            write_bytes(root / rel, data);
+        }
+        else
+        {
+            std::string data = read_bytes(src);
+            e.hash = fnv1a(data);
+            e.size = data.size();
+        }
+        if (auto t = fs::last_write_time(src, ec); !ec)
+        {
+            auto sys = t - fs::file_time_type::clock::now() +
+                std::chrono::system_clock::now();
+            e.mtime = std::chrono::duration_cast<std::chrono::seconds>(
+                          sys.time_since_epoch())
+                          .count();
+        }
+        entries.push_back(e);
+    }
+    write_snapshot_manifest(snap / L"manifest.json", entries);
+    gm_log("MergeFlow: snapshot refreshed (%zu files)", entries.size());
+}
+
+static bool file_meta(const fs::path& p, unsigned long long& size, long long& mtime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d)) return false;
+    size = ((unsigned long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+    ULARGE_INTEGER u;
+    u.LowPart = d.ftLastWriteTime.dwLowDateTime;
+    u.HighPart = d.ftLastWriteTime.dwHighDateTime;
+    mtime = (long long)(u.QuadPart / 10000000ULL - 11644473600ULL);
+    return true;
+}
+
+bool merge_flow_disk_differs(const std::wstring& projDir)
+{
+    std::vector<SnapEntry> snap;
+    if (!read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json", snap))
+        return false; // no snapshot (e.g. pre-upgrade project): no foreign state known
+    std::map<std::wstring, SnapEntry> byRel;
+    for (auto& e : snap) byRel[e.rel] = e;
+
+    std::vector<std::wstring> rels;
+    enumerate_tree(fs::path(projDir), L"cache", rels);
+    std::set<std::wstring> disk;
+    for (auto& rel : rels)
+    {
+        disk.insert(rel);
+        auto it = byRel.find(rel);
+        if (it == byRel.end()) return true; // new foreign file
+        unsigned long long size = 0;
+        long long mtime = 0;
+        if (!file_meta(fs::path(projDir) / rel, size, mtime)) return true;
+        if (size != it->second.size) return true;
+        if (mtime == it->second.mtime) continue; // fast path
+        std::string data = read_bytes(fs::path(projDir) / rel);
+        if (fnv1a(data) != it->second.hash) return true;
+    }
+    for (auto& e : snap)
+        if (!disk.count(e.rel)) return true; // deleted on disk
+    return false;
+}
+
+// ==== Editor-window helpers ====
+
+static const struct
+{
+    uint32_t arr, cnt;
+} kFormsArrays[] = {
+    {0x1E910C, 0x1E911C}, // sprites
+    {0x1E927C, 0x1E9288}, // sounds
+    {0x1E9098, 0x1E90A8}, // backgrounds
+    {0x1E92B0, 0x1E92BC}, // paths
+    {0x1E92D8, 0x1E92E4}, // scripts
+    {0x1E92C4, 0x1E92D0}, // fonts
+    {0x1E9304, 0x1E9310}, // timelines
+    {0x1E9358, 0x1E9364}, // objects
+    {0x1E9298, 0x1E92A4}, // rooms
+};
+
+static bool valid_form_slot(uint32_t* arr, uint32_t cnt, uint32_t i)
+{
+    uint32_t form = arr[i];
+    if (!form || form < 0x10000 || form == 0xFFFFFFFF) return false;
+    return !IsBadReadPtr((void*)form, 0x360);
+}
+
+int merge_flow_count_editor_windows()
+{
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return 0;
+    int n = 0;
+    for (auto& f : kFormsArrays)
+    {
+        uint32_t cnt = *(uint32_t*)(b + f.cnt);
+        uint32_t* arr = *(uint32_t**)(b + f.arr);
+        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000) continue;
+        for (uint32_t i = 0; i < cnt; i++)
+            if (valid_form_slot(arr, cnt, i)) n++;
+    }
+    return n;
+}
+
+bool merge_flow_non_editor_modal_open()
+{
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return false;
+    void* screen = *(void**)(b + ADDR_SCREEN);
+    if (!screen || IsBadReadPtr(screen, 0x90)) return false;
+    uint32_t focused = *(uint32_t*)((uint8_t*)screen + OFF_SCREEN_FFOCUSEDFORM);
+    if (!focused || focused < 0x10000) return false;
+    // In any of the forms arrays → it IS a resource editor (modal one).
+    for (auto& f : kFormsArrays)
+    {
+        uint32_t cnt = *(uint32_t*)(b + f.cnt);
+        uint32_t* arr = *(uint32_t**)(b + f.arr);
+        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000) continue;
+        for (uint32_t i = 0; i < cnt; i++)
+            if (arr[i] == focused) return false;
+    }
+    return true;
+}
+
+// Free a Delphi object through GM's TObject.Free (sub_404590: virtual
+// vmt[-4] Destroy — same call ide_hooks uses).
+static void free_delphi_obj(void* obj)
+{
+    if (!obj) return;
+    uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
+    if (!base) return;
+    uint32_t fn = (uint32_t)base + 0x4590;
+    __asm {
+        mov eax, obj
+        mov ecx, fn
+        call ecx
+    }
+}
+
+int merge_flow_close_editors(int modalResult)
+{
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return 0;
+    int freed = 0;
+    for (auto& f : kFormsArrays)
+    {
+        uint32_t cnt = *(uint32_t*)(b + f.cnt);
+        uint32_t* arr = *(uint32_t**)(b + f.arr);
+        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000) continue;
+        for (uint32_t i = 0; i < cnt; i++)
+        {
+            if (!valid_form_slot(arr, cnt, i)) continue;
+            uint8_t* form = (uint8_t*)arr[i];
+            uint8_t fstate = *(uint8_t*)(form + OFF_FORM_FORMSTATE);
+            if (fstate & FS_MODAL_FLAG)
+            {
+                // Inside ShowModal: end the loop like a button click would.
+                // The dialog's own epilogue (apply/discard, slot cleanup, Free)
+                // runs when its message loop unwinds.
+                *(uint32_t*)(form + OFF_FORM_MODALRESULT) = modalResult;
+            }
+            else
+            {
+                // Modeless (script/room editors): the treatment InitializeProject
+                // itself applies — free the form. Script editors apply their
+                // content on destroy (verified sub_55A750).
+                free_delphi_obj(form);
+                arr[i] = 0;
+                freed++;
+            }
+        }
+    }
+    return freed;
+}
+
+// ==== Staging save ====
+
+// SEH guard around the Delphi interop save (same policy as ide_hooks).
+static bool stage_save_seh(void* base, const std::wstring& path)
+{
+    __try
+    {
+        return gm80_save_to_path(base, path);
+    }
+    __except (GetExceptionCode() == 0xE06D7363 ? EXCEPTION_CONTINUE_SEARCH
+                                               : EXCEPTION_EXECUTE_HANDLER)
+    {
+        gm_log("MergeFlow: staging save SEH exception 0x%X", GetExceptionCode());
+        return false;
+    }
+}
+
+static bool stage_save(const std::wstring& stagingDir)
+{
+    void* base = GetModuleHandle(NULL);
+    // Defeat the smart-skip: with LAST_SAVE = 0 every resource timestamp is
+    // "newer", so the staging tree is COMPLETE. Restore afterwards so the
+    // next real save still skips untouched resources.
+    double saved = gm80_save_last_save_time();
+    gm80_save_set_last_save_time(0.0);
+    bool ok = stage_save_seh(base, stagingDir);
+    gm80_save_set_last_save_time(saved);
+    if (!ok) gm_log("MergeFlow: staging save FAILED (%s)", gm80_save_last_error().c_str());
+    return ok;
+}
+
+// ==== Classification + merge ====
+
+enum FileStatus
+{
+    FS_UNCHANGED,   // all three equal → skip
+    FS_REMOTE,      // only remote changed / remote-only → keep disk (auto)
+    FS_LOCAL,       // only local changed / local-only → write local (auto)
+    FS_AUTO,        // text three-way clean merge → write result (auto)
+    FS_CONFLICT,    // needs the merge tool
+    FS_DELETED      // remote deleted & local untouched → nothing to do
+};
+
+struct MergeFile
+{
+    std::wstring rel;
+    bool binary = false;
+    bool hasBase = false, hasLocal = false, hasRemote = false;
+    uint64_t hashBase = 0, hashLocal = 0, hashRemote = 0;
+    std::string baseB, localB, remoteB; // text only
+    std::string enc = "utf-8";
+    FileStatus status = FS_UNCHANGED;
+    diff3::Result dres; // text three-way details
+    std::string resultB;
+};
+
+static bool load_text_or_hash(MergeFile& mf, const fs::path& base,
+    const fs::path& localRoot, const fs::path& remoteRoot,
+    const SnapEntry* snapE)
+{
+    // local (staging)
+    fs::path lp = localRoot / mf.rel;
+    std::error_code ec;
+    if (fs::is_regular_file(lp, ec))
+    {
+        mf.hasLocal = true;
+        std::string d = read_bytes(lp);
+        mf.hashLocal = fnv1a(d);
+        if (!mf.binary) mf.localB = std::move(d);
+    }
+    fs::path rp = remoteRoot / mf.rel;
+    if (fs::is_regular_file(rp, ec))
+    {
+        mf.hasRemote = true;
+        std::string d = read_bytes(rp);
+        mf.hashRemote = fnv1a(d);
+        if (!mf.binary) mf.remoteB = std::move(d);
+    }
+    if (snapE)
+    {
+        mf.hasBase = true;
+        mf.hashBase = snapE->hash;
+        if (!mf.binary) mf.baseB = read_bytes(base / mf.rel);
+    }
+    return true;
+}
+
+static void classify_and_merge(MergeFile& mf)
+{
+    if (mf.binary)
+    {
+        if (!mf.hasLocal && !mf.hasRemote) { mf.status = FS_DELETED; return; }
+        if (!mf.hasBase)
+        {
+            // New file on one or both sides.
+            if (!mf.hasLocal) { mf.status = FS_REMOTE; return; }
+            if (!mf.hasRemote) { mf.status = FS_LOCAL; return; }
+            mf.status = (mf.hashLocal != mf.hashRemote) ? FS_CONFLICT : FS_UNCHANGED;
+            return;
+        }
+        bool lCh = mf.hasLocal && mf.hashLocal != mf.hashBase;
+        bool rCh = mf.hasRemote && mf.hashRemote != mf.hashBase;
+        if (!mf.hasRemote && lCh) { mf.status = FS_CONFLICT; return; } // del-vs-change
+        if (!mf.hasLocal && rCh) { mf.status = FS_CONFLICT; return; } // change-vs-del
+        if (!mf.hasRemote) { mf.status = FS_DELETED; return; } // remote-gone, local==base
+        if (!mf.hasLocal) { mf.status = FS_REMOTE; return; }   // local-gone, remote==base
+        if (lCh && rCh && mf.hashLocal != mf.hashRemote)
+            mf.status = FS_CONFLICT;
+        else if (lCh)
+            mf.status = FS_LOCAL;
+        else if (rCh)
+            mf.status = FS_REMOTE;
+        else
+            mf.status = FS_UNCHANGED;
+        return;
+    }
+
+    // ---- text ----
+    if (mf.hasLocal && mf.hasRemote && mf.hasBase &&
+        mf.localB == mf.baseB && mf.remoteB == mf.baseB)
+    {
+        mf.status = FS_UNCHANGED;
+        return;
+    }
+    if (!mf.hasRemote && mf.hasLocal)
+    {
+        mf.status = (!mf.hasBase || mf.localB != mf.baseB) ? FS_CONFLICT
+                                                           : FS_DELETED;
+        return;
+    }
+    if (!mf.hasLocal && mf.hasRemote)
+    {
+        mf.status = (!mf.hasBase || mf.remoteB != mf.baseB) ? FS_CONFLICT
+                                                            : FS_REMOTE;
+        return;
+    }
+    if (!mf.hasLocal && !mf.hasRemote)
+    {
+        mf.status = FS_DELETED;
+        return;
+    }
+    // all present (base may be absent = both new)
+    if (mf.localB == mf.remoteB) { mf.status = FS_UNCHANGED; return; }
+    if (mf.hasBase && mf.localB == mf.baseB) { mf.status = FS_REMOTE; return; }
+    if (mf.hasBase && mf.remoteB == mf.baseB) { mf.status = FS_LOCAL; return; }
+
+    TextMode tm = text_mode_for(mf.rel);
+    std::vector<std::string> b = diff3::split_lines(mf.baseB);
+    std::vector<std::string> l = diff3::split_lines(mf.localB);
+    std::vector<std::string> r = diff3::split_lines(mf.remoteB);
+    mf.enc = detect_encoding(mf.remoteB.empty() ? mf.localB : mf.remoteB);
+    switch (tm)
+    {
+    case TM_KEYED_CSV4:
+        mf.dres = diff3::merge_keyed(b, l, r, diff3::key_instances_csv4);
+        break;
+    case TM_KEYED_LINE:
+        mf.dres = diff3::merge_keyed(b, l, r, diff3::key_whole_line);
+        break;
+    default:
+        mf.dres = diff3::merge_lines(b, l, r);
+        break;
+    }
+    if (mf.dres.clean())
+    {
+        mf.status = FS_AUTO;
+        mf.resultB = diff3::join_lines(mf.dres.lines, "\r\n");
+    }
+    else
+    {
+        mf.status = FS_CONFLICT;
+        mf.resultB = diff3::join_lines(mf.dres.lines, "\r\n"); // preview with markers
+    }
+}
+
+// ==== Session + tool ====
+
+static std::wstring session_dir()
+{
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring s(tmp);
+    if (!s.empty() && s.back() == L'\\') s.pop_back();
+    return s + L"\\gmsave-merge-" + std::to_wstring(GetCurrentProcessId());
+}
+
+static bool find_merge_tool(std::wstring& out)
+{
+    // Tauri names the binary after the Cargo package; accept both spellings.
+    const wchar_t* names[] = {L"GMSaveMerge.exe", L"gmsave-merge.exe", nullptr};
+    wchar_t exeDir[MAX_PATH], dllDir[MAX_PATH];
+    GetModuleFileNameW(NULL, exeDir, MAX_PATH);
+    wchar_t* s = wcsrchr(exeDir, L'\\');
+    if (s) *(s + 1) = 0;
+    HMODULE self;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCWSTR)&find_merge_tool, &self);
+    GetModuleFileNameW(self, dllDir, MAX_PATH);
+    s = wcsrchr(dllDir, L'\\');
+    if (s) *(s + 1) = 0;
+    for (int i = 0; names[i]; i++)
+    {
+        std::wstring c1 = std::wstring(exeDir) + names[i];
+        std::wstring c2 = std::wstring(dllDir) + names[i];
+        if (GetFileAttributesW(c1.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            out = c1;
+            return true;
+        }
+        if (GetFileAttributesW(c2.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            out = c2;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Wait for the tool while keeping GM painted (it is disabled meanwhile).
+static DWORD wait_tool_with_pump(HANDLE proc)
+{
+    for (;;)
+    {
+        DWORD w = WaitForSingleObject(proc, 120);
+        if (w == WAIT_OBJECT_0) break;
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    DWORD code = (DWORD)-1;
+    GetExitCodeProcess(proc, &code);
+    return code;
+}
+
+// ==== Apply ====
+
+static bool apply_decisions(const std::wstring& projDir, const fs::path& session,
+    std::vector<MergeFile>& files,
+    const std::map<std::wstring, std::string>& decisions,
+    const std::set<std::wstring>& edited)
+{
+    // Stop the watcher BEFORE touching disk so our own writes never read as
+    // foreign changes; the reload re-arms it after the load.
+    project_watcher_stop();
+
+    fs::path backup = session / L"backup";
+    bool ok = true;
+    for (auto& mf : files)
+    {
+        fs::path disk = fs::path(projDir) / mf.rel;
+        auto dit = decisions.find(mf.rel);
+        std::string action = (dit != decisions.end()) ? dit->second : "auto";
+        // A conflict REQUIRES an explicit decision; missing one (tool bug)
+        // degrades to keeping the local side rather than aborting mid-apply.
+        if (mf.status == FS_CONFLICT && dit == decisions.end()) action = "local";
+
+        // Resolve the effect: {srcFile | resultBytes | delete | nothing}.
+        fs::path src;
+        bool useResult = false, wantDelete = false, skip = false;
+        if (action == "remote")
+        {
+            if (!mf.hasRemote) wantDelete = true; // remote side deleted it
+            else skip = true;                     // disk already holds remote
+        }
+        else if (action == "edited")
+        {
+            src = session / L"decisions" / mf.rel;
+            std::error_code ec;
+            if (!fs::is_regular_file(src, ec) || !edited.count(mf.rel))
+            {
+                gm_log("MergeFlow: missing edited content for '%S'",
+                    mf.rel.c_str());
+                ok = false;
+                skip = true;
+            }
+        }
+        else if (action == "local")
+        {
+            if (!mf.hasLocal) wantDelete = true; // local side deleted it
+            else src = session / L"local" / mf.rel;
+        }
+        else // auto
+        {
+            switch (mf.status)
+            {
+            case FS_UNCHANGED:
+            case FS_REMOTE:
+            case FS_DELETED: skip = true; break;
+            case FS_LOCAL: src = session / L"local" / mf.rel; break;
+            case FS_AUTO: useResult = true; break;
+            case FS_CONFLICT: action = "local";
+                if (mf.hasLocal) src = session / L"local" / mf.rel;
+                else wantDelete = true;
+                break;
+            }
+        }
+
+        std::error_code ec;
+        auto backupDisk = [&]()
+        {
+            if (fs::is_regular_file(disk, ec))
+                fs::copy_file(disk, backup / mf.rel,
+                    fs::copy_options::overwrite_existing, ec);
+        };
+
+        if (skip) continue;
+        if (wantDelete)
+        {
+            backupDisk();
+            if (fs::is_regular_file(disk, ec) && !fs::remove(disk, ec)) ok = false;
+        }
+        else if (!src.empty())
+        {
+            backupDisk();
+            fs::create_directories(disk.parent_path(), ec);
+            fs::copy_file(src, disk, fs::copy_options::overwrite_existing, ec);
+            if (ec) ok = false;
+        }
+        else if (useResult)
+        {
+            backupDisk();
+            if (!write_bytes(disk, mf.resultB)) ok = false;
+        }
+    }
+    return ok;
+}
+
+// ==== The flow ====
+
+bool merge_flow_run(const std::wstring& projDir)
+{
+    fs::path session(session_dir());
+    std::error_code ec;
+    fs::remove_all(session, ec);
+    fs::path staging = session / L"local";
+    fs::create_directories(staging, ec);
+
+    gm_log("MergeFlow: run (session '%S')", session.c_str());
+
+    // 1. staging save (full tree of current IDE memory)
+    if (!stage_save(staging.wstring()))
+    {
+        MessageBoxW(gm80_prompt_owner(),
+            L"Cannot stage the current project state for merging.\r\n"
+            L"The project was NOT reloaded.",
+            L"Game Maker 8.0", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    // 2. gather the three trees
+    std::vector<SnapEntry> snap;
+    read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json", snap);
+    std::map<std::wstring, const SnapEntry*> snapBy;
+    for (auto& e : snap) snapBy[e.rel] = &e;
+
+    std::vector<std::wstring> localRels, remoteRels;
+    enumerate_tree(staging, L"cache", localRels);
+    enumerate_tree(fs::path(projDir), L"cache", remoteRels);
+    std::set<std::wstring> all;
+    for (auto& r : localRels) all.insert(r);
+    for (auto& r : remoteRels) all.insert(r);
+    for (auto& e : snap) all.insert(e.rel);
+
+    std::vector<MergeFile> files;
+    bool anyLocal = false, anyRemote = false, anyConflict = false;
+    for (auto& rel : all)
+    {
+        MergeFile mf;
+        mf.rel = rel;
+        mf.binary = is_binary_rel(rel);
+        load_text_or_hash(mf, snapshot_dir_of(projDir) / L"root", staging,
+            fs::path(projDir), snapBy.count(rel) ? snapBy[rel] : nullptr);
+        classify_and_merge(mf);
+        if (mf.status == FS_UNCHANGED || mf.status == FS_DELETED) continue;
+        if (mf.status == FS_LOCAL || mf.status == FS_AUTO) anyLocal = true;
+        if (mf.status == FS_REMOTE) anyRemote = true;
+        if (mf.status == FS_CONFLICT) anyConflict = true;
+        files.push_back(std::move(mf));
+    }
+    gm_log("MergeFlow: %zu changed files (conflicts=%d local=%d remote=%d)",
+        files.size(), (int)anyConflict, (int)anyLocal, (int)anyRemote);
+
+    if (!anyRemote && !anyConflict)
+    {
+        // Nothing foreign after all (e.g. only mtimes moved): nothing to apply
+        // and no reason to reload — the user's editor state stays put.
+        gm_log("MergeFlow: no external difference found — nothing to do");
+        return false;
+    }
+
+    // 3. conflicts → session + tool
+    std::map<std::wstring, std::string> decisions;
+    std::set<std::wstring> edited;
+    if (anyConflict)
+    {
+        // Materialize the three sides for every listed file.
+        for (auto& mf : files)
+        {
+            auto cp = [&](const wchar_t* side, const std::string* bytes,
+                          const fs::path* srcFile)
+            {
+                if (bytes && !bytes->empty())
+                    write_bytes(session / side / mf.rel, *bytes);
+                else if (srcFile)
+                {
+                    fs::create_directories((session / side / mf.rel).parent_path(), ec);
+                    fs::copy_file(*srcFile, session / side / mf.rel,
+                        fs::copy_options::overwrite_existing, ec);
+                }
+            };
+            if (mf.hasBase)
+                cp(L"base", mf.binary ? nullptr : &mf.baseB,
+                    mf.binary ? nullptr : nullptr);
+            if (mf.hasLocal)
+            {
+                fs::path lp = staging / mf.rel;
+                if (mf.binary) cp(L"local", nullptr, &lp);
+                else cp(L"local", &mf.localB, nullptr);
+            }
+            if (mf.hasRemote)
+            {
+                fs::path rp = fs::path(projDir) / mf.rel;
+                if (mf.binary) cp(L"remote", nullptr, &rp);
+                else cp(L"remote", &mf.remoteB, nullptr);
+            }
+        }
+
+        // manifest.json for the tool
+        {
+            std::string j = "{\"version\":1,\"files\":[";
+            bool first = true;
+            for (auto& mf : files)
+            {
+                if (!first) j += ",";
+                first = false;
+                const char* st = mf.status == FS_CONFLICT ? "conflict"
+                    : mf.status == FS_AUTO               ? "auto"
+                    : mf.status == FS_LOCAL              ? "local"
+                                                         : "remote";
+                j += "{\"path\":" +
+                    json_escape(wide_to_utf8(mf.rel)) +
+                    ",\"kind\":\"" + (mf.binary ? "binary" : "text") +
+                    "\",\"status\":\"" + st + "\",\"encoding\":" +
+                    json_escape(mf.enc);
+                if (!mf.binary && !mf.dres.conflicts.empty())
+                {
+                    j += ",\"conflicts\":[";
+                    bool f2 = true;
+                    for (auto& c : mf.dres.conflicts)
+                    {
+                        if (!f2) j += ",";
+                        f2 = false;
+                        j += "{\"b\":[" + std::to_string(c.baseStart) + "," +
+                             std::to_string(c.baseLen) + "],\"l\":[" +
+                             std::to_string(c.localStart) + "," +
+                             std::to_string(c.localLen) + "],\"r\":[" +
+                             std::to_string(c.remoteStart) + "," +
+                             std::to_string(c.remoteLen) + "]}";
+                    }
+                    j += "]";
+                }
+                j += "}";
+            }
+            j += "]}";
+            write_bytes(session / L"manifest.json", j);
+        }
+
+        std::wstring tool;
+        if (!find_merge_tool(tool))
+        {
+            // Fallback: list conflicts, keep local or cancel.
+            std::wstring list;
+            int n = 0;
+            for (auto& mf : files)
+                if (mf.status == FS_CONFLICT && n++ < 12)
+                    list += L"\n  " + mf.rel;
+            int r = MessageBoxW(gm80_prompt_owner(),
+                (L"GMSaveMerge.exe was not found. Conflicting files:" + list +
+                 L"\n\nYes = keep MY version and reload (external changes to "
+                 L"these files are discarded)\n"
+                 L"No = keep editing (no reload)\n"
+                 L"(Backup of your files is NOT made in this mode.)")
+                    .c_str(),
+                L"Game Maker 8.0", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND);
+            if (r != IDYES) return false;
+            for (auto& mf : files)
+                if (mf.status == FS_CONFLICT) decisions[mf.rel] = "local";
+        }
+        else
+        {
+            HWND main = FindWindowW(L"TMainForm", NULL);
+            STARTUPINFOW si = {sizeof(si)};
+            PROCESS_INFORMATION pi = {};
+            std::wstring cmd = L"\"" + tool + L"\" --manifest \"" +
+                               (session / L"manifest.json").wstring() + L"\"";
+            if (main) EnableWindow(main, FALSE);
+            BOOL launched = CreateProcessW(NULL, &cmd[0], NULL, NULL, FALSE, 0, NULL,
+                NULL, &si, &pi);
+            if (!launched)
+            {
+                if (main) EnableWindow(main, TRUE);
+                gm_log("MergeFlow: CreateProcess failed err=%u", GetLastError());
+                MessageBoxW(gm80_prompt_owner(), L"Could not start the merge tool.",
+                    L"Game Maker 8.0", MB_OK | MB_ICONERROR);
+                return false;
+            }
+            DWORD code = wait_tool_with_pump(pi.hProcess);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (main) EnableWindow(main, TRUE);
+
+            std::string dj = read_bytes(session / L"decisions.json");
+            bool applied = false;
+            if (!dj.empty())
+            {
+                JVal v = json_parse(dj);
+                if (const JVal* res = v.get("result"))
+                    if (res->str == "apply") applied = true;
+                if (applied && v.get("files"))
+                    for (auto& f : v.get("files")->arr)
+                    {
+                        if (const JVal* p = f.get("path"))
+                        {
+                            std::wstring w = utf8_to_wide(p->str);
+                            const JVal* a = f.get("action");
+                            if (a) decisions[w] = a->str;
+                            if (a && a->str == "edited") edited.insert(w);
+                        }
+                    }
+            }
+            gm_log("MergeFlow: tool exit=%u applied=%d decisions=%zu (code %u)",
+                code, (int)applied, decisions.size(), code);
+            if (!applied)
+            {
+                gm_log("MergeFlow: user cancelled the merge — keeping IDE state");
+                return false;
+            }
+        }
+    }
+
+    // 4. apply + reload
+    bool appliedOk = apply_decisions(projDir, session, files, decisions, edited);
+    if (!appliedOk)
+        gm_log("MergeFlow: apply had errors — reloading anyway (backups in session\\backup)");
+    else
+        gm_log("MergeFlow: applied — reloading project");
+
+    project_watcher_reload_project();
+    return true;
+}

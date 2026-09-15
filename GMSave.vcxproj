@@ -53,6 +53,8 @@
     <ClInclude Include="GMSave\gm_log.h" />
     <ClInclude Include="GMSave\gm80_diag.h" />
     <ClInclude Include="GMSave\project_watcher.h" />
+    <ClInclude Include="GMSave\merge_flow.h" />
+    <ClInclude Include="GMSave\diff3.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" /><ClCompile Include="pch.cpp" />
@@ -61,6 +63,8 @@
     <ClCompile Include="GMSave\ide_hooks.cpp" />
     <ClCompile Include="GMSave\gm80_load.cpp" /><ClCompile Include="GMSave\gm80_save.cpp" />
     <ClCompile Include="GMSave\project_watcher.cpp" />
+    <ClCompile Include="GMSave\merge_flow.cpp" />
+    <ClCompile Include="GMSave\diff3.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

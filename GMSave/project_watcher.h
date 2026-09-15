@@ -20,10 +20,17 @@ void project_watcher_mark_saved();
 void project_watcher_ensure_timer_window();
 
 // Called every second on the main thread (hidden-window WM_TIMER).
-// If a foreign change is pending AND it is safe (no modal, no editor form open):
-//   - user has unsaved changes  -> Yes/No prompt (Yes: reload)
-//   - user has NO unsaved changes -> silent reload
+// Modern-IDE external-change flow (see merge_flow.h):
+//   - defer while a non-editor modal dialog is up (don't stack prompts)
+//   - editor windows open → ask once (apply / discard / cancel), close them,
+//     wait a tick for the modal loops to unwind
+//   - then: staging save → three-way classify → silent auto-apply of clean
+//     results → GMSaveMerge tool for conflicts → reload
 void project_watcher_tick();
+
+// Stop the watcher, capture tree state, and reload the current project via
+// GM80_LoadRecentProject (RVA 0x19B860). Exposed for merge_flow's apply step.
+void project_watcher_reload_project();
 
 bool project_watcher_is_running();
 

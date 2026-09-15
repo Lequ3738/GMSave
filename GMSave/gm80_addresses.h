@@ -151,6 +151,33 @@ struct GM80ResourceGlobals {
 #define ADDR_APP_MESSAGEBOX      0x07F57C   // TApplication.MessageBox
 #define ADDR_GET_SCRIPT_BY_NAME  0x15BF50   // Find script by name → returns index
 
+// ==== VCL Application / Screen / Modal machinery ====
+// Verified 2026-09-15 in IDA (8.0) and cross-checked against GM 8.1 + gm82save
+// source. 8.1 equivalents in comments — offsets DIFFER between versions, never
+// mix them.
+#define ADDR_APPLICATION         0x1EE5BC   // TApplication object ptr (8.1: 0x3882EC)
+#define ADDR_SCREEN              0x1EE5C0   // TScreen object ptr (8.1: 0x3882F0)
+#define ADDR_APP_HANDLEMESSAGE   0x47F1FC   // TApplication.HandleMessage (8.1: 0x51F734)
+#define ADDR_APP_IDLE            0x47FC30   // TApplication.Idle (8.1: 0x520418)
+#define ADDR_FORM_SHOWMODAL      0x47B7A0   // TCustomForm.ShowModal (8.1: 0x51ADC8)
+#define ADDR_FORM_CLOSEMODAL     0x47B610   // TCustomForm.CloseModal
+#define ADDR_FORM_CLOSEQUERY     0x47B5AC   // TCustomForm.CloseQuery (OnCloseQuery @ form+0x2E0)
+#define ADDR_SCRIPTFORM_CREATE   0x55A3EC   // TScriptForm create + show (MODELESS)
+#define ADDR_SCRIPTFORM_ONCLOSE  0x55A750   // applies editor text to script + marks
+                                           // updated on close/destroy — closing the
+                                           // script editor never loses code
+
+// TScreen field offsets (8.0 — 8.1 uses +0x74/+0x78 instead)
+#define OFF_SCREEN_FFOCUSEDFORM      0x78   // current modal form (0 while none)
+#define OFF_SCREEN_FSAVEFOCUSEDLIST  0x7C   // TList; FCount @ +8
+#define OFF_TLIST_FCOUNT             0x8
+
+// TForm field offsets (8.0 — 8.1 uses 0x2B8 for ModalResult instead)
+#define OFF_FORM_MODALRESULT     0x294      // write 1=mrOk / 2=mrCancel to end ShowModal
+#define OFF_FORM_FORMSTATE       0x358      // FS_MODAL_FLAG set while inside ShowModal
+#define FS_MODAL_FLAG            0x08
+#define OFF_FORM_ONCLOSEQUERY    0x2E0      // event code (+0x2E4 data)
+
 // ==== Main Form (offsets from MainForm pointer) ====
 // MainForm pointer stored at base+0x1F0100
 // TMainForm.ResourceTree at MainForm+0x3B8  (verified: same Delphi 7 VCL layout)

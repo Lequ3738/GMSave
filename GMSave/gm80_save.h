@@ -19,3 +19,10 @@ const std::string& gm80_save_last_error();
 // reload/reopen (GM 8.0 persists no tree state). cache/ is generated IDE
 // state — safe to ignore in git.
 bool gm80_capture_tree_state(void* gm_base, const std::wstring& projDir);
+
+// Access to the smart-save watermark. merge_flow temporarily zeroes it so a
+// staging save into an empty directory produces the COMPLETE file tree (the
+// smart-skip would otherwise omit resources untouched since the last real
+// save), then restores it so the next real save still skips correctly.
+double gm80_save_last_save_time();
+void gm80_save_set_last_save_time(double t);
