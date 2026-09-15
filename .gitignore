@@ -43,3 +43,7 @@
 *.pdb
 /obj/
 .zcode/
+GMSaveMerge/tests/json_out.txt
+GMSaveMerge/tests/json_test_result.txt
+GMSaveMerge/tests/*.obj
+GMSaveMerge/tests/*.exe
