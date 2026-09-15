@@ -13,6 +13,7 @@
 #include "diff3.h"
 #include "project_watcher.h"
 #include "gm_log.h"
+#include "i18n.h"
 #include <windows.h>
 #include <shlobj.h>
 #include <filesystem>
@@ -397,6 +398,48 @@ bool merge_flow_non_editor_modal_open()
         if (!isEditor) return true;
     }
     return false;
+}
+
+// Standalone code editors (object action "执行代码" and friends) are neither
+// modal (ShowModal — they block the main window through raw Win32 disabling,
+// so they never enter Screen.FSaveFocusedList) nor listed in any resource
+// forms array. Both watcher gates therefore miss them, and reloading with
+// one open wrecks its singleton state: the next open attempt dies with
+// VCL's "Cannot make a visible window modal" (2026-09-15 field report).
+// Identify them by window title while one is open and refuse to reload.
+// Content is live-synced, so waiting for the user to close it loses nothing.
+static BOOL CALLBACK code_editor_enum_proc(HWND hwnd, LPARAM lp)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    // TCodeForm is the window class of the standalone code editor (live-
+    // verified via EnumWindows + IDA: distinct from the script editor's
+    // TScriptForm @ sub_55A3EC, form name "Action_Code"); the title check
+    // stays as a fallback for reskinned builds.
+    wchar_t cls[64];
+    if (GetClassNameW(hwnd, cls, 64) > 0 && !wcscmp(cls, L"TCodeForm"))
+    {
+        *(BOOL*)lp = TRUE;
+        return FALSE;
+    }
+    wchar_t title[96];
+    int n = GetWindowTextW(hwnd, title, 96);
+    if (n <= 0) return TRUE;
+    if (wcsstr(title, L"执行代码"))
+    {
+        *(BOOL*)lp = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+bool merge_flow_code_editor_open()
+{
+    BOOL found = FALSE;
+    EnumWindows(code_editor_enum_proc, (LPARAM)&found);
+    return found != FALSE;
 }
 
 // Free a Delphi object through GM's TObject.Free (sub_404590: virtual
@@ -802,6 +845,23 @@ static bool apply_decisions(const std::wstring& projDir, const fs::path& session
 
 bool merge_flow_run(const std::wstring& projDir)
 {
+    // Save-side guard: the watcher tick defers on standalone code editors,
+    // but Ctrl+S reaches the save hook even while one blocks the main window
+    // (MDI). Refuse politely — reloading now would corrupt the editor.
+    if (merge_flow_code_editor_open())
+    {
+        gm_log("MergeFlow: standalone code editor open — refusing to run");
+        MessageBoxW(gm80_prompt_owner(),
+            tr(L"A standalone code editor window (执行代码) is open.\r\n"
+               L"The merge cannot run while it is open: reloading the project "
+               L"now would corrupt that window.\r\n\r\n"
+               L"Close the code editor window, then save again.",
+               L"检测到独立的代码编辑窗口（执行代码）处于打开状态。\r\n"
+               L"合并无法在它打开时运行：此时重载工程会损坏该窗口。\r\n\r\n"
+               L"请先关闭代码编辑窗口，再重新保存。"),
+            L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        return false;
+    }
     fs::path session(session_dir());
     std::error_code ec;
     fs::remove_all(session, ec);
@@ -831,10 +891,12 @@ bool merge_flow_run(const std::wstring& projDir)
                    "skipping this round");
             merge_flow_snapshot_refresh(projDir);
             MessageBoxW(gm80_prompt_owner(),
-                L"No merge baseline was found for this project (first run "
-                L"after an upgrade), so this external change was not applied.\r\n"
-                L"The baseline has been created — make the external change "
-                L"again to merge it.",
+                tr(L"No merge baseline was found for this project (first run "
+                   L"after an upgrade), so this external change was not applied.\r\n"
+                   L"The baseline has been created — make the external change "
+                   L"again to merge it.",
+                   L"未找到本工程的合并基线（升级后首次运行），本次外部更改未应用。\r\n"
+                   L"基线已创建——请重新进行一次外部更改即可完成合并。"),
                 L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
             return false;
         }
@@ -844,8 +906,9 @@ bool merge_flow_run(const std::wstring& projDir)
     if (!stage_save(staging.wstring()))
     {
         MessageBoxW(gm80_prompt_owner(),
-            L"Cannot stage the current project state for merging.\r\n"
-            L"The project was NOT reloaded.",
+            tr(L"Cannot stage the current project state for merging.\r\n"
+               L"The project was NOT reloaded.",
+               L"无法为合并暂存当前工程状态。\r\n工程未重载。"),
             L"Game Maker 8.0", MB_OK | MB_ICONERROR);
         return false;
     }
@@ -870,11 +933,14 @@ bool merge_flow_run(const std::wstring& projDir)
                "snapshotted) — aborting, nothing applied",
             localRels.size(), snap.size());
         MessageBoxW(gm80_prompt_owner(),
-            L"The plugin's internal snapshot of the project state came out "
-            L"incomplete (plugin bug).\r\n"
-            L"The merge was cancelled and NOTHING was changed.\r\n"
-            L"Saving the project once and retrying the external change "
-            L"usually clears this.",
+            tr(L"The plugin's internal snapshot of the project state came out "
+               L"incomplete (plugin bug).\r\n"
+               L"The merge was cancelled and NOTHING was changed.\r\n"
+               L"Saving the project once and retrying the external change "
+               L"usually clears this.",
+               L"插件的工程状态内部快照不完整（插件 bug）。\r\n"
+               L"合并已取消，未更改任何内容。\r\n"
+               L"先保存一次工程，再重试外部更改，通常即可消除此问题。"),
             L"Game Maker 8.0", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
         return false;
     }
@@ -1012,11 +1078,18 @@ bool merge_flow_run(const std::wstring& projDir)
                 if (mf.status == FS_CONFLICT && n++ < 12)
                     list += L"\n  " + mf.rel;
             int r = MessageBoxW(gm80_prompt_owner(),
-                (L"GMSaveMerge.exe was not found. Conflicting files:" + list +
-                 L"\n\nYes = keep MY version and reload (external changes to "
-                 L"these files are discarded)\n"
-                 L"No = keep editing (no reload)\n"
-                 L"(Backup of your files is NOT made in this mode.)")
+                ((ui_lang_chinese()
+                      ? L"未找到 GMSaveMerge.exe。冲突文件："
+                      : L"GMSaveMerge.exe was not found. Conflicting files:") +
+                 list +
+                 (ui_lang_chinese()
+                      ? L"\n\n是 = 保留我的版本并重载（这些文件的外部更改将被丢弃）\n"
+                        L"否 = 继续编辑（不重载）\n"
+                        L"（此模式下不会为你的文件创建备份。）"
+                      : L"\n\nYes = keep MY version and reload (external changes to "
+                        L"these files are discarded)\n"
+                        L"No = keep editing (no reload)\n"
+                        L"(Backup of your files is NOT made in this mode.)"))
                     .c_str(),
                 L"Game Maker 8.0", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND);
             if (r != IDYES) return false;
@@ -1037,7 +1110,9 @@ bool merge_flow_run(const std::wstring& projDir)
             {
                 if (main) EnableWindow(main, TRUE);
                 gm_log("MergeFlow: CreateProcess failed err=%u", GetLastError());
-                MessageBoxW(gm80_prompt_owner(), L"Could not start the merge tool.",
+                MessageBoxW(gm80_prompt_owner(),
+                    tr(L"Could not start the merge tool.",
+                       L"无法启动合并工具。"),
                     L"Game Maker 8.0", MB_OK | MB_ICONERROR);
                 return false;
             }

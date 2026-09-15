@@ -238,3 +238,40 @@ struct GM80ResourceGlobals {
 
 // ==== Code Editor ====
 #define ADDR_CODE_EDITOR_SHOW    0x0B2000   // Show resource at cursor
+
+// ==== Editor Forms Arrays (open editor windows per resource type) ====
+// Each resource type keeps {ptr array, count} of its open editor forms.
+// merge_flow counts these to detect open editors and closes them (ModalResult
+// for modal ones, TObject.Free for modeless) before merging/reloading.
+// IDA names: GM80_FormsArr_<Type> / GM80_FormsCnt_<Type> (saved 2026-09-15).
+#define ADDR_FORMSARR_SPRITES     0x1E910C
+#define ADDR_FORMSCNT_SPRITES     0x1E911C
+#define ADDR_FORMSARR_SOUNDS      0x1E927C
+#define ADDR_FORMSCNT_SOUNDS      0x1E9288
+#define ADDR_FORMSARR_BACKGROUNDS 0x1E9098
+#define ADDR_FORMSCNT_BACKGROUNDS 0x1E90A8
+#define ADDR_FORMSARR_PATHS       0x1E92B0
+#define ADDR_FORMSCNT_PATHS       0x1E92BC
+#define ADDR_FORMSARR_SCRIPTS     0x1E92D8
+#define ADDR_FORMSCNT_SCRIPTS     0x1E92E4
+#define ADDR_FORMSARR_FONTS       0x1E92C4
+#define ADDR_FORMSCNT_FONTS       0x1E92D0
+#define ADDR_FORMSARR_TIMELINES   0x1E9304
+#define ADDR_FORMSCNT_TIMELINES   0x1E9310
+#define ADDR_FORMSARR_OBJECTS     0x1E9358
+#define ADDR_FORMSCNT_OBJECTS     0x1E9364
+#define ADDR_FORMSARR_ROOMS       0x1E9298
+#define ADDR_FORMSCNT_ROOMS       0x1E92A4
+
+// ==== Standalone code editor ("Execute Code" action editor) ====
+// Window class TCodeForm (class-name strings @ VA 0x54A715/0x54A756, form
+// name "Action_Code"; IDB comment saved 2026-09-15). It blocks the main
+// window via raw Win32 disabling — NOT ShowModal, so it never enters
+// Screen.FSaveFocusedList — and it appears in NO forms array above. Both
+// watcher gates therefore miss it; reloading while it is open corrupts its
+// singleton state (reopen fails with VCL "Cannot make a visible window
+// modal"). merge_flow_code_editor_open() detects it via EnumWindows by this
+// class name (+ title "执行代码" fallback) and defers.
+// The script editor is a different class: TScriptForm / "Script_Form"
+// (strings @ VA 0x55A38B/0x55A3C6/0x55A3DC, created by GM80_ScriptForm_Create
+// 0x55A3EC) and IS tracked in ADDR_FORMSARR_SCRIPTS.

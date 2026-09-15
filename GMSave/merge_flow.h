@@ -32,6 +32,11 @@ int merge_flow_count_editor_windows();
 // A modal form that is NOT one of the resource editors (message boxes, file
 // dialogs, preferences…) → the tick should defer, not stack prompts on it.
 bool merge_flow_non_editor_modal_open();
+// A standalone code editor ("执行代码") is open. These block the main window
+// through raw Win32 disabling (never ShowModal) and live outside the resource
+// forms arrays, so they are invisible to both checks above — yet reloading
+// with one open corrupts its singleton state. Defer while it is open.
+bool merge_flow_code_editor_open();
 // Close every open editor. Modal ones (fsModal set — stuck inside ShowModal)
 // get ModalResult = modalResult (1 mrOk = apply / 2 mrCancel = discard) and
 // unwind on their own over the next message cycles; modeless ones are freed

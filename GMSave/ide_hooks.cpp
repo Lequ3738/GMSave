@@ -9,6 +9,7 @@
 #include "merge_flow.h"
 #include "gm_log.h"
 #include "gm80_diag.h"
+#include "i18n.h"
 #include <ctime>
 #include <filesystem>
 #include <exception>
@@ -296,11 +297,16 @@ static void __stdcall do_gm80_save_if_needed()
     {
         gm_log("Save: external changes detected on disk");
         int r = MessageBoxW(gm80_prompt_owner(),
-            L"The project files on disk have been modified outside Game Maker.\r\n"
-            L"\r\n"
-            L"Yes = merge the external changes first (recommended)\r\n"
-            L"No = overwrite the external changes with this save\r\n"
-            L"Cancel = don't save now",
+            tr(L"The project files on disk have been modified outside Game Maker.\r\n"
+               L"\r\n"
+               L"Yes = merge the external changes first (recommended)\r\n"
+               L"No = overwrite the external changes with this save\r\n"
+               L"Cancel = don't save now",
+               L"磁盘上的工程文件已在 Game Maker 之外被修改。\r\n"
+               L"\r\n"
+               L"是 = 先合并外部更改（推荐）\r\n"
+               L"否 = 用本次保存覆盖外部更改\r\n"
+               L"取消 = 暂不保存"),
             L"Game Maker 8.0", MB_YESNOCANCEL | MB_ICONWARNING | MB_SETFOREGROUND);
         if (r == IDCANCEL)
         {

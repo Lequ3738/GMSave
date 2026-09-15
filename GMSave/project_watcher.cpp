@@ -14,6 +14,7 @@
 #include "gm80_save.h"
 #include "merge_flow.h"
 #include "gm_log.h"
+#include "i18n.h"
 #include <windows.h>
 #include <string>
 
@@ -351,6 +352,15 @@ void project_watcher_tick()
     // A modal that is not a resource editor (message box, file dialog,
     // preferences…) — defer politely; the pending flag stays set.
     if (merge_flow_non_editor_modal_open()) return;
+    // Standalone code editors are invisible to both the modal stack and the
+    // forms arrays (raw Win32 blocking, no resource array slot), but a reload
+    // with one open corrupts its state — defer the same way. Also covers the
+    // attribute-window + code-editor combo before any prompt fires.
+    if (merge_flow_code_editor_open())
+    {
+        gm_log("Watcher: standalone code editor open — deferring");
+        return;
+    }
 
     // Claim the event from here on.
     g_flow_active = true;
@@ -360,12 +370,17 @@ void project_watcher_tick()
     if (!g_close_flow && merge_flow_count_editor_windows() > 0)
     {
         int r = MessageBoxW(gm80_prompt_owner(),
-            L"Project files have been modified outside Game Maker and the "
-            L"project must be reloaded.\r\n"
-            L"Resource editor windows are open.\r\n\r\n"
-            L"Yes = APPLY the changes in those windows and continue\r\n"
-            L"No = DISCARD the unapplied changes in those windows and continue\r\n"
-            L"Cancel = keep editing for now (you will be asked again on save)",
+            tr(L"Project files have been modified outside Game Maker and the "
+               L"project must be reloaded.\r\n"
+               L"Resource editor windows are open.\r\n\r\n"
+               L"Yes = APPLY the changes in those windows and continue\r\n"
+               L"No = DISCARD the unapplied changes in those windows and continue\r\n"
+               L"Cancel = keep editing for now (you will be asked again on save)",
+               L"工程文件已在 Game Maker 之外被修改，需要重载工程。\r\n"
+               L"当前有资源编辑器窗口打开。\r\n\r\n"
+               L"是 = 应用这些窗口中的更改并继续\r\n"
+               L"否 = 丢弃这些窗口中未应用的更改并继续\r\n"
+               L"取消 = 暂不处理（保存时仍会再次询问）"),
             L"Game Maker 8.0", MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND);
         if (r == IDCANCEL)
         {
@@ -392,9 +407,11 @@ void project_watcher_tick()
                 g_close_flow = false;
                 g_flow_active = false;
                 MessageBoxW(gm80_prompt_owner(),
-                    L"Some resource editor windows could not be closed "
-                    L"automatically, so the reload was cancelled.\r\n"
-                    L"Close them and make an external change again to retry.",
+                    tr(L"Some resource editor windows could not be closed "
+                       L"automatically, so the reload was cancelled.\r\n"
+                       L"Close them and make an external change again to retry.",
+                       L"部分资源编辑器窗口无法自动关闭，重载已取消。\r\n"
+                       L"请手动关闭它们，然后再次进行外部更改即可重试。"),
                     L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
                 return;
             }
