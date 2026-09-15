@@ -18,6 +18,19 @@
 
 * { box-sizing: border-box; }
 
+/* Text selection: this is an app, not a document — only code surfaces (and
+   real inputs) allow selecting text. */
+html, body {
+    user-select: none;
+    -webkit-user-select: none;
+}
+.cm-content,
+.cm-lineNumbers .cm-gutterElement,
+input, textarea {
+    user-select: text;
+    -webkit-user-select: text;
+}
+
 html, body {
     margin: 0;
     height: 100%;
@@ -145,17 +158,10 @@ html, body {
 .cc-col.local-col .cc-label { color: var(--local); background: #f0f6fc; }
 .cc-col.base-col .cc-label { color: var(--muted); background: #f2f2f2; }
 .cc-col.remote-col .cc-label { color: var(--remote); background: #fdf6ee; }
-.cc-col pre {
-    margin: 0;
-    padding: 8px 10px;
-    font-family: Consolas, monospace;
-    font-size: 12px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    max-height: 220px;
-    overflow: auto;
-}
-.cc-col pre.empty { color: var(--muted); font-style: italic; }
+/* Conflict-card columns host read-only CodeMirror panes (codePane). */
+.code-pane { min-height: 24px; }
+.code-pane .cm-editor { background: transparent; }
+.code-pane .cm-placeholder { color: var(--muted); font-style: italic; }
 
 .result-head {
     display: flex;

@@ -2,10 +2,14 @@
 // Contract with the DLL: read session\manifest.json + base\local\remote copies;
 // write session\decisions.json + decisions\<rel>; exit 0 (apply) / 1 (cancel).
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { MergeView } from '@codemirror/merge';
-import { EditorView, lineNumbers } from '@codemirror/view';
+import { EditorView, lineNumbers, placeholder } from '@codemirror/view';
 import { EditorState } from '@codemirror/state';
-import { createGmlLanguage } from './gmlLanguage';
+import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+import { keymap } from '@codemirror/view';
+import { langExt } from './highlight';
+import { T, winTitle } from './i18n';
 import './style.css';
 
 interface ConflictRange {
@@ -97,21 +101,18 @@ function toast(msg: string) {
     setTimeout(() => t!.classList.remove('show'), 1600);
 }
 
-const statusLabel: Record<string, string> = {
-    conflict: '冲突',
-    auto: '自动合并',
-    local: '仅本地修改',
-    remote: '仅外部修改',
-};
+function statusLabel(status: string): string {
+    return (T.groups as Record<string, string>)[status] ?? status;
+}
 
 function renderList() {
     $list.innerHTML = '';
     if (!manifest) return;
     const groups: [string, string][] = [
-        ['conflict', '冲突'],
-        ['auto', '自动合并'],
-        ['local', '仅本地修改'],
-        ['remote', '仅外部修改'],
+        ['conflict', T.groups.conflict],
+        ['auto', T.groups.auto],
+        ['local', T.groups.local],
+        ['remote', T.groups.remote],
     ];
     for (const [status, label] of groups) {
         const files = manifest.files.filter((f) => f.status === status);
@@ -149,15 +150,36 @@ function renderList() {
     const textC = conflicts.filter((f) => f.kind === 'text').length;
     const binC = conflicts.filter((f) => f.kind === 'binary');
     const binUnresolved = binC.filter((f) => !states.get(f.path)?.binary).length;
-    $summary.textContent = `${manifest.files.length} 个文件有差异 · ${conflicts.length} 个冲突（文本 ${textC} / 二进制 ${binC.length}）`;
+    $summary.textContent = T.summary(manifest.files.length, conflicts.length, textC, binC.length);
     const applyBtn = document.getElementById('btn-apply') as HTMLButtonElement;
     applyBtn.disabled = binUnresolved > 0;
-    applyBtn.textContent =
-        binUnresolved > 0 ? `还有 ${binUnresolved} 个二进制冲突未选择` : '确认并应用（重载项目）';
+    applyBtn.textContent = binUnresolved > 0 ? T.applyBlocked(binUnresolved) : T.applyReady;
 }
 
-function langExt(path: string) {
-    return path.toLowerCase().endsWith('.gml') ? [createGmlLanguage()] : [];
+// A read-only code pane with line numbers offset by `startLine` (the pane
+// shows a slice of the file, so its first row is not line 1). Used for the
+// three conflict-card columns; the big side-by-side view is a MergeView.
+function codePane(text: string, startLine: number, path: string): HTMLElement {
+    const host = document.createElement('div');
+    host.className = 'code-pane';
+    new EditorView({
+        parent: host,
+        state: EditorState.create({
+            doc: text,
+            extensions: [
+                lineNumbers({ formatNumber: (n) => String(n - 1 + startLine) }),
+                EditorView.editable.of(false),
+                EditorState.readOnly.of(true),
+                EditorView.theme({
+                    '&': { maxHeight: '220px', fontSize: '12px' },
+                    '.cm-scroller': { overflow: 'auto', fontFamily: 'Consolas, monospace' },
+                }),
+                ...(text ? [] : [placeholder(T.colEmpty)]),
+                ...langExt(path),
+            ],
+        }),
+    });
+    return host;
 }
 
 const readOnlyExt = [EditorView.editable.of(false), EditorState.readOnly.of(true), lineNumbers()];
@@ -176,10 +198,10 @@ async function renderDetail() {
     pathEl.textContent = mf.path;
     const badge = document.createElement('span');
     badge.className = 'badge ' + mf.status;
-    badge.textContent = statusLabel[mf.status];
+    badge.textContent = statusLabel(mf.status);
     const enc = document.createElement('span');
     enc.style.color = 'var(--muted)';
-    enc.textContent = mf.kind === 'binary' ? '二进制' : `文本 · ${mf.encoding.toUpperCase()}`;
+    enc.textContent = mf.kind === 'binary' ? T.kindBinary : T.kindText(mf.encoding.toUpperCase());
     head.append(pathEl, badge, enc);
     $detail.appendChild(head);
 
@@ -187,7 +209,7 @@ async function renderDetail() {
         if (mf.status !== 'conflict') {
             const info = document.createElement('div');
             info.style.color = 'var(--muted)';
-            info.textContent = '二进制文件不支持内容级合并；本文件无冲突，将自动处理。';
+            info.textContent = T.binNoConflict;
             $detail.appendChild(info);
             return;
         }
@@ -211,8 +233,8 @@ async function renderDetail() {
             return card;
         };
         wrap.append(
-            mk('local', '保留本地（IDE 内版本）', '外部对该文件的更改将被覆盖'),
-            mk('remote', '使用外部（磁盘版本）', '本地对该文件的更改将被放弃'),
+            mk('local', T.binLocalTitle, T.binLocalSub),
+            mk('remote', T.binRemoteTitle, T.binRemoteSub),
         );
         $detail.appendChild(wrap);
         return;
@@ -234,10 +256,10 @@ async function renderDetail() {
     mvHead.className = 'mv-head';
     const hL = document.createElement('div');
     hL.className = 'hlocal';
-    hL.textContent = `本地（IDE）${st2.localLines.length} 行`;
+    hL.textContent = T.mvLocalHead(st2.localLines.length);
     const hR = document.createElement('div');
     hR.className = 'hremote';
-    hR.textContent = `外部（磁盘）${st2.remoteLines.length} 行`;
+    hR.textContent = T.mvRemoteHead(st2.remoteLines.length);
     mvHead.append(hL, hR);
     const mvHost = document.createElement('div');
     wrap.append(mvHead, mvHost);
@@ -257,14 +279,14 @@ async function renderDetail() {
         const quick = document.createElement('div');
         quick.style.margin = '12px 0 2px';
         const bAllL = document.createElement('button');
-        bAllL.textContent = '全部用本地';
+        bAllL.textContent = T.allLocal;
         bAllL.onclick = () => {
             const s = states.get(mf.path)!;
             s.choices = cs.map(() => 'local');
             renderDetail();
         };
         const bAllR = document.createElement('button');
-        bAllR.textContent = '全部用外部';
+        bAllR.textContent = T.allRemote;
         bAllR.onclick = () => {
             const s = states.get(mf.path)!;
             s.choices = cs.map(() => 'remote');
@@ -280,7 +302,7 @@ async function renderDetail() {
             head2.className = 'cc-head';
             const title = document.createElement('span');
             title.className = 'cc-title';
-            title.textContent = `冲突 ${i + 1}`;
+            title.textContent = T.conflictN(i + 1);
             const btns = document.createElement('div');
             btns.className = 'cc-btns';
             const mkBtn = (side: 'local' | 'remote', label: string) => {
@@ -299,27 +321,24 @@ async function renderDetail() {
                 };
                 return b;
             };
-            btns.append(mkBtn('local', '用本地'), mkBtn('remote', '用外部'));
+            btns.append(mkBtn('local', T.useLocal), mkBtn('remote', T.useRemote));
             head2.append(title, btns);
 
             const cols = document.createElement('div');
             cols.className = 'cc-cols';
-            const mkCol = (cls: 'local-col' | 'remote-col' | 'base-col', label: string, lines: string[]) => {
+            const mkCol = (cls: 'local-col' | 'remote-col' | 'base-col', label: string, lines: string[], startLine: number) => {
                 const col = document.createElement('div');
                 col.className = 'cc-col ' + cls;
                 const lab = document.createElement('div');
                 lab.className = 'cc-label';
                 lab.textContent = label;
-                const pre = document.createElement('pre');
-                pre.textContent = lines.length ? lines.join('\n') : '（无内容）';
-                if (!lines.length) pre.classList.add('empty');
-                col.append(lab, pre);
+                col.append(lab, codePane(lines.join('\n'), startLine, mf.path));
                 return col;
             };
             cols.append(
-                mkCol('local-col', '本地', st2.localLines.slice(c.l[0], c.l[0] + c.l[1])),
-                mkCol('base-col', '原始（基线）', st2.baseLines.slice(c.b[0], c.b[0] + c.b[1])),
-                mkCol('remote-col', '外部', st2.remoteLines.slice(c.r[0], c.r[0] + c.r[1])),
+                mkCol('local-col', T.colLocal, st2.localLines.slice(c.l[0], c.l[0] + c.l[1]), c.l[0] + 1),
+                mkCol('base-col', T.colBase, st2.baseLines.slice(c.b[0], c.b[0] + c.b[1]), c.b[0] + 1),
+                mkCol('remote-col', T.colRemote, st2.remoteLines.slice(c.r[0], c.r[0] + c.r[1]), c.r[0] + 1),
             );
             card.append(head2, cols);
             $detail.appendChild(card);
@@ -331,18 +350,18 @@ async function renderDetail() {
         const rh = document.createElement('div');
         rh.className = 'result-head';
         const h3 = document.createElement('h3');
-        h3.textContent = '最终内容';
+        h3.textContent = T.resultTitle;
         const bEdit = document.createElement('button');
         const s = states.get(mf.path)!;
-        bEdit.textContent = s.manual !== null ? '撤销手动编辑' : '手动编辑';
+        bEdit.textContent = s.manual !== null ? T.editOn : T.editOff;
         bEdit.onclick = () => {
             const ss = states.get(mf.path)!;
             if (ss.manual === null) {
                 ss.manual = computeResult(ss);
-                toast('已进入手动编辑模式，逐冲突选择已停用');
+                toast(T.toastManualOn);
             } else {
                 ss.manual = null;
-                toast('已恢复逐冲突选择');
+                toast(T.toastManualOff);
             }
             renderDetail();
         };
@@ -358,6 +377,8 @@ async function renderDetail() {
                 doc: finalText,
                 extensions: [
                     lineNumbers(),
+                    history(),
+                    keymap.of([...defaultKeymap, ...historyKeymap]),
                     ...(s.manual !== null ? [] : [EditorView.editable.of(false), EditorState.readOnly.of(true)]),
                     ...langExt(mf.path),
                     EditorView.updateListener.of((v) => {
@@ -397,6 +418,16 @@ document.getElementById('btn-cancel')!.addEventListener('click', () => finish(fa
 
 // ==== Boot ====
 (async () => {
+    // Follow the system language for static chrome too (index.html ships the
+    // Chinese defaults; the window title needs a Tauri call to change).
+    document.title = winTitle;
+    document.getElementById('title')!.textContent = T.headerTitle;
+    const hint = document.getElementById('hint');
+    if (hint) hint.innerHTML = T.hint.replace(/本地（GameMaker IDE）/, '<b>本地（GameMaker IDE）</b>');
+    (document.getElementById('btn-cancel') as HTMLButtonElement).textContent = T.btnCancel;
+    (document.getElementById('btn-apply') as HTMLButtonElement).textContent = T.applyReady;
+    getCurrentWindow().setTitle(winTitle).catch(() => {});
+
     try {
         manifest = await invoke<Manifest>('get_manifest');
     } catch (e) {
@@ -404,7 +435,7 @@ document.getElementById('btn-cancel')!.addEventListener('click', () => finish(fa
         const err = document.createElement('div');
         err.style.padding = '40px';
         err.style.color = 'var(--danger)';
-        err.textContent = `无法读取 manifest：${e}`;
+        err.textContent = T.errManifest(e);
         $detail.appendChild(err);
         return;
     }

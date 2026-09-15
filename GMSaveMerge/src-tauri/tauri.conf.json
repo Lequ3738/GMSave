@@ -12,7 +12,7 @@
     "app": {
         "windows": [
             {
-                "title": "GMSave — 合并外部更改",
+                "title": "GameMaker 8.0 - 合并外部更改",
                 "width": 1280,
                 "height": 840,
                 "minWidth": 900,
