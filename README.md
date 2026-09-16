@@ -15,7 +15,7 @@
 ## 如何使用
 
 1. 请检查你的 GameMaker 8.0 安装目录，目录下是否有 `FoxPluginLoader.dll` 和 `FoxPlugin.txt`。该插件靠这两个文件进行加载。
-2. 到 Release 下载最新版本的二进制发布，将 `GMSave.dll` 放在 `(安装目录)\FoxPlugin` 文件夹下（或你能找到的磁盘上的任意地方）。
+2. 到 Release 下载最新版本的二进制发布，解压后，将 `GMSave.dll` 和 `GMSaveMerge.exe` 放在 `(安装目录)\FoxPlugin` 文件夹下（或你能找到的磁盘上的任意地方）。
 3. 打开 `FoxPlugin.txt`，新建一行并写入 `"FoxPlugin\GMSave.dll"`（或被双引号包裹的其他路径）。并保存该文件。
 4. 打开 GameMaker 8.0 并开始使用 .gm80 格式。
 
