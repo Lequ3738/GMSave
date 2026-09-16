@@ -552,6 +552,14 @@ struct MergeFile
     FileStatus status = FS_UNCHANGED;
     diff3::Result dres; // text three-way details
     std::string resultB;
+    // Disk state at session-build time. apply_decisions re-stats every file
+    // it is about to touch and aborts the whole apply when either side moved:
+    // writes are computed from THIS remote snapshot, so clobbering a newer
+    // disk version would silently lose those edits (and SAVE_END would then
+    // mask them forever).
+    bool diskMeta = false; // file existed on disk when the session was built
+    unsigned long long diskSize = 0;
+    long long diskMtime = 0;
 };
 
 static bool load_text_or_hash(MergeFile& mf, const fs::path& base,
@@ -749,67 +757,121 @@ static DWORD wait_tool_with_pump(HANDLE proc)
 
 // ==== Apply ====
 
-static bool apply_decisions(const std::wstring& projDir, const fs::path& session,
+// What apply would do to one file — resolved with NO side effects so the
+// disk-verification pass can run before anything is written or stopped.
+struct PlannedAction
+{
+    fs::path src;
+    bool useResult = false, wantDelete = false, skip = false;
+};
+
+static PlannedAction plan_action(const MergeFile& mf,
+    const std::map<std::wstring, std::string>& decisions,
+    const fs::path& session, const fs::path& staging,
+    const std::set<std::wstring>& edited, bool& contentError)
+{
+    PlannedAction a;
+    auto dit = decisions.find(mf.rel);
+    std::string action = (dit != decisions.end()) ? dit->second : "auto";
+    // A conflict REQUIRES an explicit decision; missing one (tool bug)
+    // degrades to keeping the local side rather than aborting mid-apply.
+    if (mf.status == FS_CONFLICT && dit == decisions.end()) action = "local";
+
+    // Resolve the effect: {srcFile | resultBytes | delete | nothing}.
+    if (action == "remote")
+    {
+        if (!mf.hasRemote) a.wantDelete = true; // remote side deleted it
+        else a.skip = true;                     // disk already holds remote
+    }
+    else if (action == "edited")
+    {
+        a.src = session / L"decisions" / mf.rel;
+        std::error_code ec;
+        if (!fs::is_regular_file(a.src, ec) || !edited.count(mf.rel))
+        {
+            gm_log("MergeFlow: missing edited content for '%S'",
+                mf.rel.c_str());
+            contentError = true;
+            a.skip = true;
+        }
+    }
+    else if (action == "local")
+    {
+        if (!mf.hasLocal) a.wantDelete = true; // local side deleted it
+        else a.src = staging / mf.rel;
+    }
+    else // auto
+    {
+        switch (mf.status)
+        {
+        case FS_UNCHANGED:
+        case FS_REMOTE:
+        case FS_DELETED: a.skip = true; break;
+        case FS_LOCAL: a.src = staging / mf.rel; break;
+        case FS_AUTO: a.useResult = true; break;
+        case FS_DELETE_LOCAL: a.wantDelete = true; break;
+        case FS_CONFLICT:
+            if (mf.hasLocal) a.src = staging / mf.rel;
+            else a.wantDelete = true;
+            break;
+        }
+    }
+    return a;
+}
+
+// Returns 0 = applied (per-file errors are logged, ok stays true for them),
+// 2 = the disk moved under the tool session — NOTHING was written and the
+// caller must NOT reload (the flow re-runs instead). movedList (when rc==2)
+// holds a preview list of the files that changed, for the user prompt.
+static int apply_decisions(const std::wstring& projDir, const fs::path& session,
     const fs::path& staging, std::vector<MergeFile>& files,
     const std::map<std::wstring, std::string>& decisions,
-    const std::set<std::wstring>& edited)
+    const std::set<std::wstring>& edited, std::wstring& movedList)
 {
+    // Pass 1: plan every effect and verify each file we are about to touch
+    // still matches the disk state the session snapshot was built from.
+    // Writes/deletes are computed from THAT snapshot, so touching a newer
+    // disk version would silently lose the edits made while the tool was
+    // open — and SAVE_END afterwards would mask the loss forever. Abort
+    // instead, before stopping the watcher or writing anything.
+    bool contentError = false;
+    std::vector<PlannedAction> plan;
+    plan.reserve(files.size());
+    for (auto& mf : files)
+    {
+        PlannedAction a = plan_action(mf, decisions, session, staging, edited,
+            contentError);
+        if (!a.skip)
+        {
+            unsigned long long sz = 0;
+            long long mt = 0;
+            bool exists = file_meta(fs::path(projDir) / mf.rel, sz, mt);
+            bool same = mf.diskMeta ? (exists && sz == mf.diskSize &&
+                                       mt == mf.diskMtime)
+                                    : !exists;
+            if (!same)
+            {
+                if (movedList.size() < 800) movedList += L"\n  " + mf.rel;
+                gm_log("MergeFlow: '%S' changed since the session was built",
+                    mf.rel.c_str());
+            }
+        }
+        plan.push_back(std::move(a));
+    }
+    if (!movedList.empty()) return 2;
+
     // Stop the watcher BEFORE touching disk so our own writes never read as
     // foreign changes; the reload re-arms it after the load.
     project_watcher_stop();
 
+    // Pass 2: execute (backup first, then write/delete).
     fs::path backup = session / L"backup";
-    bool ok = true;
-    for (auto& mf : files)
+    bool ok = !contentError;
+    for (size_t i = 0; i < files.size(); i++)
     {
+        const MergeFile& mf = files[i];
+        const PlannedAction& a = plan[i];
         fs::path disk = fs::path(projDir) / mf.rel;
-        auto dit = decisions.find(mf.rel);
-        std::string action = (dit != decisions.end()) ? dit->second : "auto";
-        // A conflict REQUIRES an explicit decision; missing one (tool bug)
-        // degrades to keeping the local side rather than aborting mid-apply.
-        if (mf.status == FS_CONFLICT && dit == decisions.end()) action = "local";
-
-        // Resolve the effect: {srcFile | resultBytes | delete | nothing}.
-        fs::path src;
-        bool useResult = false, wantDelete = false, skip = false;
-        if (action == "remote")
-        {
-            if (!mf.hasRemote) wantDelete = true; // remote side deleted it
-            else skip = true;                     // disk already holds remote
-        }
-        else if (action == "edited")
-        {
-            src = session / L"decisions" / mf.rel;
-            std::error_code ec;
-            if (!fs::is_regular_file(src, ec) || !edited.count(mf.rel))
-            {
-                gm_log("MergeFlow: missing edited content for '%S'",
-                    mf.rel.c_str());
-                ok = false;
-                skip = true;
-            }
-        }
-        else if (action == "local")
-        {
-            if (!mf.hasLocal) wantDelete = true; // local side deleted it
-            else src = staging / mf.rel;
-        }
-        else // auto
-        {
-            switch (mf.status)
-            {
-            case FS_UNCHANGED:
-            case FS_REMOTE:
-            case FS_DELETED: skip = true; break;
-            case FS_LOCAL: src = staging / mf.rel; break;
-            case FS_AUTO: useResult = true; break;
-            case FS_DELETE_LOCAL: wantDelete = true; break;
-            case FS_CONFLICT: action = "local";
-                if (mf.hasLocal) src = staging / mf.rel;
-                else wantDelete = true;
-                break;
-            }
-        }
 
         std::error_code ec;
         auto backupDisk = [&]()
@@ -819,26 +881,26 @@ static bool apply_decisions(const std::wstring& projDir, const fs::path& session
                     fs::copy_options::overwrite_existing, ec);
         };
 
-        if (skip) continue;
-        if (wantDelete)
+        if (a.skip) continue;
+        if (a.wantDelete)
         {
             backupDisk();
             if (fs::is_regular_file(disk, ec) && !fs::remove(disk, ec)) ok = false;
         }
-        else if (!src.empty())
+        else if (!a.src.empty())
         {
             backupDisk();
             fs::create_directories(disk.parent_path(), ec);
-            fs::copy_file(src, disk, fs::copy_options::overwrite_existing, ec);
+            fs::copy_file(a.src, disk, fs::copy_options::overwrite_existing, ec);
             if (ec) ok = false;
         }
-        else if (useResult)
+        else if (a.useResult)
         {
             backupDisk();
             if (!write_bytes(disk, mf.resultB)) ok = false;
         }
     }
-    return ok;
+    return ok ? 0 : 1;
 }
 
 // ==== The flow ====
@@ -979,6 +1041,8 @@ bool merge_flow_run(const std::wstring& projDir)
         if (mf.status == FS_LOCAL || mf.status == FS_AUTO) anyLocal = true;
         if (mf.status == FS_REMOTE) anyRemote = true;
         if (mf.status == FS_CONFLICT) anyConflict = true;
+        mf.diskMeta = file_meta(fs::path(projDir) / rel, mf.diskSize,
+            mf.diskMtime);
         files.push_back(std::move(mf));
     }
     gm_log("MergeFlow: %zu changed files (conflicts=%d local=%d remote=%d)",
@@ -1166,9 +1230,33 @@ bool merge_flow_run(const std::wstring& projDir)
     }
 
     // 4. apply + reload
-    bool appliedOk = apply_decisions(projDir, session, staging, files, decisions,
-        edited);
-    if (!appliedOk)
+    std::wstring movedList;
+    int rc = apply_decisions(projDir, session, staging, files, decisions,
+        edited, movedList);
+    if (rc == 2)
+    {
+        // The disk moved while the tool was open. Applying would have
+        // clobbered those newer edits, so nothing was written — re-arm the
+        // flow and let it re-run against the current disk (the tool's
+        // decisions for the moved files are redone there, this time with
+        // them visible as the remote side).
+        gm_log("MergeFlow: disk changed during the tool session — aborted, "
+               "nothing written");
+        project_watcher_rearm_pending();
+        MessageBoxW(gm80_prompt_owner(),
+            (std::wstring(tr(L"Project files were modified on disk while the "
+                             L"merge tool was open:",
+                             L"合并工具打开期间，以下工程文件又在磁盘上被修改了：")) +
+             movedList +
+             tr(L"\r\n\r\nThe merge was cancelled and NOTHING was written. "
+                L"It will restart automatically using the latest files.",
+                L"\r\n\r\n本次合并已取消，未写入任何内容；"
+                L"稍后将使用最新文件自动重新运行。"))
+                .c_str(),
+            L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        return false;
+    }
+    if (rc != 0)
         gm_log("MergeFlow: apply had errors — reloading anyway (backups in session\\backup)");
     else
         gm_log("MergeFlow: applied — reloading project");

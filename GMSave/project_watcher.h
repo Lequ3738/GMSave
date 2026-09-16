@@ -11,6 +11,14 @@ void project_watcher_start(const std::wstring& path);
 // Stop watching and clear the pending-foreign-change flag.
 void project_watcher_stop();
 
+// Set the pending-foreign-change flag while the watcher keeps running: the
+// next tick re-runs the whole flow against the current disk. Used by
+// merge_flow when an apply was aborted because the disk moved under the tool
+// session — the newer disk content must be re-classified, not clobbered.
+// No-op in effect if the watcher is stopped (the flag is cleared on the next
+// start/stop); the save-side disk_differs check covers that path.
+void project_watcher_rearm_pending();
+
 // Record SAVE_END = now (call after our own save completes so our writes aren't
 // treated as foreign changes).
 void project_watcher_mark_saved();

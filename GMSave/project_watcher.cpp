@@ -5,9 +5,12 @@
 //   - A hidden-window timer (1s) on the main thread polls the flag and acts:
 //       * user has NO unsaved changes  -> silent reload (GM80_LoadRecentProject)
 //       * user HAS unsaved changes     -> Yes/No prompt (conflict)
-//   - Safety gate: only act when no modal dialog is focused and no resource
-//     editor form is open, so the reload never runs while UI references
-//     resources that InitializeProject is about to free.
+//   - Safety gates: the flow only starts while the IDE is the foreground
+//     process (an external editor keeps itself focused for the whole duration
+//     of an edit session, so this waits out mid-edit batches), and merge_flow
+//     further defers while non-editor modals or standalone code editors are
+//     open, so the reload never runs while UI references resources that
+//     InitializeProject is about to free.
 #include "pch.h"
 #include "project_watcher.h"
 #include "gm80_addresses.h"
@@ -209,6 +212,12 @@ void project_watcher_stop()
     gm_log("Watcher: stopped");
 }
 
+void project_watcher_rearm_pending()
+{
+    InterlockedExchange(&g_pending_foreign, 1);
+    gm_log("Watcher: pending re-armed — flow will re-run");
+}
+
 void project_watcher_start(const std::wstring& path)
 {
     // Lazy-create the main-thread timer window here (first start). Called on the
@@ -328,6 +337,21 @@ static bool watcher_path_current()
     return _wcsicmp(wdir.c_str(), g_watch_path.c_str()) == 0;
 }
 
+// True when the foreground window belongs to this process (the IDE itself).
+// The "user is back in Game Maker" gate: while an external editor is the
+// foreground app its saves are still arriving — acting then would reload a
+// half-finished edit batch. Any IDE-owned window counts (main form, a GM
+// dialog, an editor), so the gate only blocks while the user is genuinely
+// working somewhere else.
+static bool ide_foreground()
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
 void project_watcher_tick()
 {
     // While closing editors the pending flag is already consumed — the
@@ -348,6 +372,22 @@ void project_watcher_tick()
         project_watcher_stop();
         g_close_flow = false;
         return;
+    }
+    // Act only while the IDE is frontmost. The pending flag (and any close
+    // flow already in progress) survives this gate untouched — the flow runs
+    // on the first tick after the user switches back to Game Maker. A close
+    // flow paused here is safe: the WM_CLOSEs were already posted and the
+    // main-thread message loop processes them regardless of this timer.
+    {
+        static bool was_fg = true;
+        bool fg = ide_foreground();
+        if (fg != was_fg)
+        {
+            gm_log("Watcher: %s", fg ? "IDE foreground — resuming flow"
+                                     : "IDE not foreground — deferring");
+            was_fg = fg;
+        }
+        if (!fg) return;
     }
     // A modal that is not a resource editor (message box, file dialog,
     // preferences…) — defer politely; the pending flag stays set.

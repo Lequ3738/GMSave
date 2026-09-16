@@ -318,7 +318,16 @@ static void __stdcall do_gm80_save_if_needed()
             // Full merge flow (editor prompts → staging → tool → reload).
             // After it returns the IDE holds the merged state — nothing left
             // to save for this Ctrl+S.
-            merge_flow_run(g_gm80_save_path);
+            bool reloaded = merge_flow_run(g_gm80_save_path);
+            // This hook stopped the watcher on entry and the flow only
+            // restarts it through a successful reload. If we got here without
+            // one (user cancelled, or the apply aborted because the disk
+            // moved under the tool), re-arm so FUTURE external edits are
+            // still detected. project_watcher_start re-baselines SAVE_END,
+            // so changes already on disk stay masked here — the disk_differs
+            // check at the top of this hook catches those on the next save.
+            if (!reloaded && !project_watcher_is_running())
+                project_watcher_start(g_gm80_save_path);
             return;
         }
         // IDNO falls through: this save overwrites; the snapshot refresh
