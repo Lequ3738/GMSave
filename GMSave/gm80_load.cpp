@@ -3672,6 +3672,33 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     gm_log("Loading resource trees...");
     {
         GmPerfSpan _pf("load.trees");
+        // Bulk-insert speedup: every TVM_INSERTITEM into a live treeview does
+        // per-item layout/invalidation work; with WM_SETREDRAW off the same
+        // inserts are several times cheaper (~2600 nodes cost 0.8s+ otherwise).
+        // RAII so no return/unwind path can leave the control frozen. HWND
+        // plumbing identical to tree_set_expanded_gm ([tv+0x1B4]).
+        HWND tvHwnd = NULL;
+        {
+            void* tv = *(void**)((uint8_t*)g_load_base + 0x1F6288);
+            if (tv && (uintptr_t)tv >= 0x10000 && !IsBadReadPtr(tv, 0x1B8))
+                tvHwnd = *(HWND*)((uint8_t*)tv + 0x1B4);
+        }
+        struct RedrawOff
+        {
+            HWND h;
+            explicit RedrawOff(HWND hwnd)
+                : h(hwnd && IsWindow(hwnd) ? hwnd : NULL)
+            {
+                if (h) SendMessageW(h, WM_SETREDRAW, FALSE, 0);
+            }
+            ~RedrawOff()
+            {
+                if (!h) return;
+                SendMessageW(h, WM_SETREDRAW, TRUE, 0);
+                RedrawWindow(h, NULL, NULL,
+                    RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+            }
+        } redrawOff(tvHwnd);
         const struct
         {
             const char* dir;

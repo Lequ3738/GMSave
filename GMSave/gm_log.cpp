@@ -1,7 +1,5 @@
-// Shared log implementation (see gm_log.h). gm_log is compiled only in Debug
-// builds (in Release it is a no-op macro, so nothing references it); gm_perf
-// and gm_perf_ms are always compiled — the perf log is the Release-visible
-// window into load/save stage timing.
+// Shared log implementation (see gm_log.h). Compiled only in Debug builds —
+// in Release gm_log/gm_perf are no-op macros and nothing references this TU.
 #include "pch.h"
 #include "gm_log.h"
 
@@ -22,7 +20,6 @@ void gm_log(const char* fmt, ...)
         fclose(f);
     }
 }
-#endif
 
 double gm_perf_ms()
 {
@@ -54,3 +51,4 @@ void gm_perf(const char* fmt, ...)
     fprintf(f, "%9.1f %s\n", gm_perf_ms(), buf);
     fclose(f);
 }
+#endif

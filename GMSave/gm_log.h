@@ -1,20 +1,17 @@
-// Plugin-wide logging. gm_log is compiled OUT of Release builds: in Release
-// every call becomes a no-op and its arguments are not evaluated, so the
-// plugin carries zero logging cost. In Debug builds each call appends one line
-// to %TEMP%\GMSave.log.
-//
-// gm_perf is the exception: it is compiled into Release too. Each call appends
-// one line to %TEMP%\GMSave.perf.log (truncated at the first write of a
-// process, so the file holds the current session only) — a handful of lines
-// per load/save, used to watch where load/save time actually goes.
+// Plugin-wide logging. gm_log, gm_perf and the GmPerfSpan timer are compiled
+// OUT of Release builds: in Release every call becomes a no-op and its
+// arguments are not evaluated, and GmPerfSpan is an empty struct the compiler
+// eliminates — the plugin carries zero logging/timing cost. In Debug builds:
+//   gm_log      appends one line to %TEMP%\GMSave.log
+//   gm_perf     appends one line to %TEMP%\GMSave.perf.log (truncated at the
+//               first write of a process, so the file holds the current
+//               session only) — load/save/merge stage timing; re-enable a
+//               Release build of these only while actually measuring.
 #pragma once
 #include <cstdarg>
 
 #ifdef _DEBUG
 void gm_log(const char* fmt, ...);
-#else
-#define gm_log(...) ((void)0)
-#endif
 
 // QPC milliseconds since an arbitrary origin (process lifetime is enough —
 // only deltas between gm_perf lines are meaningful).
@@ -34,3 +31,11 @@ struct GmPerfSpan
     GmPerfSpan(const GmPerfSpan&) = delete;
     GmPerfSpan& operator=(const GmPerfSpan&) = delete;
 };
+#else
+#define gm_log(...) ((void)0)
+#define gm_perf(...) ((void)0)
+struct GmPerfSpan
+{
+    explicit GmPerfSpan(const char*) {}
+};
+#endif

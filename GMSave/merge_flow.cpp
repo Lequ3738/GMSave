@@ -284,7 +284,7 @@ static bool file_meta(const fs::path& p, unsigned long long& size, long long& mt
 // still exist before reuse (missing → fall through to a fresh read+copy).
 void merge_flow_snapshot_refresh(const std::wstring& projDir)
 {
-    double t0 = gm_perf_ms();
+    GmPerfSpan _pf("merge.snapshot");
     fs::path snap = snapshot_dir_of(projDir);
     std::error_code ec;
     fs::path root = snap / L"root";
@@ -358,8 +358,6 @@ void merge_flow_snapshot_refresh(const std::wstring& projDir)
     write_snapshot_manifest(snap / L"manifest.json", entries);
     gm_log("MergeFlow: snapshot refreshed (%zu files, %zu reused)",
         entries.size(), reused);
-    gm_perf("merge.snapshot %.1fms n=%zu reused=%zu reread=%zu", gm_perf_ms() - t0,
-        entries.size(), reused, entries.size() - reused);
 }
 
 bool merge_flow_disk_differs(const std::wstring& projDir)
