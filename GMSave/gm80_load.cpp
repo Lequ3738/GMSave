@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <vector>
 #include <array>
 #include <algorithm>
@@ -143,13 +144,31 @@ static std::string utf8_to_ansi_if_valid(const std::string& s)
 }
 
 // ==== File I/O ====
+// FILE* instead of ifstream+ostringstream: the stream version copied every
+// file's bytes twice (streambuf → stringstream → returned string). With
+// thousands of files per project load the extra copies and stream setup are
+// measurable.
+// NOTE the fseek(SEEK_SET): after probing the size at SEEK_END the position
+// must go back to 0 before fread — reading from EOF yields 0 bytes and an
+// empty string. Missing this made EVERY load read return "" (2026-09-19:
+// project opened with an empty resource tree, load "succeeding" at 36ms).
 static std::string read_file(const fs::path& p)
 {
-    std::ifstream f(p, std::ios::binary);
+    FILE* f = _wfopen(p.c_str(), L"rb");
     if (!f) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string r;
+    if (fseek(f, 0, SEEK_END) == 0)
+    {
+        long sz = ftell(f);
+        if (fseek(f, 0, SEEK_SET) == 0 && sz > 0 && sz < 64 * 1024 * 1024)
+        {
+            r.resize((size_t)sz);
+            size_t rd = fread(&r[0], 1, (size_t)sz, f);
+            r.resize(rd);
+        }
+    }
+    fclose(f);
+    return r;
 }
 static bool file_exists(const fs::path& p)
 {
@@ -2964,6 +2983,30 @@ static void load_room_instances(void* rm, const fs::path& subDir,
 {
     const std::string roomName = subDir.filename().string();
 
+    // Per-row name resolution over hash maps instead of a linear scan per
+    // row: rooms with tens of thousands of tile/instance rows each re-scanned
+    // the whole names vector (O(rows × names)). Same first-match semantics as
+    // name_to_index (emplace keeps the first duplicate).
+    struct NameIndexMap
+    {
+        std::unordered_map<std::string, int> m;
+        explicit NameIndexMap(const std::vector<std::string>& names)
+        {
+            for (size_t i = 0; i < names.size(); i++) m.emplace(names[i], (int)i);
+        }
+    };
+    NameIndexMap objMap(objectNames), bgMap(bgNames);
+    auto resolve = [&](const char* what, const std::string& name,
+                       const NameIndexMap& map,
+                       const std::vector<std::string>& names) -> int {
+        // Empty = GM's "none"; must never hit a blank index.yyd slot.
+        if (name.empty()) return -1;
+        auto it = map.m.find(name);
+        if (it != map.m.end()) return it->second;
+        // Miss: go through the warn path so the diagnostic is still recorded.
+        return resolve_name_warn(roomName.c_str(), what, name, names);
+    };
+
     // ==== Instances (instances.txt) ====
     {
         fs::path instPath = subDir / "instances.txt";
@@ -2998,8 +3041,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                 cols.push_back(line.substr(s));
                 if (cols.size() < 5) continue;
                 InstRow r;
-                r.obj = resolve_name_warn(
-                    roomName.c_str(), "instance object", cols[0], objectNames);
+                r.obj = resolve("instance object", cols[0], objMap, objectNames);
                 r.x = p_i32(cols[1]);
                 r.y = p_i32(cols[2]);
                 r.hash = cols[3];
@@ -3089,8 +3131,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                     std::array<int32_t, 10> t = {};
                     t[0] = p_i32(cols[1]); // x
                     t[1] = p_i32(cols[2]); // y
-                    t[2] = resolve_name_warn(roomName.c_str(), "tile background", cols[0],
-                        bgNames); // source_bg
+                    t[2] = resolve("tile background", cols[0], bgMap, bgNames); // source_bg
                     t[3] = p_i32(cols[3]); // u
                     t[4] = p_i32(cols[4]); // v
                     t[5] = p_i32(cols[5]); // width
@@ -3401,13 +3442,14 @@ bool gm80_load_project(void* gm_base, const std::wstring& wpath)
 
 static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
 {
+    GmPerfSpan _pf_total("load.TOTAL");
     g_load_base = gm_base;
     gm80_instance_hashes_clear();
     gm80_diag_reset();
     fs::path root(wpath);
     if (!fs::is_directory(root)) return false;
     // 0. Resource-tree expansion state (tree_state.yyd) — restore after load.
-    load_tree_state(root);
+    { GmPerfSpan _pf("load.tree_state"); load_tree_state(root); }
     // Ensure GM's id counters start in the valid ranges: instance ids < 100001
     // would collide with the object namespace (0-100000), tile ids < 10000001
     // with backgrounds. GM's room load post-process re-assigns ids from these
@@ -3442,7 +3484,10 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     auto stem = root.filename();
     std::string projName = "";
     fs::path metaFile; // the .gm80 metadata FILE inside the project folder
+    bool metaRead = false; // a .gm80 candidate was found AND read successfully
     uint32_t fileVersion = 1; // missing gm80_version → old file, load tolerantly
+    {
+        GmPerfSpan _pf("load.metadata");
     // Find the .gm80 metadata file
     for (auto& entry : fs::directory_iterator(root))
     {
@@ -3454,6 +3499,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
             std::string meta = read_file(entry.path());
             if (!meta.empty())
             {
+                metaRead = true;
                 parse_kv(meta,
                     [&](auto& k, auto& v)
                 {
@@ -3480,6 +3526,20 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
             }
         }
     }
+    // Read-back sanity: a .gm80 metadata file EXISTS (it is what triggered
+    // this load) but could not be read. Failing loudly here beats continuing
+    // into a "successful" load of nothing — the IDE then shows an empty tree
+    // and a subsequent save would overwrite the real project with it
+    // (2026-09-19: read_file returned "" for everything, load "succeeded").
+    if (!metaRead && !metaFile.empty())
+    {
+        gm_log("Load: ABORT — metadata file exists but is unreadable");
+        MessageBoxA(gm80_prompt_owner(),
+            "The project's .gm80 metadata file exists but could not be read.\r\n"
+            "The project was NOT loaded.",
+            "Game Maker 8.0", MB_OK | MB_ICONERROR);
+        return false;
+    }
     // Refuse files from a NEWER GMSave — the format may have changed and we'd
     // misread it (gm82save parity: rejects a newer gm82_version).
     if (fileVersion > GM80_VERSION)
@@ -3493,15 +3553,15 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
         MessageBoxA(gm80_prompt_owner(), buf, "Game Maker 8.0", MB_OK | MB_ICONERROR);
         return false;
     }
+    }
 
     gm_log("Load: metadata done");
     // 3. Load settings + constants
-    load_settings(root);
+    { GmPerfSpan _pf("load.settings"); load_settings(root); }
     gm_log("Load: settings done");
-    load_gameinfo(root);
-    load_extensions(root);
+    { GmPerfSpan _pf("load.gameinfo_ext"); load_gameinfo(root); load_extensions(root); }
     gm_log("Load: extensions done");
-    load_included_files(root);
+    { GmPerfSpan _pf("load.datafiles"); load_included_files(root); }
     gm_log("Load: included files done");
 
     // 4. Load triggers (single array, names live inside objects at +4)
@@ -3527,37 +3587,43 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
 
     // 5. Load sounds
     gm_log("Loading sounds...");
-    load_assets_simple("sounds", load_sound, find_res("sounds"), root);
+    { GmPerfSpan _pf("load.sounds");
+    load_assets_simple("sounds", load_sound, find_res("sounds"), root); }
     gm_log("Sounds done.");
     gm80_progress_step(10);
 
     // 6. Load sprites
     gm_log("Loading sprites...");
-    load_assets_simple("sprites", load_sprite_obj, find_res("sprites"), root);
+    { GmPerfSpan _pf("load.sprites");
+    load_assets_simple("sprites", load_sprite_obj, find_res("sprites"), root); }
     gm_log("Sprites done.");
     gm80_progress_step(20);
 
     // 7. Load backgrounds
     gm_log("Loading backgrounds...");
-    load_assets_simple("backgrounds", load_bg_obj, find_res("backgrounds"), root);
+    { GmPerfSpan _pf("load.backgrounds");
+    load_assets_simple("backgrounds", load_bg_obj, find_res("backgrounds"), root); }
     gm_log("Backgrounds done.");
     gm80_progress_step(30);
 
     // 8. Load paths
     gm_log("Loading paths...");
-    load_assets_simple("paths", load_path_obj, find_res("paths"), root);
+    { GmPerfSpan _pf("load.paths");
+    load_assets_simple("paths", load_path_obj, find_res("paths"), root); }
     gm_log("Paths done.");
     gm80_progress_step(40);
 
     // 9. Load scripts
     gm_log("Loading scripts...");
-    load_assets_simple("scripts", load_script, find_res("scripts"), root);
+    { GmPerfSpan _pf("load.scripts");
+    load_assets_simple("scripts", load_script, find_res("scripts"), root); }
     gm_log("Scripts done.");
     gm80_progress_step(50);
 
     // 10. Load fonts
     gm_log("Loading fonts...");
-    load_assets_simple("fonts", load_font, find_res("fonts"), root);
+    { GmPerfSpan _pf("load.fonts");
+    load_assets_simple("fonts", load_font, find_res("fonts"), root); }
     gm_log("Fonts done.");
     gm80_progress_step(60);
 
@@ -3581,6 +3647,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
 
     gm_log("Loading objects...");
     {
+        GmPerfSpan _pf("load.objects");
         auto names = load_names(root / "objects" / "index.yyd");
         auto sprites = load_names(root / "sprites" / "index.yyd");
         load_assets_ctx(
@@ -3592,6 +3659,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     // 12. Load rooms (needs object + background name context)
     gm_log("Loading rooms...");
     {
+        GmPerfSpan _pf("load.rooms");
         auto names = load_names(root / "rooms" / "index.yyd");
         auto objs = load_names(root / "objects" / "index.yyd");
         auto bgs = load_names(root / "backgrounds" / "index.yyd");
@@ -3603,6 +3671,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     // 13. Resource tree (tree.yyd per type) — needed for the IDE to display assets
     gm_log("Loading resource trees...");
     {
+        GmPerfSpan _pf("load.trees");
         const struct
         {
             const char* dir;
@@ -3629,12 +3698,13 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
 
     // 14. Load timelines (before objects — they share the Event/Action system)
     gm_log("Loading timelines...");
-    load_assets_simple("timelines", load_timeline, find_res("timelines"), root);
+    { GmPerfSpan _pf("load.timelines");
+    load_assets_simple("timelines", load_timeline, find_res("timelines"), root); }
     gm_log("Timelines done.");
     gm80_progress_step(100);
 
     // 14b. Font installation verification (warn about fonts not on this system)
-    verify_fonts();
+    { GmPerfSpan _pf("load.fonts_check"); verify_fonts(); }
 
     // 14c. Diagnostics: broken asset references collected during the load.
     gm80_diag_show("Game Maker 8.0");

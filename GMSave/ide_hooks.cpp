@@ -293,7 +293,10 @@ static void __stdcall do_gm80_save_if_needed()
     // Save-side conflict check: disk carries external changes our snapshot
     // doesn't know about (e.g. the user dismissed the reload prompt earlier).
     // Ask every time — a silent overwrite could discard unseen external edits.
-    if (merge_flow_disk_differs(g_gm80_save_path))
+    bool diskDiffers = false;
+    { GmPerfSpan _pf("merge.disk_differs");
+      diskDiffers = merge_flow_disk_differs(g_gm80_save_path); }
+    if (diskDiffers)
     {
         gm_log("Save: external changes detected on disk");
         int r = MessageBoxW(gm80_prompt_owner(),
@@ -337,29 +340,32 @@ static void __stdcall do_gm80_save_if_needed()
     gm80_progress_show();
     gm80_progress_step(25);
     bool ok = false;
-    try
     {
-        if (!gm80_save_seh(g_gm_base, g_gm80_save_path)) gm_log("Save: ERROR");
-        else
+        GmPerfSpan _pf("save.ctrl_s");
+        try
         {
-            gm_log("Save: .gm80 complete");
-            clear_updated_flags();
-            // Re-arm the watcher + SAVE_END so subsequent foreign edits are seen.
-            project_watcher_start(g_gm80_save_path);
-            project_watcher_mark_saved();
-            // Disk == IDE memory now → this is the new three-way merge base.
-            merge_flow_snapshot_refresh(g_gm80_save_path);
-            ok = true;
+            if (!gm80_save_seh(g_gm_base, g_gm80_save_path)) gm_log("Save: ERROR");
+            else
+            {
+                gm_log("Save: .gm80 complete");
+                clear_updated_flags();
+                // Re-arm the watcher + SAVE_END so subsequent foreign edits are seen.
+                project_watcher_start(g_gm80_save_path);
+                project_watcher_mark_saved();
+                // Disk == IDE memory now → this is the new three-way merge base.
+                merge_flow_snapshot_refresh(g_gm80_save_path);
+                ok = true;
+            }
         }
-    }
-    catch (const std::exception& e)
-    {
-        (void)e; // referenced only by the Debug log below; keep Release warning-free
-        gm_log("Save: EXCEPTION: %s", e.what());
-    }
-    catch (...)
-    {
-        gm_log("Save: UNKNOWN EXCEPTION");
+        catch (const std::exception& e)
+        {
+            (void)e; // referenced only by the Debug log below; keep Release warning-free
+            gm_log("Save: EXCEPTION: %s", e.what());
+        }
+        catch (...)
+        {
+            gm_log("Save: UNKNOWN EXCEPTION");
+        }
     }
     gm80_progress_step(100);
     gm80_progress_close();
@@ -706,7 +712,9 @@ static int __stdcall check_and_do_gm80_load()
 
     // Direct Delphi object creation via gm80_load_project
     // (Delphi MM is ready — InitializeProject already ran at this point)
-    if (gm80_load_project(g_gm_base, dirPath))
+    bool loaded = false;
+    { GmPerfSpan _pf("load.open"); loaded = gm80_load_project(g_gm_base, dirPath); }
+    if (loaded)
     {
         gm_log("Load: .gm80 direct Delphi objects — SUCCESS");
         // Start the file watcher so external edits are detected (merge flow:

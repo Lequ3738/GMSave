@@ -28,13 +28,26 @@ namespace fs = std::filesystem;
 
 // ==== Small utilities ====
 
+// FILE* instead of ifstream+ostringstream — no double copy (see read_file in
+// gm80_load.cpp, including the mandatory fseek(SEEK_SET) after the size
+// probe: reading from EOF yields 0 bytes).
 static std::string read_bytes(const fs::path& p)
 {
-    std::ifstream f(p, std::ios::binary);
+    FILE* f = _wfopen(p.c_str(), L"rb");
     if (!f) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string r;
+    if (fseek(f, 0, SEEK_END) == 0)
+    {
+        long sz = ftell(f);
+        if (fseek(f, 0, SEEK_SET) == 0 && sz > 0 && sz < 64 * 1024 * 1024)
+        {
+            r.resize((size_t)sz);
+            size_t rd = fread(&r[0], 1, (size_t)sz, f);
+            r.resize(rd);
+        }
+    }
+    fclose(f);
+    return r;
 }
 
 static bool write_bytes(const fs::path& p, const std::string& data)
@@ -193,7 +206,15 @@ static void write_snapshot_manifest(const fs::path& manifest,
         f["text"] = e.text;
         j["files"].push_back(std::move(f));
     }
-    write_bytes(manifest, j.dump());
+    // The manifest is the registry that tells the incremental refresh and
+    // disk_differs what the base holds — a half-written one would poison
+    // both. Write to a temp file and swap atomically.
+    fs::path tmp = manifest;
+    tmp += L".tmp";
+    if (!write_bytes(tmp, j.dump())) return;
+    if (!MoveFileExW(tmp.c_str(), manifest.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFileW(tmp.c_str());
 }
 
 static bool read_snapshot_manifest(const fs::path& manifest,
@@ -233,60 +254,112 @@ static bool read_snapshot_manifest(const fs::path& manifest,
     return !out.empty();
 }
 
-void merge_flow_snapshot_refresh(const std::wstring& projDir)
-{
-    fs::path snap = snapshot_dir_of(projDir);
-    std::error_code ec;
-    fs::remove_all(snap, ec);
-    fs::path root = snap / L"root";
-    fs::create_directories(root, ec);
-
-    std::vector<std::wstring> rels;
-    enumerate_tree(fs::path(projDir), L"cache", rels);
-    std::vector<SnapEntry> entries;
-    for (auto& rel : rels)
-    {
-        fs::path src = fs::path(projDir) / rel;
-        SnapEntry e;
-        e.rel = rel;
-        e.text = !is_binary_rel(rel);
-        if (e.text)
-        {
-            std::string data = read_bytes(src);
-            e.hash = fnv1a(data);
-            e.size = data.size();
-            write_bytes(root / rel, data);
-        }
-        else
-        {
-            std::string data = read_bytes(src);
-            e.hash = fnv1a(data);
-            e.size = data.size();
-        }
-        if (auto t = fs::last_write_time(src, ec); !ec)
-        {
-            auto sys = t - fs::file_time_type::clock::now() +
-                std::chrono::system_clock::now();
-            e.mtime = std::chrono::duration_cast<std::chrono::seconds>(
-                          sys.time_since_epoch())
-                          .count();
-        }
-        entries.push_back(e);
-    }
-    write_snapshot_manifest(snap / L"manifest.json", entries);
-    gm_log("MergeFlow: snapshot refreshed (%zu files)", entries.size());
-}
-
+// Disk (size, mtime) probe. mtime is the raw 100-ns FILETIME tick: the
+// previous seconds-scaled value let two saves inside the same wall-clock
+// second with identical file size look "unchanged" to both the incremental
+// snapshot refresh and disk_differs' fast path. Every consumer of this
+// function compares two file_meta results (never a manifest value against a
+// hand-computed one), so switching resolution is internally consistent.
+// Manifests written by older builds hold seconds-scale values, which never
+// match ticks → the first refresh after an upgrade re-reads everything once
+// and rewrites the manifest in ticks.
 static bool file_meta(const fs::path& p, unsigned long long& size, long long& mtime)
 {
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d)) return false;
     size = ((unsigned long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
-    ULARGE_INTEGER u;
-    u.LowPart = d.ftLastWriteTime.dwLowDateTime;
-    u.HighPart = d.ftLastWriteTime.dwHighDateTime;
-    mtime = (long long)(u.QuadPart / 10000000ULL - 11644473600ULL);
+    mtime = (long long)(((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) |
+        d.ftLastWriteTime.dwLowDateTime);
     return true;
+}
+
+// Rebuild the base snapshot. INCREMENTAL: the previous manifest acts as the
+// reuse pool — a file whose (size, mtime) is unchanged since the last refresh
+// keeps its recorded hash and its base copy without being read or rewritten.
+// After a plain save that is 1-2 files out of thousands; the previous
+// remove_all + full re-read + full re-copy ran on every save/load/apply and
+// dominated open/save time on file-count-heavy projects.
+// Consumers that must keep holding: load_text_or_hash reads root\<rel> for
+// EVERY non-binary manifest entry, so a reused entry's copy is verified to
+// still exist before reuse (missing → fall through to a fresh read+copy).
+void merge_flow_snapshot_refresh(const std::wstring& projDir)
+{
+    double t0 = gm_perf_ms();
+    fs::path snap = snapshot_dir_of(projDir);
+    std::error_code ec;
+    fs::path root = snap / L"root";
+    fs::create_directories(root, ec);
+
+    std::map<std::wstring, SnapEntry> old;
+    {
+        std::vector<SnapEntry> prev;
+        if (read_snapshot_manifest(snap / L"manifest.json", prev))
+            for (auto& e : prev) old.emplace(e.rel, std::move(e));
+    }
+
+    std::vector<std::wstring> rels;
+    enumerate_tree(fs::path(projDir), L"cache", rels);
+    std::vector<SnapEntry> entries;
+    entries.reserve(rels.size());
+    std::set<std::wstring> seen;
+    size_t reused = 0;
+    for (auto& rel : rels)
+    {
+        seen.insert(rel);
+        fs::path src = fs::path(projDir) / rel;
+        unsigned long long sz = 0;
+        long long mt = 0;
+        bool metaOk = file_meta(src, sz, mt);
+        SnapEntry e;
+        e.rel = rel;
+        e.text = !is_binary_rel(rel);
+        e.size = sz;
+        e.mtime = metaOk ? mt : 0;
+
+        auto it = old.find(rel);
+        if (metaOk && it != old.end() && it->second.size == sz &&
+            it->second.mtime == mt && it->second.text == e.text)
+        {
+            // Binary entries store only the hash — nothing to verify. Text
+            // entries must still have their base copy on disk.
+            bool copyOk = !e.text;
+            if (!copyOk)
+            {
+                DWORD a = GetFileAttributesW((root / rel).c_str());
+                copyOk = a != INVALID_FILE_ATTRIBUTES &&
+                    !(a & FILE_ATTRIBUTE_DIRECTORY);
+            }
+            if (copyOk)
+            {
+                e.hash = it->second.hash;
+                reused++;
+                entries.push_back(std::move(e));
+                continue;
+            }
+        }
+
+        // New, changed, or copy missing → read + hash (+ copy for text).
+        std::string data = read_bytes(src);
+        e.hash = fnv1a(data);
+        e.size = data.size();
+        if (e.text) write_bytes(root / rel, data);
+        entries.push_back(std::move(e));
+    }
+
+    // Files gone from the project: drop their base copies (the manifest is
+    // the only registry of what belongs under root\).
+    for (auto& kv : old)
+        if (!seen.count(kv.first))
+        {
+            std::error_code ec2;
+            fs::remove(root / kv.first, ec2);
+        }
+
+    write_snapshot_manifest(snap / L"manifest.json", entries);
+    gm_log("MergeFlow: snapshot refreshed (%zu files, %zu reused)",
+        entries.size(), reused);
+    gm_perf("merge.snapshot %.1fms n=%zu reused=%zu reread=%zu", gm_perf_ms() - t0,
+        entries.size(), reused, entries.size() - reused);
 }
 
 bool merge_flow_disk_differs(const std::wstring& projDir)
@@ -907,6 +980,7 @@ static int apply_decisions(const std::wstring& projDir, const fs::path& session,
 
 bool merge_flow_run(const std::wstring& projDir)
 {
+    GmPerfSpan _pf_total("merge.run");
     // Save-side guard: the watcher tick defers on standalone code editors,
     // but Ctrl+S reaches the save hook even while one blocks the main window
     // (MDI). Refuse politely — reloading now would corrupt the editor.
