@@ -6,6 +6,7 @@
 #include "gm80_addresses.h"
 #include "gm_log.h"
 #include "gm80_diag.h"
+#include "i18n.h"
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -1066,8 +1067,9 @@ static void save_timeline(
                     else
                     {
                         gml += "applies_to=" + to_str(at) + "\r\n"; // tolerant fallback
-                        gm80_diag_add("a timeline action applies_to references a deleted "
-                            "object (index %d)",
+                        gm80_diag_add(tr(L"a timeline action applies_to references a "
+                                         L"deleted object (index %d)",
+                                         L"时间线动作的 applies_to 引用了已删除的对象（索引 %d）"),
                             at);
                     }
                 }
@@ -1211,8 +1213,9 @@ static void save_object(void* obj, const std::vector<std::string>& spriteNames,
                             // Deleted object: keep the save tolerant (write the
                             // index) but flag it so the broken action is found.
                             gml += "applies_to=" + to_str(at) + "\r\n";
-                            gm80_diag_add("an action applies_to references a deleted "
-                                "object (index %d)",
+                            gm80_diag_add(tr(L"an action applies_to references a "
+                                             L"deleted object (index %d)",
+                                             L"动作的 applies_to 引用了已删除的对象（索引 %d）"),
                                 at);
                         }
                     }

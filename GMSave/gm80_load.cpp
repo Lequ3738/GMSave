@@ -6,6 +6,7 @@
 #include "project_watcher.h"
 #include "gm_log.h"
 #include "gm80_diag.h"
+#include "i18n.h"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -570,7 +571,11 @@ static int resolve_name_warn(const char* owner, const char* what, const std::str
                 isNumber = false;
                 break;
             }
-        if (!isNumber) gm80_diag_add("%s: %s '%s' not found", owner, what, name.c_str());
+        if (!isNumber)
+            gm80_diag_add(tr(L"%s: %s '%s' not found",
+                             L"%s：%s“%s”未找到"),
+                ansi_to_wide(owner).c_str(), ansi_to_wide(what).c_str(),
+                ansi_to_wide(name).c_str());
     }
     return idx;
 }
@@ -977,6 +982,9 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
     // Parse tree.yyd: tab-indented, + for group (rtype=2), | for leaf (rtype=3)
     std::vector<void*> stack;
     stack.push_back(rootNode);
+    // Leaf names seen in tree.yyd — cross-checked against the index list below
+    // to flag assets registered in only one of the two files.
+    std::set<std::string> seenLeaves;
 
     std::istringstream ss(txt);
     std::string line;
@@ -1013,10 +1021,32 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
                 stack.push_back(childNode);
             }
         }
-        else if (rtype == '|' && idx >= 0)
+        else if (rtype == '|')
         {
-            tree_add_child(nodes, parent, name, 3, (uint32_t)kind, (uint32_t)idx);
+            if (!name.empty()) seenLeaves.insert(name);
+            if (idx >= 0)
+                tree_add_child(nodes, parent, name, 3, (uint32_t)kind, (uint32_t)idx);
+            else if (!name.empty())
+                gm80_diag_add(tr(L"%s: tree entry '%s' is not in index.yyd "
+                                 L"(asset not loaded)",
+                                 L"%s：树条目“%s”不在 index.yyd 中（该资源未被载入）"),
+                             ansi_to_wide(dirName).c_str(),
+                             ansi_to_wide(name).c_str());
         }
+    }
+
+    // Inverse check: an index entry with no tree row loads fine and code
+    // references resolve, but the IDE tree never shows it — and the save side
+    // rebuilds tree.yyd from the live tree, so the row never comes back.
+    for (size_t i = 0; i < names.size(); i++)
+    {
+        if (!names[i].empty() && !seenLeaves.count(names[i]))
+            gm80_diag_add(tr(L"%s: '%s' is in index.yyd but not in tree.yyd "
+                             L"(asset hidden in the IDE tree)",
+                             L"%s：“%s”在 index.yyd 中但不在 tree.yyd 中"
+                             L"（该资源在资源树中不可见）"),
+                         ansi_to_wide(dirName).c_str(),
+                         ansi_to_wide(names[i]).c_str());
     }
 
     // Phase 2: whole tree is built (children present, haschildren flags set by
@@ -2482,8 +2512,9 @@ static void parse_actions_into_event(void* ev, const std::string& body,
                         break;
                     }
                     if (idx < 0)
-                        gm80_diag_add("%s: action references missing resource '%s'",
-                            owner.c_str(), pv.c_str());
+                        gm80_diag_add(tr(L"%s: action references missing resource '%s'",
+                                         L"%s：动作引用了缺失的资源“%s”"),
+                            ansi_to_wide(owner).c_str(), ansi_to_wide(pv).c_str());
                 }
                 pv = std::to_string(idx);
             }
@@ -3734,7 +3765,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     { GmPerfSpan _pf("load.fonts_check"); verify_fonts(); }
 
     // 14c. Diagnostics: broken asset references collected during the load.
-    gm80_diag_show("Game Maker 8.0");
+    gm80_diag_show();
 
     // 15. Clear all updated flags
     clear_all_updated_flags();
