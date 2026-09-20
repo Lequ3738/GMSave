@@ -220,6 +220,7 @@ static void write_snapshot_manifest(const fs::path& manifest,
 static bool read_snapshot_manifest(const fs::path& manifest,
     std::vector<SnapEntry>& out)
 {
+    out.clear(); // reused across analysis passes
     std::string j = read_bytes(manifest);
     if (j.empty()) return false;
     try
@@ -427,6 +428,46 @@ int merge_flow_count_editor_windows()
             if (valid_form_slot(arr, cnt, i)) n++;
     }
     return n;
+}
+
+// GM's own "unsaved changes" state: 16 one-byte per-category flags — the
+// source of the title-bar '*' (ide_hooks::clear_updated_flags zeroes the
+// same array after a save, replicating GM's post-save clear). Modeless
+// editors set their flag the moment content is edited (typing → immediate
+// star, verified on-device 2026-09-20); modal property forms only set theirs
+// when the dialog applies. Loads and saves clear all of them.
+static bool merge_flow_global_dirty()
+{
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return true; // unreadable → assume dirty, take the slow path
+    static const uint32_t flags[] = ADDR_DIRTY_FLAGS;
+    for (int i = 0; i < 16; i++)
+        if (*(uint8_t*)(b + flags[i])) return true;
+    return false;
+}
+
+// Any open editor stuck inside ShowModal. Their edits don't reach the dirty
+// flags until the dialog applies, so a zero flag proves nothing while one is
+// open — the fast path must refuse and take the prompt flow.
+static bool merge_flow_any_modal_editor_open()
+{
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return true;
+    for (auto& f : kFormsArrays)
+    {
+        uint32_t cnt = *(uint32_t*)(b + f.cnt);
+        uint32_t* arr = *(uint32_t**)(b + f.arr);
+        if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 50000)
+            continue;
+        for (uint32_t i = 0; i < cnt; i++)
+        {
+            if (!valid_form_slot(arr, cnt, i)) continue;
+            if (*(uint8_t*)((uint8_t*)arr[i] + OFF_FORM_FORMSTATE) &
+                FS_MODAL_FLAG)
+                return true;
+        }
+    }
+    return false;
 }
 
 bool merge_flow_non_editor_modal_open()
@@ -648,18 +689,48 @@ static bool load_text_or_hash(MergeFile& mf, const fs::path& base,
         if (!mf.binary) mf.localB = std::move(d);
     }
     fs::path rp = remoteRoot / mf.rel;
+    bool remoteSkipped = false;
     if (fs::is_regular_file(rp, ec))
     {
         mf.hasRemote = true;
-        std::string d = read_bytes(rp);
-        mf.hashRemote = fnv1a(d);
-        if (!mf.binary) mf.remoteB = std::move(d);
+        // P0-style stat shortcut (2026-09-20): the snapshot entry records the
+        // source file's size + mtime ticks at refresh time and the hash of
+        // exactly that content (the root copy holds the same bytes). If the
+        // disk file still matches both, it IS the base content — skip the
+        // read. Any stat mismatch or failure falls back to the full read, so
+        // the shortcut only ever skips provably-identical files.
+        bool remoteIsBase = false;
+        if (snapE)
+        {
+            unsigned long long sz2 = 0;
+            long long mt2 = 0;
+            remoteIsBase = file_meta(rp, sz2, mt2) &&
+                sz2 == snapE->size && mt2 == snapE->mtime;
+        }
+        if (remoteIsBase)
+        {
+            mf.hashRemote = snapE->hash;
+            remoteSkipped = true;
+        }
+        else
+        {
+            std::string d = read_bytes(rp);
+            mf.hashRemote = fnv1a(d);
+            if (!mf.binary) mf.remoteB = std::move(d);
+        }
     }
     if (snapE)
     {
         mf.hasBase = true;
         mf.hashBase = snapE->hash;
-        if (!mf.binary) mf.baseB = read_bytes(base / mf.rel);
+        if (!mf.binary)
+        {
+            mf.baseB = read_bytes(base / mf.rel);
+            // Content-equal by the stat match; downstream comparisons, diff3
+            // and the tool's session copy all read these fields, so keep
+            // remoteB populated without a second disk read.
+            if (remoteSkipped) mf.remoteB = mf.baseB;
+        }
     }
     // One encoding verdict per file, used by the tool for every side it
     // shows. Must NOT live in the clean-merge branch only: early-returning
@@ -974,9 +1045,183 @@ static int apply_decisions(const std::wstring& projDir, const fs::path& session,
     return ok ? 0 : 1;
 }
 
+// ==== Native progress form (see gm80_addresses.h "Native progress form") ====
+// Driven with our own title so the merge analysis (staging save + three-way
+// comparison, ~1s on large projects) shows feedback instead of looking like a
+// hang. On success the form is left OPEN: project_watcher_reload_project →
+// GM80_LoadRecentProject retitles and rezeros it in place (FShowing already
+// set → no second Show), giving one continuous native bar into the reload.
+// Every early return must close it first — Show disabled the main form.
+static void native_progress_show(const wchar_t* text)
+{
+    // Fake Delphi constant AnsiString: char data at +8, refcount at [data-8]
+    // = -1 (LStrAddRef/LStrClr no-op it, same as GM's own .rdata literals),
+    // length at [data-4].
+    static struct
+    {
+        uint32_t refcnt;
+        uint32_t len;
+        char data[512];
+    } title = {0xFFFFFFFFu, 0, {0}};
+    title.refcnt = 0xFFFFFFFFu;
+    int n = WideCharToMultiByte(CP_ACP, 0, text, -1, title.data,
+        sizeof(title.data) - 1, nullptr, nullptr);
+    title.len = (n > 0) ? (uint32_t)(n - 1) : 0;
+    if (n <= 0) title.data[0] = 0;
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return;
+    uint32_t fn = (uint32_t)b + ADDR_PROGRESS_SHOW;
+    uint32_t t = (uint32_t)title.data;
+    __asm {
+        mov eax, t
+        call fn
+    }
+}
+static void native_progress_step(int pos)
+{
+    if (pos < 0) pos = 0;
+    if (pos > 100) pos = 100;
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return;
+    uint32_t fn = (uint32_t)b + ADDR_PROGRESS_STEP;
+    __asm {
+        mov eax, pos
+        call fn
+    }
+}
+static void native_progress_close()
+{
+    uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
+    if (!b) return;
+    uint32_t fn = (uint32_t)b + ADDR_PROGRESS_CLOSE;
+    __asm { call fn }
+}
+
 // ==== The flow ====
 
-bool merge_flow_run(const std::wstring& projDir)
+// One full analysis: staging save (IDE memory → %TEMP% tree) + three-way
+// classification of every project file. Runs at most twice: pass 1 is the
+// GATE ("is there anything to do at all?"), taken with editor windows still
+// untouched. Pass 2 runs only when the user chose to APPLY editor content —
+// those freshly-applied bytes enter the merge exclusively through a re-stage,
+// making pass 2 the authoritative one. Disk and base cannot change between
+// the passes, so the stat shortcut skips their re-reads in pass 2 for free.
+struct FlowState
+{
+    std::vector<SnapEntry> snap;
+    std::map<std::wstring, const SnapEntry*> snapBy;
+    std::vector<MergeFile> files;
+    bool anyLocal = false, anyRemote = false, anyConflict = false;
+    bool nothing_to_do() const { return files.empty() && !anyRemote; }
+};
+
+enum class AnalyzeRc { OK, STAGE_FAIL, TREE_SMALL };
+
+static AnalyzeRc merge_analyze(const std::wstring& projDir,
+    const fs::path& staging, FlowState& fs)
+{
+    GmPerfSpan _pf("merge.analyze");
+    if (!stage_save(staging.wstring()))
+        return AnalyzeRc::STAGE_FAIL;
+    native_progress_step(45); // staging save is the long pole — mark it done
+
+    read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json", fs.snap);
+    fs.snapBy.clear();
+    for (auto& e : fs.snap) fs.snapBy[e.rel] = &e;
+
+    std::vector<std::wstring> localRels, remoteRels;
+    enumerate_tree(staging, L"cache", localRels);
+    enumerate_tree(fs::path(projDir), L"cache", remoteRels);
+
+    // Guard: a staging tree far smaller than the snapshot means the staging
+    // save skipped types anyway (a future smart-skip regression) — applying
+    // that would read every missing file as an IDE-side deletion. Abort
+    // instead; nothing has been written to the project yet.
+    if (fs.snap.size() > 8 && localRels.size() * 2 < fs.snap.size())
+    {
+        gm_log("MergeFlow: staging tree suspiciously small (%zu files vs %zu "
+               "snapshotted)",
+            localRels.size(), fs.snap.size());
+        return AnalyzeRc::TREE_SMALL;
+    }
+
+    std::set<std::wstring> all;
+    for (auto& r : localRels) all.insert(r);
+    for (auto& r : remoteRels) all.insert(r);
+    for (auto& e : fs.snap) all.insert(e.rel);
+
+    fs.files.clear();
+    fs.anyLocal = fs.anyRemote = fs.anyConflict = false;
+    const size_t cmpTotal = all.size();
+    size_t cmpDone = 0;
+    for (auto& rel : all)
+    {
+        MergeFile mf;
+        mf.rel = rel;
+        mf.binary = is_binary_rel(rel);
+        load_text_or_hash(mf, snapshot_dir_of(projDir) / L"root", staging,
+            fs::path(projDir), fs.snapBy.count(rel) ? fs.snapBy[rel] : nullptr);
+        classify_and_merge(mf);
+        if (++cmpDone % 256 == 0)
+            native_progress_step(45 + (int)((35 * cmpDone) / cmpTotal));
+        if (mf.status == FS_UNCHANGED) continue;
+        if (mf.status == FS_DELETED)
+        {
+            // Disk deletion with local untouched — nothing to write, but the
+            // IDE memory still holds the resource, so a reload IS required.
+            // 2026-09-15: skipping these entirely left a pure external delete
+            // with nothing to do (flag-wise), and the flow silently returned.
+            fs.anyRemote = true;
+            continue;
+        }
+        if (mf.status == FS_DELETE_LOCAL)
+        {
+            // IDE memory dropped the file (stale disk orphan) — keep it in
+            // the list so apply removes the disk copy.
+            fs.anyRemote = true;
+        }
+        if (mf.status == FS_LOCAL || mf.status == FS_AUTO) fs.anyLocal = true;
+        if (mf.status == FS_REMOTE) fs.anyRemote = true;
+        if (mf.status == FS_CONFLICT) fs.anyConflict = true;
+        mf.diskMeta = file_meta(fs::path(projDir) / rel, mf.diskSize,
+            mf.diskMtime);
+        fs.files.push_back(std::move(mf));
+    }
+    gm_log("MergeFlow: %zu changed files (conflicts=%d local=%d remote=%d)",
+        fs.files.size(), (int)fs.anyConflict, (int)fs.anyLocal,
+        (int)fs.anyRemote);
+    native_progress_step(82);
+    return AnalyzeRc::OK;
+}
+
+// Close every editor window and pump until the MODAL ones have unwound —
+// their ModalResult epilogues (apply/discard into the resources, slot
+// cleanup, Free) run as their message loops exit through our pump. Modeless
+// editors are freed synchronously inside merge_flow_close_editors. Fails
+// after ~6s of stacked modals refusing to close.
+static bool close_editors_and_wait(int modalResult)
+{
+    merge_flow_close_editors(modalResult);
+    for (int i = 0; i < 60; i++)
+    {
+        if (merge_flow_count_editor_windows() == 0) return true;
+        MSG msg;
+        DWORD until = GetTickCount() + 100;
+        do
+        {
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(10);
+        } while (GetTickCount() < until);
+        merge_flow_close_editors(modalResult); // stacked modals: one per cycle
+    }
+    return merge_flow_count_editor_windows() == 0;
+}
+
+bool merge_flow_run(const std::wstring& projDir, bool review)
 {
     GmPerfSpan _pf_total("merge.run");
     // Save-side guard: the watcher tick defers on standalone code editors,
@@ -986,16 +1231,46 @@ bool merge_flow_run(const std::wstring& projDir)
     {
         gm_log("MergeFlow: standalone code editor open — refusing to run");
         MessageBoxW(gm80_prompt_owner(),
-            tr(L"A standalone code editor window (执行代码) is open.\r\n"
+            tr(L"A standalone code editor window is open.\r\n"
                L"The merge cannot run while it is open: reloading the project "
                L"now would corrupt that window.\r\n\r\n"
                L"Close the code editor window, then save again.",
-               L"检测到独立的代码编辑窗口（执行代码）处于打开状态。\r\n"
+               L"检测到独立的代码编辑窗口处于打开状态。\r\n"
                L"合并无法在它打开时运行：此时重载工程会损坏该窗口。\r\n\r\n"
                L"请先关闭代码编辑窗口，再重新保存。"),
             L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
         return false;
     }
+    // Cheap stat-level pre-check first: external tools that only touched
+    // mtimes — or changed files and then reverted them — used to cost a full
+    // staging save + prompt cycle only to reach a "nothing to do" verdict.
+    {
+        GmPerfSpan _pf("merge.precheck");
+        if (!merge_flow_disk_differs(projDir))
+        {
+            gm_log("MergeFlow: disk matches the base snapshot — nothing to do");
+            return false;
+        }
+    }
+
+    bool progressUp = false;
+    auto showProgress = [&](const wchar_t* text, int pos)
+    {
+        native_progress_show(text);
+        native_progress_step(pos);
+        progressUp = true;
+    };
+    auto closeProgress = [&]()
+    {
+        if (progressUp)
+        {
+            native_progress_close();
+            progressUp = false;
+        }
+    };
+    showProgress(tr(L"Checking for external changes",
+        L"检查工程文件的外部更改"), 4);
+
     fs::path session(session_dir());
     std::error_code ec;
     fs::remove_all(session, ec);
@@ -1024,6 +1299,7 @@ bool merge_flow_run(const std::wstring& projDir)
             gm_log("MergeFlow: no base snapshot — re-baselining from disk, "
                    "skipping this round");
             merge_flow_snapshot_refresh(projDir);
+            closeProgress();
             MessageBoxW(gm80_prompt_owner(),
                 tr(L"No merge baseline was found for this project (first run "
                    L"after an upgrade), so this external change was not applied.\r\n"
@@ -1036,91 +1312,44 @@ bool merge_flow_run(const std::wstring& projDir)
         }
     }
 
-    // 1. staging save (full tree of current IDE memory)
-    if (!stage_save(staging.wstring()))
+    // Runs an analysis pass; on failure closes the progress form, shows the
+    // matching error and leaves the flow (caller returns false).
+    auto analyzeOrFail = [&](FlowState& s) -> bool
     {
-        MessageBoxW(gm80_prompt_owner(),
-            tr(L"Cannot stage the current project state for merging.\r\n"
-               L"The project was NOT reloaded.",
-               L"无法为合并暂存当前工程状态。\r\n工程未重载。"),
-            L"Game Maker 8.0", MB_OK | MB_ICONERROR);
-        return false;
-    }
-
-    // 2. gather the three trees
-    std::vector<SnapEntry> snap;
-    read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json", snap);
-    std::map<std::wstring, const SnapEntry*> snapBy;
-    for (auto& e : snap) snapBy[e.rel] = &e;
-
-    std::vector<std::wstring> localRels, remoteRels;
-    enumerate_tree(staging, L"cache", localRels);
-    enumerate_tree(fs::path(projDir), L"cache", remoteRels);
-
-    // Guard: a staging tree far smaller than the snapshot means the staging
-    // save skipped types anyway (a future smart-skip regression) — applying
-    // that would read every missing file as an IDE-side deletion. Abort
-    // instead; nothing has been written to the project yet.
-    if (snap.size() > 8 && localRels.size() * 2 < snap.size())
-    {
-        gm_log("MergeFlow: staging tree suspiciously small (%zu files vs %zu "
-               "snapshotted) — aborting, nothing applied",
-            localRels.size(), snap.size());
-        MessageBoxW(gm80_prompt_owner(),
-            tr(L"The plugin's internal snapshot of the project state came out "
-               L"incomplete (plugin bug).\r\n"
-               L"The merge was cancelled and NOTHING was changed.\r\n"
-               L"Saving the project once and retrying the external change "
-               L"usually clears this.",
-               L"插件的工程状态内部快照不完整（插件 bug）。\r\n"
-               L"合并已取消，未更改任何内容。\r\n"
-               L"先保存一次工程，再重试外部更改，通常即可消除此问题。"),
-            L"Game Maker 8.0", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-        return false;
-    }
-
-    std::set<std::wstring> all;
-    for (auto& r : localRels) all.insert(r);
-    for (auto& r : remoteRels) all.insert(r);
-    for (auto& e : snap) all.insert(e.rel);
-
-    std::vector<MergeFile> files;
-    bool anyLocal = false, anyRemote = false, anyConflict = false;
-    for (auto& rel : all)
-    {
-        MergeFile mf;
-        mf.rel = rel;
-        mf.binary = is_binary_rel(rel);
-        load_text_or_hash(mf, snapshot_dir_of(projDir) / L"root", staging,
-            fs::path(projDir), snapBy.count(rel) ? snapBy[rel] : nullptr);
-        classify_and_merge(mf);
-        if (mf.status == FS_UNCHANGED) continue;
-        if (mf.status == FS_DELETED)
+        switch (merge_analyze(projDir, staging, s))
         {
-            // Disk deletion with local untouched — nothing to write, but the
-            // IDE memory still holds the resource, so a reload IS required.
-            // 2026-09-15: skipping these entirely left a pure external delete
-            // with nothing to do (flag-wise), and the flow silently returned.
-            anyRemote = true;
-            continue;
+        case AnalyzeRc::STAGE_FAIL:
+            closeProgress();
+            MessageBoxW(gm80_prompt_owner(),
+                tr(L"Cannot stage the current project state for merging.\r\n"
+                   L"The project was NOT reloaded.",
+                   L"无法为合并暂存当前工程状态。\r\n工程未重载。"),
+                L"Game Maker 8.0", MB_OK | MB_ICONERROR);
+            return false;
+        case AnalyzeRc::TREE_SMALL:
+            closeProgress();
+            MessageBoxW(gm80_prompt_owner(),
+                tr(L"The plugin's internal snapshot of the project state came out "
+                   L"incomplete (plugin bug).\r\n"
+                   L"The merge was cancelled and NOTHING was changed.\r\n"
+                   L"Saving the project once and retrying the external change "
+                   L"usually clears this.",
+                   L"插件的工程状态内部快照不完整（插件 bug）。\r\n"
+                   L"合并已取消，未更改任何内容。\r\n"
+                   L"先保存一次工程，再重试外部更改，通常即可消除此问题。"),
+                L"Game Maker 8.0", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+            return false;
+        case AnalyzeRc::OK: break;
         }
-        if (mf.status == FS_DELETE_LOCAL)
-        {
-            // IDE memory dropped the file (stale disk orphan) — keep it in
-            // the list so apply removes the disk copy.
-            anyRemote = true;
-        }
-        if (mf.status == FS_LOCAL || mf.status == FS_AUTO) anyLocal = true;
-        if (mf.status == FS_REMOTE) anyRemote = true;
-        if (mf.status == FS_CONFLICT) anyConflict = true;
-        mf.diskMeta = file_meta(fs::path(projDir) / rel, mf.diskSize,
-            mf.diskMtime);
-        files.push_back(std::move(mf));
-    }
-    gm_log("MergeFlow: %zu changed files (conflicts=%d local=%d remote=%d)",
-        files.size(), (int)anyConflict, (int)anyLocal, (int)anyRemote);
+        return true;
+    };
 
-    if (files.empty() && !anyRemote)
+    // Pass 1 — the gate: analyze with editor windows untouched. Decides
+    // whether a reload is imminent at all, and whether conflicts exist.
+    int editorsAtStart = merge_flow_count_editor_windows();
+    FlowState s1;
+    if (!analyzeOrFail(s1)) return false;
+    if (s1.nothing_to_do())
     {
         // Nothing foreign after all (e.g. only mtimes moved): nothing to apply
         // and no reason to reload — the user's editor state stays put.
@@ -1128,16 +1357,143 @@ bool merge_flow_run(const std::wstring& projDir)
         // non-touching local+external edit pair applies and reloads here —
         // gating on anyRemote alone used to skip it entirely (2026-09-15).
         gm_log("MergeFlow: no external difference found — nothing to do");
+        closeProgress();
         return false;
     }
 
-    // 3. conflicts → session + tool
+    // Editor gate — reached only when a reload is genuinely imminent, so the
+    // prompt can no longer fire "for nothing". Editors stay untouched through
+    // every cancellable step above; their disposition is the last question,
+    // and the tool's confirm (if the tool opens) is the FINAL action.
+    int editorsNow = merge_flow_count_editor_windows();
+    if (editorsNow == 0 && editorsAtStart > 0)
+    {
+        // Every editor closed (manually) while pass 1 ran. Closing APPLIES
+        // content into the resources; anything closed after the staging save
+        // is missing from it — re-analyze so it cannot be lost by the reload.
+        // Idempotent when nothing actually changed.
+        showProgress(tr(L"Re-analyzing after editor changes",
+            L"编辑器内容已应用，正在重新分析"), 4);
+        if (!analyzeOrFail(s1)) return false;
+        if (s1.nothing_to_do())
+        {
+            closeProgress();
+            return false;
+        }
+    }
+    // FAST PATH — editors open, every one modeless, GM's dirty flags all
+    // zero. Modeless editors set those flags the moment content is edited,
+    // so zero flags prove nothing is left unapplied: the pass-1 staging is
+    // already the authoritative analysis — exactly the no-editors case (one
+    // analysis, no questions, nothing closed here; the reload's
+    // InitializeProject frees these modeless forms itself). The check
+    // deliberately sits AFTER the staging save: the progress pump inside the
+    // analysis delivers a keystroke still queued when the tick fired, and
+    // that typing flips a flag before this read.
+    bool editorsClean =
+        editorsNow > 0 && !merge_flow_any_modal_editor_open() &&
+        !merge_flow_global_dirty();
+    if (editorsClean)
+        gm_log("MergeFlow: fast path — modeless editors clean (dirty flags "
+               "zero), staging is authoritative");
+
+    if (editorsNow > 0 && !editorsClean)
+    {
+        closeProgress();
+        int r;
+        if (s1.anyConflict)
+        {
+            // The tool opens anyway and doubles as the review — the question
+            // is only the disposition of unapplied editor content.
+            r = MessageBoxW(gm80_prompt_owner(),
+                tr(L"External changes to the project conflict with your edits; "
+                   L"the merge window will open to resolve them.\r\n"
+                   L"Resource editor windows are open.\r\n\r\n"
+                   L"Yes = keep their unapplied content and continue\r\n"
+                   L"No = drop their unapplied content and continue\r\n"
+                   L"Cancel = keep editing for now",
+                   L"检测到工程文件的外部更改，其中部分与你的修改冲突，"
+                   L"将打开合并窗口解决冲突。\r\n"
+                   L"当前有资源编辑器窗口打开。\r\n\r\n"
+                   L"是 = 保留编辑器未应用内容并继续\r\n"
+                   L"否 = 丢弃编辑器未应用内容并继续\r\n"
+                   L"取消 = 暂不处理"),
+                L"Game Maker 8.0",
+                MB_YESNOCANCEL | MB_ICONWARNING | MB_SETFOREGROUND);
+        }
+        else
+        {
+            // Review is folded into 否 — no second question anywhere. Both
+            // 是 and 否 keep the editor content: it must reach the staging
+            // save for the merge (or the tool) to see it.
+            r = MessageBoxW(gm80_prompt_owner(),
+                tr(L"External changes to the project were detected and can "
+                   L"be merged cleanly; the project will be reloaded.\r\n"
+                   L"Resource editor windows are open — their unapplied "
+                   L"content is kept and takes part in the merge.\r\n\r\n"
+                   L"Yes = merge and reload directly\r\n"
+                   L"No = review the changes in the merge window first, "
+                   L"then reload\r\n"
+                   L"Cancel = keep editing for now",
+                   L"检测到工程文件的外部更改，可以干净合并，随后将重载工程。\r\n"
+                   L"当前有资源编辑器窗口打开，其中的未应用内容将被保留并参与合并。\r\n\r\n"
+                   L"是 = 直接合并并重载\r\n"
+                   L"否 = 先在合并窗口查看改动，确认后重载\r\n"
+                   L"取消 = 暂不处理"),
+                L"Game Maker 8.0",
+                MB_YESNOCANCEL | MB_ICONINFORMATION | MB_SETFOREGROUND);
+            if (r == IDNO) review = true;
+        }
+        if (r == IDCANCEL)
+        {
+            gm_log("MergeFlow: user cancelled at the editor gate");
+            return false;
+        }
+        // "Discard" exists only in the conflict variant (where the tool still
+        // runs and can take the remote side per file); the clean variant's
+        // 否 is "review", which keeps the content.
+        int modalResult = (s1.anyConflict && r == IDNO) ? 2 : 1;
+        if (!close_editors_and_wait(modalResult))
+        {
+            MessageBoxW(gm80_prompt_owner(),
+                tr(L"Some resource editor windows could not be closed "
+                   L"automatically, so the reload was cancelled.\r\n"
+                   L"Close them and make an external change again to retry.",
+                   L"部分资源编辑器窗口无法自动关闭，重载已取消。\r\n"
+                   L"请手动关闭它们，然后再次进行外部更改即可重试。"),
+                L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+            return false;
+        }
+        // Freeing the modeless editors applies their content into the
+        // resources (TScriptForm applies on destroy) and the modal epilogues
+        // run through the pump — whichever disposition was chosen, the
+        // staging from pass 1 may now be stale. Pass 2 is therefore ALWAYS
+        // taken after the gate; the stat shortcut keeps it cheap when the
+        // trees still match. (Skipping it on "discard" would let the reload
+        // throw away just-applied script content.)
+        showProgress(tr(L"Editors closed, re-analyzing",
+                        L"编辑器已关闭，正在重新分析"), 4);
+        if (!analyzeOrFail(s1)) return false;
+        if (s1.nothing_to_do())
+        {
+            // The applied content matched the disk exactly — nothing to
+            // merge and no reload needed (memory already holds it).
+            closeProgress();
+            return false;
+        }
+    }
+
+    // 3. the merge tool: conflicts always, clean changes when the user asked
+    // to review. Its confirm is the FINAL action — no questions after it.
     std::map<std::wstring, std::string> decisions;
     std::set<std::wstring> edited;
-    if (anyConflict)
+    if (s1.anyConflict || review)
     {
+        // The merge tool takes over the UI from here — hand the progress form
+        // back (close re-enables the main form).
+        closeProgress();
         // Materialize the three sides for every listed file.
-        for (auto& mf : files)
+        for (auto& mf : s1.files)
         {
             auto cp = [&](const wchar_t* side, const std::string* bytes,
                           const fs::path* srcFile)
@@ -1173,7 +1529,7 @@ bool merge_flow_run(const std::wstring& projDir)
             nlohmann::json j = nlohmann::json::object();
             j["version"] = 1;
             j["files"] = nlohmann::json::array();
-            for (auto& mf : files)
+            for (auto& mf : s1.files)
             {
                 nlohmann::json e = nlohmann::json::object();
                 e["path"] = wide_to_utf8(mf.rel);
@@ -1210,7 +1566,7 @@ bool merge_flow_run(const std::wstring& projDir)
             // Fallback: list conflicts, keep local or cancel.
             std::wstring list;
             int n = 0;
-            for (auto& mf : files)
+            for (auto& mf : s1.files)
                 if (mf.status == FS_CONFLICT && n++ < 12)
                     list += L"\n  " + mf.rel;
             int r = MessageBoxW(gm80_prompt_owner(),
@@ -1229,7 +1585,7 @@ bool merge_flow_run(const std::wstring& projDir)
                     .c_str(),
                 L"Game Maker 8.0", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND);
             if (r != IDYES) return false;
-            for (auto& mf : files)
+            for (auto& mf : s1.files)
                 if (mf.status == FS_CONFLICT) decisions[mf.rel] = "local";
         }
         else
@@ -1301,9 +1657,31 @@ bool merge_flow_run(const std::wstring& projDir)
         }
     }
 
-    // 4. apply + reload
+    // 4. apply + reload. The progress form rides along when it is still up
+    // (the silent path never closed it); re-show it when prompts or the tool
+    // did — the reload then retitles it in place for one continuous bar.
+    // Fast-path guard: typing is impossible while the flow runs (main form
+    // disabled, the tool session disables it too) — but re-check anyway so
+    // the reload can never wipe content typed in some freak enabled window.
+    if (editorsClean && merge_flow_global_dirty())
+    {
+        gm_log("MergeFlow: editor content changed after the staging — "
+               "aborting, will retry via the slow path");
+        project_watcher_rearm_pending();
+        closeProgress();
+        MessageBoxW(gm80_prompt_owner(),
+            tr(L"Editor content changed while the merge was running, so the "
+               L"reload was cancelled. It will retry automatically in a "
+               L"moment.",
+               L"合并期间编辑器内容发生了变化，本次重载已取消——稍后将自动重试。"),
+            L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return false;
+    }
+    if (progressUp) native_progress_step(88);
+    else showProgress(tr(L"Applying merge results",
+        L"正在应用合并结果"), 85);
     std::wstring movedList;
-    int rc = apply_decisions(projDir, session, staging, files, decisions,
+    int rc = apply_decisions(projDir, session, staging, s1.files, decisions,
         edited, movedList);
     if (rc == 2)
     {
@@ -1315,6 +1693,7 @@ bool merge_flow_run(const std::wstring& projDir)
         gm_log("MergeFlow: disk changed during the tool session — aborted, "
                "nothing written");
         project_watcher_rearm_pending();
+        closeProgress();
         MessageBoxW(gm80_prompt_owner(),
             (std::wstring(tr(L"Project files were modified on disk while the "
                              L"merge tool was open:",

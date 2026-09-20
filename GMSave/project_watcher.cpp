@@ -301,9 +301,6 @@ HWND gm80_prompt_owner()
 // ==== Flow state (main thread only; g_flow_active also blocks re-entrant
 // ticks while our dialogs / the merge tool pump messages) ====
 static bool g_flow_active = false;
-static bool g_close_flow = false; // closing editors, waiting for modal unwind
-static int g_close_modal_result = 1; // 1 = mrOk (apply) / 2 = mrCancel (discard)
-static int g_close_attempts = 0; // ticks spent in close_flow (stuck-editor abort)
 
 // The watcher watches g_watch_path (a .gm80 project folder). If the current
 // project (GM80_ProjectPath, 0x1EA27C — the metadata FILE inside that folder) no
@@ -354,30 +351,22 @@ static bool ide_foreground()
 
 void project_watcher_tick()
 {
-    // While closing editors the pending flag is already consumed — the
-    // follow-up ticks (confirm editors closed, then merge_flow_run) are driven
-    // by g_close_flow alone. 2026-09-15: gating on g_pending_foreign here left
-    // the flow dead after the prompt — editors closed, reload never ran.
-    if (!g_pending_foreign && !g_close_flow) return;
+    if (!g_pending_foreign) return;
     if (g_flow_active) return; // re-entrant tick while our UI pumps messages
     if (!g_watching)
     {
         InterlockedExchange(&g_pending_foreign, 0);
-        g_close_flow = false;
         return;
     }
     // The project changed under us (File > New / switched project) → stop watching.
     if (!watcher_path_current())
     {
         project_watcher_stop();
-        g_close_flow = false;
         return;
     }
-    // Act only while the IDE is frontmost. The pending flag (and any close
-    // flow already in progress) survives this gate untouched — the flow runs
-    // on the first tick after the user switches back to Game Maker. A close
-    // flow paused here is safe: the WM_CLOSEs were already posted and the
-    // main-thread message loop processes them regardless of this timer.
+    // Act only while the IDE is frontmost. The pending flag survives this gate
+    // untouched — the flow runs on the first tick after the user switches back
+    // to Game Maker.
     {
         static bool was_fg = true;
         bool fg = ide_foreground();
@@ -394,75 +383,21 @@ void project_watcher_tick()
     if (merge_flow_non_editor_modal_open()) return;
     // Standalone code editors are invisible to both the modal stack and the
     // forms arrays (raw Win32 blocking, no resource array slot), but a reload
-    // with one open corrupts its state — defer the same way. Also covers the
-    // attribute-window + code-editor combo before any prompt fires.
+    // with one open corrupts its state — defer the same way.
     if (merge_flow_code_editor_open())
     {
         gm_log("Watcher: standalone code editor open — deferring");
         return;
     }
 
-    // Claim the event from here on.
+    // Claim the event and run the whole merge flow. Analysis, the editor gate
+    // (which fires only once a reload is imminent), the merge tool and the
+    // reload itself all live in merge_flow_run; it pumps messages itself
+    // where needed (editor modal unwinds, the tool wait), so the old
+    // cross-tick close-flow state machine is gone (2026-09-20).
     g_flow_active = true;
     InterlockedExchange(&g_pending_foreign, 0);
-
-    // Editor windows open → ask once how to treat their unapplied content.
-    if (!g_close_flow && merge_flow_count_editor_windows() > 0)
-    {
-        int r = MessageBoxW(gm80_prompt_owner(),
-            tr(L"Project files have been modified outside Game Maker and the "
-               L"project must be reloaded.\r\n"
-               L"Resource editor windows are open.\r\n\r\n"
-               L"Yes = APPLY the changes in those windows and continue\r\n"
-               L"No = DISCARD the unapplied changes in those windows and continue\r\n"
-               L"Cancel = keep editing for now (you will be asked again on save)",
-               L"工程文件已在 Game Maker 之外被修改，需要重载工程。\r\n"
-               L"当前有资源编辑器窗口打开。\r\n\r\n"
-               L"是 = 应用这些窗口中的更改并继续\r\n"
-               L"否 = 丢弃这些窗口中未应用的更改并继续\r\n"
-               L"取消 = 暂不处理（保存时仍会再次询问）"),
-            L"Game Maker 8.0", MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND);
-        if (r == IDCANCEL)
-        {
-            gm_log("Watcher: user cancelled — keeping IDE state");
-            g_flow_active = false;
-            return; // pending stays cleared; the save-side hook still guards
-        }
-        g_close_modal_result = (r == IDYES) ? 1 : 2; // mrOk / mrCancel
-        g_close_flow = true;
-        g_close_attempts = 0;
-        merge_flow_close_editors(g_close_modal_result);
-        g_flow_active = false;
-        return; // modal loops unwind over the next message cycles
-    }
-    if (g_close_flow)
-    {
-        if (merge_flow_count_editor_windows() > 0)
-        {
-            // Keep closing (stacked modals unwind one message-loop at a time).
-            if (++g_close_attempts > 5)
-            {
-                gm_log("Watcher: editors still open after %d ticks — aborting the flow",
-                    g_close_attempts);
-                g_close_flow = false;
-                g_flow_active = false;
-                MessageBoxW(gm80_prompt_owner(),
-                    tr(L"Some resource editor windows could not be closed "
-                       L"automatically, so the reload was cancelled.\r\n"
-                       L"Close them and make an external change again to retry.",
-                       L"部分资源编辑器窗口无法自动关闭，重载已取消。\r\n"
-                       L"请手动关闭它们，然后再次进行外部更改即可重试。"),
-                    L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-                return;
-            }
-            merge_flow_close_editors(g_close_modal_result);
-            g_flow_active = false;
-            return;
-        }
-        g_close_flow = false;
-    }
-
-    merge_flow_run(g_watch_path);
+    merge_flow_run(g_watch_path, false);
     g_flow_active = false;
 }
 

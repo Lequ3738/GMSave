@@ -42,7 +42,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem><EnableUAC>false</EnableUAC>
-      <AdditionalOptions>/SAFESEH:NO %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/SAFESEH:NO /MAP %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

@@ -299,29 +299,39 @@ static void __stdcall do_gm80_save_if_needed()
     if (diskDiffers)
     {
         gm_log("Save: external changes detected on disk");
+        // MessageBox caps this prompt at three choices — "review first" is a
+        // watcher-gate feature. The tool still opens here whenever the merge
+        // carries conflicts, which covers the cases worth inspecting.
         int r = MessageBoxW(gm80_prompt_owner(),
-            tr(L"The project files on disk have been modified outside Game Maker.\r\n"
-               L"\r\n"
-               L"Yes = merge the external changes first (recommended)\r\n"
+            tr(L"The project files on disk have been modified outside Game "
+               L"Maker.\r\n\r\n"
+               L"Yes = merge the external changes and reload first, then "
+               L"save (recommended)\r\n"
                L"No = overwrite the external changes with this save\r\n"
-               L"Cancel = don't save now",
-               L"磁盘上的工程文件已在 Game Maker 之外被修改。\r\n"
-               L"\r\n"
-               L"是 = 先合并外部更改（推荐）\r\n"
+               L"Cancel = do not save now",
+               L"磁盘上的工程文件已在 Game Maker 之外被修改。\r\n\r\n"
+               L"是 = 先合并外部更改并重载，然后保存（推荐）\r\n"
                L"否 = 用本次保存覆盖外部更改\r\n"
                L"取消 = 暂不保存"),
-            L"Game Maker 8.0", MB_YESNOCANCEL | MB_ICONWARNING | MB_SETFOREGROUND);
+            L"Game Maker 8.0",
+            MB_YESNOCANCEL | MB_ICONWARNING | MB_SETFOREGROUND);
         if (r == IDCANCEL)
         {
             gm_log("Save: cancelled at the conflict prompt");
+            // This hook stopped the watcher on entry — re-arm it, or external
+            // changes stay undetected until the next save.
+            if (!project_watcher_is_running())
+                project_watcher_start(g_gm80_save_path);
             return;
         }
         if (r == IDYES)
         {
-            // Full merge flow (editor prompts → staging → tool → reload).
+            // Full merge flow (analysis → editor gate → tool → reload). The
+            // flow's editor gate handles open editor windows uniformly for
+            // both entry paths (this hook used to reload right under them).
             // After it returns the IDE holds the merged state — nothing left
             // to save for this Ctrl+S.
-            bool reloaded = merge_flow_run(g_gm80_save_path);
+            bool reloaded = merge_flow_run(g_gm80_save_path, false);
             // This hook stopped the watcher on entry and the flow only
             // restarts it through a successful reload. If we got here without
             // one (user cancelled, or the apply aborted because the disk

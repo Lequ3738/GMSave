@@ -20,11 +20,24 @@ void merge_flow_snapshot_refresh(const std::wstring& projDir);
 // fast path, hash fallback). Used by the save-side conflict prompt.
 bool merge_flow_disk_differs(const std::wstring& projDir);
 
-// ==== The flow (main thread, from the watcher tick) ====
-// Assumes editor windows were already closed by the caller. Performs staging
-// save → classification → silent auto-apply of clean results → merge tool for
-// conflicts → apply + reload. Returns true when the project was reloaded.
-bool merge_flow_run(const std::wstring& projDir);
+// ==== The flow (main thread: the watcher tick, or the save-side hook) ====
+// v2 flow (2026-09-20): cheap stat pre-check → pass-1 analysis (the GATE,
+// taken with editor windows untouched) → FAST PATH: open editors that are
+// all modeless with GM's dirty flags (the title-'*' array) all zero have
+// nothing unapplied — the pass-1 staging is authoritative; no question, no
+// editor closing (the reload frees them): identical to the no-editors case,
+// one analysis → otherwise the editor gate (one MessageBox per variant;
+// "review the changes" is folded into the clean variant's 否 — no second
+// question anywhere; the conflict variant asks apply/discard of the
+// unapplied editor content, the tool doubles as the review) → pass-2
+// analysis ALWAYS follows the gate (freeing modeless editors applies their
+// content into the resources, so the staging may be stale; the stat
+// shortcut keeps it cheap) → merge tool for conflicts and reviews (its
+// confirm is the FINAL action; clean+unreviewed changes apply silently) →
+// apply + reload through GM80_LoadRecentProject, which retitles the
+// already-open native progress form in place. review=true opens the tool
+// even for clean merges. Returns true when the project was reloaded.
+bool merge_flow_run(const std::wstring& projDir, bool review);
 
 // ==== Editor-window helpers (shared with the watcher tick) ====
 // One editor form instance per resource lives in the resource "forms" arrays.

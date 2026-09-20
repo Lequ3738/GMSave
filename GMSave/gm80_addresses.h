@@ -151,6 +151,28 @@ struct GM80ResourceGlobals {
 #define ADDR_APP_MESSAGEBOX      0x07F57C   // TApplication.MessageBox
 #define ADDR_GET_SCRIPT_BY_NAME  0x15BF50   // Find script by name → returns index
 
+// ==== Native progress form ("Saving…"/"Loading" window) ====
+// Verified 2026-09-20 in IDA 8.0 (disasm + native callers). The singleton form
+// object is dword_5F6208; its bar control is at form+0x364; FShowing byte at
+// form+0x57. Native callers pass .rdata AnsiString literals as the title:
+//   GM80_LoadRecentProject @0x59B8A6, GM80_SaveProject_Outer @0x59BA67
+//   (mov eax, offset dword_59BCD0), GM80_OpenProject @0x5D4572.
+#define ADDR_PROGRESS_SHOW       0x199620   // (title: AnsiString @EAX): MainForm.SetEnabled(false)
+                                            // (vtable+0x68, edx=0); Caption=title only if changed;
+                                            // bar:=0; Show via sub_47B6B0 ONLY if FShowing==0 →
+                                            // repeat calls update title+bar IN PLACE (no 2nd form);
+                                            // then App ProcessMessages pump (0x47F1E4).
+                                            // Title is Delphi AnsiString DATA ptr: LStrAddRef'd
+                                            // ([ptr-8] refcount, sub_405988=GM80_LStrAddRef) and
+                                            // LStrClr'd at exit — both no-ops for refcount -1.
+#define ADDR_PROGRESS_STEP       0x1996B8   // (pos 0..100 @EAX): bar.Position:=eax + pump
+#define ADDR_PROGRESS_CLOSE      0x1996D8   // MainForm.SetEnabled(true) (vtable+0x68, dl=1)
+                                            // + pump + form Hide (sub_47B508). Idempotent.
+#define ADDR_PROGRESS_FORM       0x1F6208   // dword_5F6208 — singleton progress form object
+#define OFF_PROGRESS_BAR         0x364      // form+0x364 = bar control
+#define OFF_FORM_FSHOWING        0x57       // form+0x57 = FShowing (skip Show when set)
+#define ADDR_PROGRESS_TITLE_SAVE 0x19BCD0   // GM's "Saving…" title literal (char data)
+
 // ==== VCL Application / Screen / Modal machinery ====
 // Verified 2026-09-15 in IDA (8.0) and cross-checked against GM 8.1 + gm82save
 // source. 8.1 equivalents in comments — offsets DIFFER between versions, never
