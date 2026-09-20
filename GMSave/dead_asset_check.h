@@ -14,3 +14,8 @@ void dead_asset_check_ensure_menu();
 
 // True once the menu entry is in place (successfully or given up).
 bool dead_asset_check_menu_ready();
+
+// Sync the entry's enabled state with project presence (called from the load
+// hooks). No-op until the entry exists — the injection reads the project path
+// itself to pick the initial state.
+void dead_asset_check_set_project(bool loaded);

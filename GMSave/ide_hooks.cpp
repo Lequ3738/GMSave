@@ -647,6 +647,14 @@ __declspec(naked) static void msg_hook_thunk()
     }
 }
 
+// Native (.gmk) load path succeeded → the dead-asset entry becomes active.
+// Standalone helper so the naked thunk below can call it (symbols referenced
+// from __asm must already be defined).
+static void __stdcall enable_dead_asset_menu()
+{
+    dead_asset_check_set_project(true);
+}
+
 // Called at 0x59B91B (replaces call sub_59B28C).
 // At this point: InitializeProject has run, Delphi MM is ready.
 // EAX = TStream containing loaded file data.
@@ -681,6 +689,13 @@ call_original:
         mov ecx, dword ptr [g_gm_base_ptr]
         add ecx, 0x19B28C // sub_59B28C
         call ecx
+        // Native project loaded OK → enable the dead-asset menu entry.
+        cmp al, 0
+        je done
+        pushad
+        call enable_dead_asset_menu
+        popad
+done:
         ret // AL = original result
     }
 }
@@ -728,6 +743,7 @@ static int __stdcall check_and_do_gm80_load()
     if (loaded)
     {
         gm_log("Load: .gm80 direct Delphi objects — SUCCESS");
+        dead_asset_check_set_project(true); // enable the Scripts-menu entry
         // Start the file watcher so external edits are detected (merge flow:
         // silent auto-apply when clean, GMSaveMerge tool on conflicts).
         project_watcher_start(dirPath);

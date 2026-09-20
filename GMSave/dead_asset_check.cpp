@@ -52,6 +52,8 @@ namespace fs = std::filesystem;
 #define DAC_MENUITEM_VMT      0x53EA0  // classref; its value = TMenuItem VMT
 #define DAC_MENUITEM_CREATE   0x55414  // dl=1, ecx=nil, eax=classref → eax=item
 #define DAC_SETCAPTION        0x573F8  // eax=item, edx=pseudo-AnsiString
+#define DAC_SETENABLED        0x574C0  // TMenuItem.SetEnabled (RTTI: Enabled
+                                       // setter): eax=item, dl=0/1
 #define DAC_ADD               0x57914  // eax=self menu item, edx=new item
 #define DAC_ITEM_TAG          0x0C
 #define DAC_ITEM_CAPTION      0x30    // AnsiString; RTTI-verified twice (see below)
@@ -66,6 +68,7 @@ namespace fs = std::filesystem;
 static uint8_t* s_base;
 static HWINEVENTHOOK s_wevent_hook;
 static bool s_menu_done = false; // injected, or given up for a logged reason
+static void* s_menu_item = nullptr; // our entry, once injected (for Enable sync)
 
 static void dead_asset_check_run();
 
@@ -104,6 +107,28 @@ void dead_asset_check_install(uint8_t* base)
 bool dead_asset_check_menu_ready()
 {
     return s_menu_done;
+}
+
+// A project counts as open when GM's project-path global holds a path — set
+// by gm80_load_project (and the native loader) on success.
+static bool project_path_present()
+{
+    const char* p = *(const char**)(s_base + DAC_PROJECT_PATH);
+    return p && !IsBadStringPtrA(p, 2) && p[0] != '\0';
+}
+
+void dead_asset_check_set_project(bool loaded)
+{
+    void* item = s_menu_item;
+    if (!item || !s_base) return; // not injected yet: the injection path picks
+                                  // the initial state from the same global
+    uint32_t fn = (uint32_t)s_base + DAC_SETENABLED;
+    uint8_t v = loaded ? 1 : 0;
+    __asm {
+        mov dl, v
+        mov eax, item
+        call fn
+    }
 }
 
 // Logs a transient failure once (the watcher/timer paths keep retrying
@@ -226,6 +251,9 @@ void dead_asset_check_ensure_menu()
         call fnAdd
     }
     s_menu_done = true;
+    s_menu_item = item;
+    // Grey the entry out while no project is open (scanning does nothing).
+    dead_asset_check_set_project(project_path_present());
     if (s_wevent_hook)
     {
         UnhookWinEvent(s_wevent_hook); // one-shot: the menu bar is done
