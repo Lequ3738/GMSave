@@ -27,8 +27,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         bool config_ok = (GetFileAttributesA(gm_path) != INVALID_FILE_ATTRIBUTES);
         bool hooks_ok = ide_hooks_install(g_gm_base);
 
-        gm_log("GMSave v5 loaded | FoxPlugin.txt: %s | Hooks: %s | Base: 0x%p",
-            config_ok ? "FOUND" : "MISSING", hooks_ok ? "OK" : "FAIL", g_gm_base);
+        gm_log("GMSave v5 build %s %s | FoxPlugin.txt: %s | Hooks: %s | Base: 0x%p",
+            __DATE__, __TIME__, config_ok ? "FOUND" : "MISSING",
+            hooks_ok ? "OK" : "FAIL", g_gm_base);
     }
     else if (fdwReason == DLL_PROCESS_DETACH)
     {

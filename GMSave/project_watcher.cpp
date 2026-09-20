@@ -16,6 +16,7 @@
 #include "gm80_addresses.h"
 #include "gm80_save.h"
 #include "merge_flow.h"
+#include "dead_asset_check.h"
 #include "gm_log.h"
 #include "i18n.h"
 #include <windows.h>
@@ -224,6 +225,9 @@ void project_watcher_start(const std::wstring& path)
     // main thread during a project load/save — never from DllMain, so creating a
     // window is safe (no loader lock).
     project_watcher_ensure_timer_window();
+    // Main-menu entry for the dead-asset scan (idempotent; the main form
+    // exists by now, which is why this can't run from DLL attach).
+    dead_asset_check_ensure_menu();
     project_watcher_stop();
     if (!g_watch_wake)
         g_watch_wake = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -408,12 +412,20 @@ void project_watcher_tick()
 static const wchar_t* kWatcherWndClass = L"GMSave.Watcher";
 static HWND g_timer_wnd = NULL;
 static const UINT kTimerId = 1;
+static const UINT kMenuTimerId = 2; // dead-asset menu injection poll
 
 static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_TIMER && wp == kTimerId)
     {
         project_watcher_tick();
+        return 0;
+    }
+    if (msg == WM_TIMER && wp == kMenuTimerId)
+    {
+        // Idempotent; stops itself once the entry is in (or given up + logged).
+        if (dead_asset_check_menu_ready()) KillTimer(hwnd, kMenuTimerId);
+        else dead_asset_check_ensure_menu();
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -434,6 +446,7 @@ void project_watcher_ensure_timer_window()
     if (g_timer_wnd)
     {
         SetTimer(g_timer_wnd, kTimerId, 1000, NULL);
+        SetTimer(g_timer_wnd, kMenuTimerId, 1000, NULL);
         gm_log("Watcher: timer window created");
     }
     else

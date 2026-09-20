@@ -55,6 +55,7 @@
     <ClInclude Include="GMSave\project_watcher.h" />
     <ClInclude Include="GMSave\merge_flow.h" />
     <ClInclude Include="GMSave\diff3.h" />
+    <ClInclude Include="GMSave\dead_asset_check.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" /><ClCompile Include="pch.cpp" />
@@ -65,6 +66,7 @@
     <ClCompile Include="GMSave\project_watcher.cpp" />
     <ClCompile Include="GMSave\merge_flow.cpp" />
     <ClCompile Include="GMSave\diff3.cpp" />
+    <ClCompile Include="GMSave\dead_asset_check.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

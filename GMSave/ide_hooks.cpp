@@ -7,6 +7,7 @@
 #include "gm80_load.h"
 #include "project_watcher.h"
 #include "merge_flow.h"
+#include "dead_asset_check.h"
 #include "gm_log.h"
 #include "gm80_diag.h"
 #include "i18n.h"
@@ -946,6 +947,8 @@ bool ide_hooks_install(HMODULE gm_base)
     g_gm_base_ptr = gm_base;
     uint8_t* base = (uint8_t*)gm_base;
     hook_comdlg32_iat(gm_base);
+    // "Check for dead assets" entry in the IDE's Scripts menu.
+    dead_asset_check_install(base);
     // NOTE: the file watcher's hidden timer window is created lazily on the
     // first project_watcher_start (project load / save), NOT here — creating a
     // window inside DllMain (loader lock held) is unsafe.
