@@ -57,3 +57,11 @@ bool merge_flow_code_editor_open();
 // these forms — script editors apply their content on destroy, verified).
 // Returns the number of modeless forms freed immediately.
 int merge_flow_close_editors(int modalResult);
+// GM's global unsaved-changes state: the 16 per-category title-'*' flags.
+// true when ANY category is dirty (memory unreadable also counts as dirty —
+// callers take the safe route). Zero everywhere is what makes the merge flow
+// provably silent: local == base, so no per-file conflict can exist.
+bool merge_flow_global_dirty();
+// Any resource editor currently stuck inside ShowModal (its content hasn't
+// reached the dirty flags yet, so zero flags prove nothing while one is up).
+bool merge_flow_any_modal_editor_open();

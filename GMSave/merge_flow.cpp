@@ -436,7 +436,7 @@ int merge_flow_count_editor_windows()
 // editors set their flag the moment content is edited (typing → immediate
 // star, verified on-device 2026-09-20); modal property forms only set theirs
 // when the dialog applies. Loads and saves clear all of them.
-static bool merge_flow_global_dirty()
+bool merge_flow_global_dirty()
 {
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return true; // unreadable → assume dirty, take the slow path
@@ -449,7 +449,7 @@ static bool merge_flow_global_dirty()
 // Any open editor stuck inside ShowModal. Their edits don't reach the dirty
 // flags until the dialog applies, so a zero flag proves nothing while one is
 // open — the fast path must refuse and take the prompt flow.
-static bool merge_flow_any_modal_editor_open()
+bool merge_flow_any_modal_editor_open()
 {
     uint8_t* b = (uint8_t*)GetModuleHandle(NULL);
     if (!b) return true;

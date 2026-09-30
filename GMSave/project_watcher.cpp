@@ -405,6 +405,108 @@ void project_watcher_tick()
     g_flow_active = false;
 }
 
+// ==== Force-sync entry for external agents (unattended) ====
+// The tick only acts while the IDE is the foreground process: its model is
+// "the user alt-tabs back to Game Maker, then we catch up". An AI coding loop
+// driven by the gm8 MCP server has no such moment — it edits the project
+// while the IDE sits in the background and wants the very same merge flow on
+// demand, right after its edit batch is complete and before triggering run.
+//
+// Protocol (see GMEnhance mcp/server.mjs for the caller side): the agent
+// RegisterWindowMessageW's "GMSave.ForceSync" (same string → same message id
+// system-wide), finds this process's hidden "GMSave.Watcher" window by pid,
+// PostMessages the id in wParam, then polls a small named file mapping
+//
+//     Local\GMSave.SyncStatus.<pid>   (16 bytes: magic 'GMS1', reqId, status, detail)
+//
+// until reqId matches its own (written last, as the commit marker). The
+// mapping doubles as the capability probe: no mapping ⇒ deployed GMSave
+// predates force-sync. Status codes:
+//   1 reloaded       — merge flow ran and the project was reloaded from disk
+//   2 nothing-to-do  — disk matches the base snapshot
+//   3 deferred       — retry later; detail: 1 flow already active,
+//                      2 non-editor modal dialog open, 3 standalone code
+//                      editor open, 4 resource editor stuck in ShowModal
+//   4 needs-manual   — refused WITHOUT running anything or popping any UI;
+//                      a human must handle the IDE. detail 2 = unsaved
+//                      in-IDE edits present (the editor-gate prompts would
+//                      fire). detail 1 is unused (modal editors defer as 3:4
+//                      instead — closing one may clear the block on its own).
+//   5 not-watching   — no .gm80 project watched, or it changed under us
+//   6 failed         — reserved (flow ran but did not reload)
+//
+// Unattended safety: the flow is allowed to proceed only when it is provably
+// silent. Zero dirty flags + no modal editor ⇒ IDE memory == base snapshot ⇒
+// every difference is remote-only ⇒ the fast path auto-applies with no
+// prompt and no conflict tool, guaranteed. Any other state refuses with a
+// status instead of surfacing a dialog nobody will answer.
+#pragma pack(push, 4)
+struct GmSyncResultBlock
+{
+    uint32_t magic;
+    volatile uint32_t reqId;  // written LAST: its match is the completion signal
+    volatile uint32_t status;
+    volatile uint32_t detail;
+};
+#pragma pack(pop)
+static const uint32_t kSyncMagic = 0x47534D31; // 'GMS1'
+static HANDLE g_sync_map = NULL;
+static GmSyncResultBlock* g_sync_view = NULL;
+static UINT g_msgForceSync = 0;
+
+static void force_sync_report(uint32_t reqId, uint32_t status, uint32_t detail)
+{
+    if (g_sync_view)
+    {
+        g_sync_view->status = status;
+        g_sync_view->detail = detail;
+        InterlockedExchange((volatile LONG*)&g_sync_view->reqId, (LONG)reqId);
+    }
+    gm_log("ForceSync: req=%u -> status=%u detail=%u", reqId, status, detail);
+}
+
+// Runs on the main thread — the timer window's wndproc dispatches it, the
+// same thread the WM_TIMER tick and merge_flow_run itself live on.
+static void project_watcher_force_sync(uint32_t reqId)
+{
+    if (!g_watching || !watcher_path_current())
+    {
+        force_sync_report(reqId, 5, 0);
+        return;
+    }
+    if (g_flow_active)
+    {
+        force_sync_report(reqId, 3, 1);
+        return;
+    }
+    if (merge_flow_non_editor_modal_open())
+    {
+        force_sync_report(reqId, 3, 2);
+        return;
+    }
+    if (merge_flow_code_editor_open())
+    {
+        force_sync_report(reqId, 3, 3);
+        return;
+    }
+    if (merge_flow_any_modal_editor_open())
+    {
+        force_sync_report(reqId, 3, 4);
+        return;
+    }
+    if (merge_flow_global_dirty())
+    {
+        force_sync_report(reqId, 4, 2);
+        return;
+    }
+    gm_log("ForceSync: req=%u running merge flow on '%S'", reqId, g_watch_path.c_str());
+    g_flow_active = true;
+    InterlockedExchange(&g_pending_foreign, 0);
+    bool ok = merge_flow_run(g_watch_path, false);
+    g_flow_active = false;
+    force_sync_report(reqId, ok ? 1 : 2, 0);
+}
+
 // ==== Hidden timer window (main-thread polling, self-contained) ====
 // A message-only window with a 1s WM_TIMER. The thread's message pump
 // (Application.Run → DispatchMessage) delivers WM_TIMER to it, so project_watcher_tick
@@ -416,6 +518,11 @@ static const UINT kMenuTimerId = 2; // dead-asset menu injection poll
 
 static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (g_msgForceSync && msg == g_msgForceSync)
+    {
+        project_watcher_force_sync((uint32_t)wp);
+        return 0;
+    }
     if (msg == WM_TIMER && wp == kTimerId)
     {
         project_watcher_tick();
@@ -434,6 +541,31 @@ static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 void project_watcher_ensure_timer_window()
 {
     if (g_timer_wnd) return;
+    // Force-sync channel: registered message id + per-pid named mapping (the
+    // agent's capability probe and result block). Created once, on the main
+    // thread, together with the window — both live until process exit.
+    g_msgForceSync = RegisterWindowMessageW(L"GMSave.ForceSync");
+    if (!g_sync_map)
+    {
+        const std::wstring mapName =
+            L"Local\\GMSave.SyncStatus." + std::to_wstring(GetCurrentProcessId());
+        g_sync_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+            0, sizeof(GmSyncResultBlock), mapName.c_str());
+        if (g_sync_map)
+        {
+            g_sync_view = (GmSyncResultBlock*)MapViewOfFile(
+                g_sync_map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+            if (g_sync_view)
+            {
+                g_sync_view->magic = kSyncMagic;
+                g_sync_view->reqId = 0;
+                g_sync_view->status = 0;
+                g_sync_view->detail = 0;
+            }
+        }
+        gm_log("Watcher: sync mapping '%S' %s", mapName.c_str(),
+            g_sync_view ? "created" : "FAILED");
+    }
     HINSTANCE inst = (HINSTANCE)GetModuleHandle(NULL);
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
