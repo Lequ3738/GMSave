@@ -83,6 +83,38 @@ static void journal_record(const std::wstring& fp, const void* data, size_t len)
 
 void gm80_save_set_force_full(bool on) { g_force_full = on; }
 
+// ==== Save-pass progress sink ====
+// See gm80_save.h. Reports are mapped into the installer's window and deduped
+// so the sink — which sets the native bar — is called about once per
+// percentage point, not once per resource.
+static Gm80ProgressSink g_prog_sink = nullptr;
+static int g_prog_lo = 0;
+static int g_prog_hi = 100;
+static int g_prog_last = -1;
+
+void gm80_save_progress_install(Gm80ProgressSink sink, int lo, int hi)
+{
+    if (lo < 0) lo = 0;
+    if (hi > 100) hi = 100;
+    g_prog_sink = sink;
+    g_prog_lo = lo;
+    g_prog_hi = hi;
+    g_prog_last = lo - 1;
+}
+
+void gm80_save_progress_uninstall() { g_prog_sink = nullptr; }
+
+void gm80_save_progress_report(int selfPct)
+{
+    if (!g_prog_sink) return;
+    if (selfPct < 0) selfPct = 0;
+    if (selfPct > 100) selfPct = 100;
+    int p = g_prog_lo + (g_prog_hi - g_prog_lo) * selfPct / 100;
+    if (p <= g_prog_last) return;
+    g_prog_last = p;
+    g_prog_sink(p);
+}
+
 // Delphi Now() → TDateTime in ST(0) (sub_40CF18). Same clock GM uses for the
 // per-resource timestamps, so ts[i] and LAST_SAVE are directly comparable.
 static double now_t()
@@ -1861,6 +1893,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     g_save_io_error = false;
     gm80_diag_reset();
     uint8_t* base = (uint8_t*)gm_base;
+    gm80_save_progress_report(0);
 
     CreateDirectoryW(path.c_str(), NULL);
     auto sub = [&](const wchar_t* s) {
@@ -1953,6 +1986,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
             return false; // caller shows the error after closing the progress form
         }
     }
+    gm80_save_progress_report(4);
 
     // ==== Smart save decision ====
     // changed[t] = type t needs a FULL re-save (its name/index structure changed,
@@ -2047,6 +2081,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         auto basename = path.substr(path.find_last_of(L"\\/") + 1);
         wf(path + L"\\" + basename, m);
     }
+    gm80_save_progress_report(6);
 
     // ==== Settings ====
     // Field offsets corrected 2026-08-02 from GM80_SaveSettings (0x59E648)
@@ -2213,6 +2248,8 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         }
     }
 
+    gm80_save_progress_report(8);
+
     // ==== Included files (datafiles/) — gm82save format ====
     // GM 8.0 (verified GM80_SaveIncludedFiles 0x59AE20): count 0x1E9398,
     // object array 0x1E9390, timestamps 0x1E9394. IncludedFile object:
@@ -2248,6 +2285,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
             std::string index;
             for (uint32_t i = 0; i < ifCnt; i++)
             {
+                gm80_save_progress_stage(8, 12, (int)(i + 1), (int)ifCnt);
                 void* f = (void*)(uintptr_t)ifArr[i];
                 if (!f) continue;
                 std::string name = RS(f, 4);
@@ -2339,6 +2377,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < scCnt && i < (uint32_t)scriptNames.size(); i++)
             {
+                gm80_save_progress_stage(12, 40, (int)(i + 1), (int)scCnt);
                 if (scriptNames[i].empty()) continue;
                 if (!changed[T_SCR] && scrTs && scrTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2364,6 +2403,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < fCnt && i < (uint32_t)fontNames.size(); i++)
             {
+                gm80_save_progress_stage(40, 42, (int)(i + 1), (int)fCnt);
                 if (fontNames[i].empty()) continue;
                 if (!changed[T_FNT] && fntTs && fntTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2387,6 +2427,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < pathCnt && i < (uint32_t)pathNames.size(); i++)
             {
+                gm80_save_progress_stage(42, 44, (int)(i + 1), (int)pathCnt);
                 if (pathNames[i].empty()) continue;
                 if (!changed[T_PAT] && patTs && patTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2413,6 +2454,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < soundCnt && i < (uint32_t)soundNames.size(); i++)
             {
+                gm80_save_progress_stage(44, 47, (int)(i + 1), (int)soundCnt);
                 if (soundNames[i].empty()) continue;
                 if (!changed[T_SND] && sndTs && sndTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2436,6 +2478,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < spriteCnt && i < (uint32_t)spriteNames.size(); i++)
             {
+                gm80_save_progress_stage(47, 53, (int)(i + 1), (int)spriteCnt);
                 if (spriteNames[i].empty()) continue;
                 if (!changed[T_SPR] && sprTs && sprTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2460,6 +2503,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < bgCnt && i < (uint32_t)bgNames.size(); i++)
             {
+                gm80_save_progress_stage(53, 55, (int)(i + 1), (int)bgCnt);
                 if (bgNames[i].empty()) continue;
                 if (!changed[T_BG] && bgTs && bgTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2483,6 +2527,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < tlCnt && i < (uint32_t)tlNames.size(); i++)
             {
+                gm80_save_progress_stage(55, 57, (int)(i + 1), (int)tlCnt);
                 if (tlNames[i].empty()) continue;
                 if (!changed[T_TLN] && tlTs && tlTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2506,6 +2551,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < triggerCnt && i < (uint32_t)triggerNames.size(); i++)
             {
+                gm80_save_progress_stage(57, 59, (int)(i + 1), (int)triggerCnt);
                 if (triggerNames[i].empty()) continue;
                 void* tObj = (void*)(uintptr_t)tArr[i];
                 if (!tObj) continue;
@@ -2527,6 +2573,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < objectCnt && i < (uint32_t)objectNames.size(); i++)
             {
+                gm80_save_progress_stage(59, 74, (int)(i + 1), (int)objectCnt);
                 if (objectNames[i].empty()) continue;
                 if (!changed[T_OBJ] && objTs && objTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2552,6 +2599,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         {
             for (uint32_t i = 0; i < roomCnt && i < (uint32_t)roomNames.size(); i++)
             {
+                gm80_save_progress_stage(74, 95, (int)(i + 1), (int)roomCnt);
                 if (roomNames[i].empty()) continue;
                 if (!changed[T_ROM] && romTs && romTs[i] <= g_last_save)
                     continue; // smart skip
@@ -2581,6 +2629,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     // Persist expanded folders so the tree survives project reopen. Written
     // AFTER the baseline update point above — a failed save skips it too.
     { GmPerfSpan _pf("save.tree_state"); gm80_capture_tree_state(gm_base, path); }
+    gm80_save_progress_report(97);
     if (g_force_full)
     {
         // Staging save: the tree just written mirrors the IDE memory, but the
@@ -2619,6 +2668,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
     if (roomNamesOk) removed += cleanup_type_dir(path, L"rooms", roomNames, true);
     if (soundNamesOk) removed += cleanup_type_dir(path, L"sounds", soundNames, false);
     gm_log("SmartSave: cleanup removed %d stale entries", removed);
+    gm80_save_progress_report(100);
 
     return true;
 }

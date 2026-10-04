@@ -329,6 +329,7 @@ void merge_flow_snapshot_refresh(const std::wstring& projDir,
     const std::vector<Gm80WrittenFile>* written)
 {
     GmPerfSpan _pf("merge.snapshot");
+    gm80_save_progress_report(2);
     fs::path snap = snapshot_dir_of(projDir);
     std::error_code ec;
     fs::path root = snap / L"root";
@@ -347,12 +348,15 @@ void merge_flow_snapshot_refresh(const std::wstring& projDir,
 
     std::vector<DiskEntry> disk;
     enumerate_tree_meta(projDir, L"cache", disk);
+    gm80_save_progress_report(12);
     std::vector<SnapEntry> entries;
     entries.reserve(disk.size());
     std::set<std::wstring> seen;
     size_t reused = 0;
+    size_t progDone = 0;
     for (auto& d : disk)
     {
+        gm80_save_progress_stage(20, 90, (int)(++progDone), (int)disk.size());
         seen.insert(d.rel);
         fs::path src = fs::path(projDir) / d.rel;
         SnapEntry e;
@@ -422,6 +426,7 @@ void merge_flow_snapshot_refresh(const std::wstring& projDir,
         }
 
     write_snapshot_manifest(snap / L"manifest.json", entries);
+    gm80_save_progress_report(100);
     gm_log("MergeFlow: snapshot refreshed (%zu files, %zu reused)",
         entries.size(), reused);
 }
@@ -667,6 +672,11 @@ int merge_flow_close_editors(int modalResult)
 
 // ==== Staging save ====
 
+// Progress sink for the staging save (defined next to the native progress
+// primitives below): the save pass reports its own 0..100 and the sink drives
+// the merge form's bar at the mapped position.
+static void staging_progress_sink(int pct);
+
 // SEH guard around the Delphi interop save (same policy as ide_hooks).
 static bool stage_save_seh(void* base, const std::wstring& path)
 {
@@ -692,7 +702,11 @@ static bool stage_save(const std::wstring& stagingDir)
     // staging tree shipped as a stub whose missing files then read as
     // IDE-side deletions — 2026-09-15, nearly deleted 7 real files.)
     gm80_save_set_force_full(true);
+    // The staging save is the long pole of the merge analysis: let its pass
+    // drive the form's bar (4..44) instead of leaving it parked.
+    gm80_save_progress_install(&staging_progress_sink, 4, 44);
     bool ok = stage_save_seh(base, stagingDir);
+    gm80_save_progress_uninstall();
     gm80_save_set_force_full(false);
     if (!ok) gm_log("MergeFlow: staging save FAILED (%s)", gm80_save_last_error().c_str());
     return ok;
@@ -1155,6 +1169,11 @@ static void native_progress_close()
     if (!b) return;
     uint32_t fn = (uint32_t)b + ADDR_PROGRESS_CLOSE;
     __asm { call fn }
+}
+
+static void staging_progress_sink(int pct)
+{
+    native_progress_step(pct);
 }
 
 // ==== The flow ====

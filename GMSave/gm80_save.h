@@ -30,6 +30,27 @@ struct Gm80WrittenFile
 };
 const std::vector<Gm80WrittenFile>& gm80_save_written_files();
 
+// ==== Save-pass progress ====
+// The entry point that owns the native progress form (the Ctrl+S hook, the
+// merge flow's staging save) installs a sink with the percentage window
+// [lo,hi] the pass may fill. The pass reports its own 0..100 progress; the
+// sink receives mapped absolute positions, monotonic, repeats dropped. The
+// snapshot refresh that runs after the save reports through the same sink
+// (the caller re-installs a window for it). No sink installed → dropped.
+typedef void (*Gm80ProgressSink)(int pct);
+void gm80_save_progress_install(Gm80ProgressSink sink, int lo, int hi);
+void gm80_save_progress_uninstall();
+void gm80_save_progress_report(int selfPct);
+
+// Stage-boundary report: selfLo + (selfHi-selfLo)*done/total. Loop bodies call
+// this once per resource so the bar keeps moving inside the long types.
+inline void gm80_save_progress_stage(int selfLo, int selfHi, int done, int total)
+{
+    if (total <= 0) total = 1;
+    if (done > total) done = total;
+    gm80_save_progress_report(selfLo + (selfHi - selfLo) * done / total);
+}
+
 // Save project to .gm80 directory
 // gm_base: GetModuleHandle(NULL) of GameMaker.exe
 // path: full path to .gm80 file (e.g. "C:\project.gm80")

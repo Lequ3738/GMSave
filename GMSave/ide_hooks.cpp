@@ -266,6 +266,7 @@ static void clear_updated_flags()
 static void gm80_progress_show();
 static void gm80_progress_step(int pos);
 static void gm80_progress_close();
+static void save_progress_sink(int pct);
 
 // SEH guard for the save pass (2026-09-09): the project has no /EHa, so an
 // access violation inside the Delphi interop (e.g. a corrupt AnsiString read
@@ -349,7 +350,10 @@ static void __stdcall do_gm80_save_if_needed()
     }
     gm_log("Save: writing .gm80 to '%S'", g_gm80_save_path.c_str());
     gm80_progress_show();
-    gm80_progress_step(25);
+    // One bar, two windows: the save pass fills 8..78, the snapshot refresh
+    // that follows it re-installs and fills 78..98. Both report through the
+    // same sink, so the bar tracks the work instead of sitting on one value.
+    gm80_save_progress_install(&save_progress_sink, 8, 78);
     bool ok = false;
     {
         GmPerfSpan _pf("save.ctrl_s");
@@ -366,6 +370,7 @@ static void __stdcall do_gm80_save_if_needed()
                 // Disk == IDE memory now → this is the new three-way merge base.
                 // The save's write journal feeds the refresh: what was just
                 // written skips the re-read + re-hash entirely.
+                gm80_save_progress_install(&save_progress_sink, 78, 98);
                 merge_flow_snapshot_refresh(g_gm80_save_path,
                     &gm80_save_written_files());
                 ok = true;
@@ -381,6 +386,7 @@ static void __stdcall do_gm80_save_if_needed()
             gm_log("Save: UNKNOWN EXCEPTION");
         }
     }
+    gm80_save_progress_uninstall();
     gm80_progress_step(100);
     gm80_progress_close();
     // Show diagnostics (e.g. applies_to pointing at a deleted object) only AFTER
@@ -452,7 +458,8 @@ static void gm80_progress_show()
 }
 static void gm80_progress_step(int pos)
 {
-    // Position is passed in EAX (PBM_SETPOS via sub_49C530).
+    // Position is passed in EAX (PBM_SETPOS via sub_49C530); the GM function
+    // ends with Application.ProcessMessages, so each step repaints the bar.
     if (pos < 0) pos = 0;
     if (pos > 100) pos = 100;
     uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
@@ -462,6 +469,11 @@ static void gm80_progress_step(int pos)
         call fn
     }
 }
+
+// Sink adapter: the save pass (and the snapshot refresh after it) reports its
+// own 0..100, gm80_progress_step maps it into the installed window position
+// and shows it on the bar.
+static void save_progress_sink(int pct) { gm80_progress_step(pct); }
 static void gm80_progress_close()
 {
     uint8_t* base = (uint8_t*)GetModuleHandle(NULL);
