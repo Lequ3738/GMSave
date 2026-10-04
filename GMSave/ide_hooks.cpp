@@ -364,7 +364,10 @@ static void __stdcall do_gm80_save_if_needed()
                 project_watcher_start(g_gm80_save_path);
                 project_watcher_mark_saved();
                 // Disk == IDE memory now → this is the new three-way merge base.
-                merge_flow_snapshot_refresh(g_gm80_save_path);
+                // The save's write journal feeds the refresh: what was just
+                // written skips the re-read + re-hash entirely.
+                merge_flow_snapshot_refresh(g_gm80_save_path,
+                    &gm80_save_written_files());
                 ok = true;
             }
         }

@@ -7,6 +7,9 @@
 // project is reloaded through the existing GM80_LoadRecentProject path.
 #pragma once
 #include <string>
+#include <vector>
+
+struct Gm80WrittenFile;
 
 // ==== Base snapshot ====
 // Refresh after every successful load AND every successful real save: re-copy
@@ -14,7 +17,11 @@
 // manifest.json (per-file size + mtime + FNV-1a-64 hash for every project
 // file; binary files are hashed, not copied). cache\ is watcher-filtered and
 // git-ignored.
-void merge_flow_snapshot_refresh(const std::wstring& projDir);
+// `written` (when given) carries the save's own write journal: files listed
+// there skip the re-read + re-hash, and their base copy is refreshed from a
+// read-back only when its recorded content changed.
+void merge_flow_snapshot_refresh(
+    const std::wstring& projDir, const std::vector<Gm80WrittenFile>* written = nullptr);
 
 // True when any project file on disk differs from the snapshot (size/mtime
 // fast path, hash fallback). Used by the save-side conflict prompt.

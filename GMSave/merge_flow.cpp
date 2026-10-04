@@ -63,13 +63,7 @@ static bool write_bytes(const fs::path& p, const std::string& data)
 
 static uint64_t fnv1a(const std::string& d)
 {
-    uint64_t h = 1469598103934665603ULL;
-    for (unsigned char c : d)
-    {
-        h ^= c;
-        h *= 1099511628211ULL;
-    }
-    return h;
+    return gm80_fnv1a64(d.data(), d.size());
 }
 
 static std::string hex64(uint64_t v)
@@ -167,24 +161,71 @@ static fs::path snapshot_dir_of(const std::wstring& projDir)
     return fs::path(projDir) / L"cache" / L"gmsave-base";
 }
 
-static void enumerate_tree(const fs::path& root, const std::wstring& skipTop,
-    std::vector<std::wstring>& out)
+// One file seen on disk, with the metadata its directory entry already
+// carries — no per-file stat probe anywhere downstream.
+struct DiskEntry
 {
-    std::error_code ec;
-    if (!fs::exists(root, ec)) return;
-    for (auto it = fs::recursive_directory_iterator(root, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec))
+    std::wstring rel;
+    unsigned long long size = 0;
+    long long mtime = 0;
+};
+
+// Single-pass tree enumeration via FindFirstFileExW: every entry arrives with
+// its size and mtime attached, replacing the previous std::filesystem iterator
+// plus one GetFileAttributesExW probe per file — the save path's constant
+// conflict-check and snapshot overhead on file-count-heavy projects.
+// Dot entries skipped, hidden files kept; reparse points (symlinks/junctions)
+// are neither followed nor listed — the iterator this replaces followed file
+// symlinks, a divergence taken deliberately: a merge/snapshot tool must not
+// read content from outside the project tree.
+static void enumerate_tree_meta(const std::wstring& root,
+    const std::wstring& skipTop, std::vector<DiskEntry>& out)
+{
+    struct Dir
     {
-        if (ec) break;
-        if (!it->is_regular_file(ec)) continue;
-        std::wstring rel = it->path().lexically_relative(root).wstring();
-        if (!skipTop.empty() &&
-            (rel == skipTop || rel.rfind(skipTop + L"\\", 0) == 0))
+        std::wstring abs, rel;
+    };
+    std::vector<Dir> dirs;
+    dirs.push_back({root, L""});
+    while (!dirs.empty())
+    {
+        Dir d = std::move(dirs.back());
+        dirs.pop_back();
+        std::wstring relPrefix = d.rel.empty() ? L"" : d.rel + L"\\";
+        std::wstring query = d.abs + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(query.c_str(), FindExInfoBasic, &fd,
+            FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_PARAMETER)
+            h = FindFirstFileW(query.c_str(), &fd); // same data, no large fetch
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do
         {
-            it.disable_recursion_pending();
-            continue;
-        }
-        out.push_back(rel);
+            const wchar_t* n = fd.cFileName;
+            if (n[0] == L'.' && (n[1] == 0 || (n[1] == L'.' && n[2] == 0)))
+                continue;
+            std::wstring rel = relPrefix + n;
+            if (!skipTop.empty() &&
+                (rel == skipTop || rel.rfind(skipTop + L"\\", 0) == 0))
+                continue;
+            DWORD attr = fd.dwFileAttributes;
+            if (attr & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT))
+                    dirs.push_back({d.abs + L"\\" + n, std::move(rel)});
+                continue;
+            }
+            if (attr & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            DiskEntry e;
+            e.rel = std::move(rel);
+            e.size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            e.mtime = (long long)(((unsigned long long)
+                                          fd.ftLastWriteTime.dwHighDateTime
+                                      << 32) |
+                fd.ftLastWriteTime.dwLowDateTime);
+            out.push_back(std::move(e));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
     }
 }
 
@@ -277,13 +318,15 @@ static bool file_meta(const fs::path& p, unsigned long long& size, long long& mt
 // Rebuild the base snapshot. INCREMENTAL: the previous manifest acts as the
 // reuse pool — a file whose (size, mtime) is unchanged since the last refresh
 // keeps its recorded hash and its base copy without being read or rewritten.
-// After a plain save that is 1-2 files out of thousands; the previous
-// remove_all + full re-read + full re-copy ran on every save/load/apply and
-// dominated open/save time on file-count-heavy projects.
+// `written` (the save's write journal) takes priority: a file the save just
+// wrote has its hash recorded at write time, so neither a read nor a stat
+// probe is needed; only its text base copy may still have to be refreshed
+// (from a read-back — the file is in the NTFS cache we just filled).
 // Consumers that must keep holding: load_text_or_hash reads root\<rel> for
-// EVERY non-binary manifest entry, so a reused entry's copy is verified to
+// EVERY non-binary manifest entry, so any reused entry's copy is verified to
 // still exist before reuse (missing → fall through to a fresh read+copy).
-void merge_flow_snapshot_refresh(const std::wstring& projDir)
+void merge_flow_snapshot_refresh(const std::wstring& projDir,
+    const std::vector<Gm80WrittenFile>* written)
 {
     GmPerfSpan _pf("merge.snapshot");
     fs::path snap = snapshot_dir_of(projDir);
@@ -298,52 +341,74 @@ void merge_flow_snapshot_refresh(const std::wstring& projDir)
             for (auto& e : prev) old.emplace(e.rel, std::move(e));
     }
 
-    std::vector<std::wstring> rels;
-    enumerate_tree(fs::path(projDir), L"cache", rels);
+    std::map<std::wstring, const Gm80WrittenFile*> journal;
+    if (written)
+        for (auto& w : *written) journal[w.rel] = &w;
+
+    std::vector<DiskEntry> disk;
+    enumerate_tree_meta(projDir, L"cache", disk);
     std::vector<SnapEntry> entries;
-    entries.reserve(rels.size());
+    entries.reserve(disk.size());
     std::set<std::wstring> seen;
     size_t reused = 0;
-    for (auto& rel : rels)
+    for (auto& d : disk)
     {
-        seen.insert(rel);
-        fs::path src = fs::path(projDir) / rel;
-        unsigned long long sz = 0;
-        long long mt = 0;
-        bool metaOk = file_meta(src, sz, mt);
+        seen.insert(d.rel);
+        fs::path src = fs::path(projDir) / d.rel;
         SnapEntry e;
-        e.rel = rel;
-        e.text = !is_binary_rel(rel);
-        e.size = sz;
-        e.mtime = metaOk ? mt : 0;
+        e.rel = d.rel;
+        e.text = !is_binary_rel(d.rel);
+        e.size = d.size;
+        e.mtime = d.mtime;
 
-        auto it = old.find(rel);
-        if (metaOk && it != old.end() && it->second.size == sz &&
-            it->second.mtime == mt && it->second.text == e.text)
+        auto o = old.find(d.rel);
+        auto j = journal.find(d.rel);
+        std::string data;
+        bool haveData = false;
+        if (j != journal.end() && j->second->size == d.size)
         {
-            // Binary entries store only the hash — nothing to verify. Text
-            // entries must still have their base copy on disk.
-            bool copyOk = !e.text;
-            if (!copyOk)
-            {
-                DWORD a = GetFileAttributesW((root / rel).c_str());
-                copyOk = a != INVALID_FILE_ATTRIBUTES &&
-                    !(a & FILE_ATTRIBUTE_DIRECTORY);
-            }
-            if (copyOk)
-            {
-                e.hash = it->second.hash;
-                reused++;
-                entries.push_back(std::move(e));
-                continue;
-            }
+            // Written by this save — the hash was computed over the bytes.
+            e.hash = j->second->hash;
+            reused++;
+        }
+        else if (o != old.end() && o->second.size == d.size &&
+                 o->second.mtime == d.mtime && o->second.text == e.text)
+        {
+            // Untouched since the last refresh — reuse the recorded hash.
+            e.hash = o->second.hash;
+            reused++;
+        }
+        else
+        {
+            // New or changed → read + hash (+ copy for text).
+            data = read_bytes(src);
+            e.hash = fnv1a(data);
+            e.size = data.size();
+            haveData = true;
         }
 
-        // New, changed, or copy missing → read + hash (+ copy for text).
-        std::string data = read_bytes(src);
-        e.hash = fnv1a(data);
-        e.size = data.size();
-        if (e.text) write_bytes(root / rel, data);
+        // Text entries must hold a base copy with exactly this content.
+        if (e.text)
+        {
+            bool copyFresh = o != old.end() && o->second.text &&
+                o->second.hash == e.hash;
+            if (copyFresh)
+            {
+                DWORD a = GetFileAttributesW((root / d.rel).c_str());
+                copyFresh = a != INVALID_FILE_ATTRIBUTES &&
+                    !(a & FILE_ATTRIBUTE_DIRECTORY);
+            }
+            if (!copyFresh)
+            {
+                if (!haveData)
+                {
+                    data = read_bytes(src);
+                    e.hash = fnv1a(data); // recompute: the copy must match
+                    e.size = data.size();
+                }
+                write_bytes(root / d.rel, data);
+            }
+        }
         entries.push_back(std::move(e));
     }
 
@@ -369,25 +434,20 @@ bool merge_flow_disk_differs(const std::wstring& projDir)
     std::map<std::wstring, SnapEntry> byRel;
     for (auto& e : snap) byRel[e.rel] = e;
 
-    std::vector<std::wstring> rels;
-    enumerate_tree(fs::path(projDir), L"cache", rels);
-    std::set<std::wstring> disk;
-    for (auto& rel : rels)
+    std::vector<DiskEntry> disk;
+    enumerate_tree_meta(projDir, L"cache", disk);
+    for (auto& d : disk)
     {
-        disk.insert(rel);
-        auto it = byRel.find(rel);
+        auto it = byRel.find(d.rel);
         if (it == byRel.end()) return true; // new foreign file
-        unsigned long long size = 0;
-        long long mtime = 0;
-        if (!file_meta(fs::path(projDir) / rel, size, mtime)) return true;
-        if (size != it->second.size) return true;
-        if (mtime == it->second.mtime) continue; // fast path
-        std::string data = read_bytes(fs::path(projDir) / rel);
+        if (d.size != it->second.size) return true;
+        if (d.mtime == it->second.mtime) continue; // fast path
+        std::string data = read_bytes(fs::path(projDir) / d.rel);
         if (fnv1a(data) != it->second.hash) return true;
     }
-    for (auto& e : snap)
-        if (!disk.count(e.rel)) return true; // deleted on disk
-    return false;
+    // Every disk file matched above, so the disk side is a subset of the
+    // snapshot; a count mismatch means snapshot-only files were deleted.
+    return disk.size() != byRel.size();
 }
 
 // ==== Editor-window helpers ====
@@ -1129,25 +1189,25 @@ static AnalyzeRc merge_analyze(const std::wstring& projDir,
     fs.snapBy.clear();
     for (auto& e : fs.snap) fs.snapBy[e.rel] = &e;
 
-    std::vector<std::wstring> localRels, remoteRels;
-    enumerate_tree(staging, L"cache", localRels);
-    enumerate_tree(fs::path(projDir), L"cache", remoteRels);
+    std::vector<DiskEntry> localTree, remoteTree;
+    enumerate_tree_meta(staging.wstring(), L"cache", localTree);
+    enumerate_tree_meta(projDir, L"cache", remoteTree);
 
     // Guard: a staging tree far smaller than the snapshot means the staging
     // save skipped types anyway (a future smart-skip regression) — applying
     // that would read every missing file as an IDE-side deletion. Abort
     // instead; nothing has been written to the project yet.
-    if (fs.snap.size() > 8 && localRels.size() * 2 < fs.snap.size())
+    if (fs.snap.size() > 8 && localTree.size() * 2 < fs.snap.size())
     {
         gm_log("MergeFlow: staging tree suspiciously small (%zu files vs %zu "
                "snapshotted)",
-            localRels.size(), fs.snap.size());
+            localTree.size(), fs.snap.size());
         return AnalyzeRc::TREE_SMALL;
     }
 
     std::set<std::wstring> all;
-    for (auto& r : localRels) all.insert(r);
-    for (auto& r : remoteRels) all.insert(r);
+    for (auto& d : localTree) all.insert(d.rel);
+    for (auto& d : remoteTree) all.insert(d.rel);
     for (auto& e : fs.snap) all.insert(e.rel);
 
     fs.files.clear();

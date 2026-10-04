@@ -1,7 +1,34 @@
 // GM80 save format: multi-file project save (mirrors gm82save for GM 8.0)
 // Reads Delphi objects directly from GM arrays and writes .gm80 directory.
 #pragma once
+#include <cstdint>
 #include <string>
+#include <vector>
+
+// FNV-1a 64 over raw bytes (standard offset basis). Shared with the merge
+// flow's snapshot hashing — the write journal and the snapshot manifest must
+// agree on the digest of the same content.
+inline uint64_t gm80_fnv1a64(const char* d, size_t n)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; i++)
+    {
+        h ^= (unsigned char)d[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// One file written by the last save: path relative to the save target, byte
+// size, content hash. The post-save snapshot refresh joins these against its
+// tree enumeration and skips re-reading what the save just wrote.
+struct Gm80WrittenFile
+{
+    std::wstring rel;
+    unsigned long long size = 0;
+    unsigned long long hash = 0;
+};
+const std::vector<Gm80WrittenFile>& gm80_save_written_files();
 
 // Save project to .gm80 directory
 // gm_base: GetModuleHandle(NULL) of GameMaker.exe

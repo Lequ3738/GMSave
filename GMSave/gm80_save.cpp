@@ -53,6 +53,34 @@ static bool g_has_last_names[10] = {false};
 static uint64_t g_last_data_hash = 0;
 static bool g_has_last_data = false;
 
+// ==== Write journal ====
+// Every successful write inside gm80_save_to_path records rel/size/hash here;
+// the post-save snapshot refresh consumes it to skip re-reading what the save
+// just wrote. Cleared at the start of each save, so it always reflects the
+// most recent save attempt only.
+static std::vector<Gm80WrittenFile> g_save_journal;
+// Save target of the running save; empty outside a save (journaling off).
+static std::wstring g_save_root;
+
+const std::vector<Gm80WrittenFile>& gm80_save_written_files()
+{
+    return g_save_journal;
+}
+
+// Record a successful write. Only paths under the save target journal (the
+// staging save journals its own tree, which nothing consumes).
+static void journal_record(const std::wstring& fp, const void* data, size_t len)
+{
+    if (g_save_root.empty()) return;
+    std::wstring prefix = g_save_root + L"\\";
+    if (fp.compare(0, prefix.size(), prefix) != 0) return;
+    Gm80WrittenFile e;
+    e.rel = fp.substr(prefix.size());
+    e.size = len;
+    e.hash = gm80_fnv1a64((const char*)data, len);
+    g_save_journal.push_back(std::move(e));
+}
+
 void gm80_save_set_force_full(bool on) { g_force_full = on; }
 
 // Delphi Now() → TDateTime in ST(0) (sub_40CF18). Same clock GM uses for the
@@ -497,10 +525,11 @@ static bool wf(const std::wstring& fp, const std::string& content)
         return false;
     }
     DWORD written;
-    if (!WriteFile(h, content.c_str(), (DWORD)content.size(), &written, NULL) ||
-        written != content.size())
-        g_save_io_error = true; // partial/failed write
+    bool ok = WriteFile(h, content.c_str(), (DWORD)content.size(), &written, NULL) &&
+        written == content.size();
+    if (!ok) g_save_io_error = true; // partial/failed write
     CloseHandle(h);
+    if (ok) journal_record(fp, content.data(), content.size());
     return true;
 }
 
@@ -565,10 +594,11 @@ static bool wb(const std::wstring& fp, const void* data, size_t len)
         return false;
     }
     DWORD written;
-    if (!WriteFile(h, data, (DWORD)len, &written, NULL) || written != len)
-        g_save_io_error = true;
+    bool ok = WriteFile(h, data, (DWORD)len, &written, NULL) && written == len;
+    if (!ok) g_save_io_error = true;
     CloseHandle(h);
-    return true;
+    if (ok) journal_record(fp, data, len);
+    return ok;
 }
 
 // Convert ANSI (CP_ACP / GBK) → UTF-8 for GML output (matching gm82save)
@@ -1810,9 +1840,23 @@ static bool extract_richtext(uint8_t* b, std::string* out)
 }
 
 // ==== Main save function ====
+// Scopes the write journal to one save: cleared on entry, root closed on
+// exit — the entries survive for the post-save snapshot refresh (or until
+// the next save), but writes outside a save never journal.
+struct SaveJournalScope
+{
+    explicit SaveJournalScope(const std::wstring& path)
+    {
+        g_save_journal.clear();
+        g_save_root = path;
+    }
+    ~SaveJournalScope() { g_save_root.clear(); }
+};
+
 bool gm80_save_to_path(void* gm_base, const std::wstring& path)
 {
     GmPerfSpan _pf_total("save.to_path");
+    SaveJournalScope _journal(path);
     g_save_base = gm_base;
     g_save_io_error = false;
     gm80_diag_reset();
