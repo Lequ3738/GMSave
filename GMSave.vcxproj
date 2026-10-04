@@ -1,22 +1,34 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
-    <ProjectConfiguration Include="Debug|Win32"><Configuration>Debug</Configuration><Platform>Win32</Platform></ProjectConfiguration>
-    <ProjectConfiguration Include="Release|Win32"><Configuration>Release</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword>
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{B2C3D4E5-F6A7-8901-BCDE-F12345678901}</ProjectGuid>
-    <RootNamespace>GMSave</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <RootNamespace>GMSave</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset><WholeProgramOptimization>true</WholeProgramOptimization>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
@@ -24,7 +36,10 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
-  <PropertyGroup><IncludePath>.;Librarys;GMSave;$(IncludePath)</IncludePath><TargetName>GMSave</TargetName></PropertyGroup>
+  <PropertyGroup>
+    <IncludePath>.;Librarys;GMSave;$(IncludePath)</IncludePath>
+    <TargetName>GMSave</TargetName>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <OutDir>$(ProjectDir)Debug\</OutDir>
     <IntDir>$(ProjectDir)obj\Debug\</IntDir>
@@ -35,21 +50,29 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;GMSAVE_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/Zc:__cplusplus /utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <SubSystem>Windows</SubSystem><EnableUAC>false</EnableUAC>
+      <SubSystem>Windows</SubSystem>
+      <EnableUAC>false</EnableUAC>
       <AdditionalOptions>/SAFESEH:NO /MAP %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="framework.h" /><ClInclude Include="pch.h" />
-    <ClInclude Include="Librarys\delphi.h" /><ClInclude Include="Librarys\json.hpp" />
-    <ClInclude Include="GMSave\ide_hooks.h" /><ClInclude Include="GMSave\gm80_addresses.h" />
-    <ClInclude Include="GMSave\gm80_load.h" /><ClInclude Include="GMSave\gm80_save.h" />
+    <ClInclude Include="framework.h" />
+    <ClInclude Include="GMSave\i18n.h" />
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="Librarys\delphi.h" />
+    <ClInclude Include="Librarys\json.hpp" />
+    <ClInclude Include="GMSave\ide_hooks.h" />
+    <ClInclude Include="GMSave\gm80_addresses.h" />
+    <ClInclude Include="GMSave\gm80_load.h" />
+    <ClInclude Include="GMSave\gm80_save.h" />
     <ClInclude Include="GMSave\gm_log.h" />
     <ClInclude Include="GMSave\gm80_diag.h" />
     <ClInclude Include="GMSave\project_watcher.h" />
@@ -58,11 +81,13 @@
     <ClInclude Include="GMSave\dead_asset_check.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="dllmain.cpp" /><ClCompile Include="pch.cpp" />
+    <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="pch.cpp" />
     <ClCompile Include="GMSave\gm_log.cpp" />
     <ClCompile Include="GMSave\gm80_diag.cpp" />
     <ClCompile Include="GMSave\ide_hooks.cpp" />
-    <ClCompile Include="GMSave\gm80_load.cpp" /><ClCompile Include="GMSave\gm80_save.cpp" />
+    <ClCompile Include="GMSave\gm80_load.cpp" />
+    <ClCompile Include="GMSave\gm80_save.cpp" />
     <ClCompile Include="GMSave\project_watcher.cpp" />
     <ClCompile Include="GMSave\merge_flow.cpp" />
     <ClCompile Include="GMSave\diff3.cpp" />
