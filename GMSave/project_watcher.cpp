@@ -19,6 +19,7 @@
 #include "dead_asset_check.h"
 #include "gm_log.h"
 #include "i18n.h"
+#include "mm_audit.h"
 #include <windows.h>
 #include <string>
 
@@ -393,6 +394,22 @@ void project_watcher_tick()
         gm_log("Watcher: standalone code editor open — deferring");
         return;
     }
+    // A wedged Delphi MM pool lock (see mm_audit.h) makes the next MM op spin
+    // forever INSIDE GM's own CAS loop — the merge flow (staging save + reload)
+    // is by far the heaviest MM user, so starting it now is what turns a latent
+    // wedge into the permanent "加载游戏数据 未响应". Defer; the pending flag
+    // stays set and the flow resumes once the audit reads clean.
+    {
+        mm_audit::StuckPool sp = {};
+        bool wedged = mm_audit::any_stuck_sustained(&sp);
+        if (!wedged) wedged = mm_audit::last_nonzero(&sp); // tick 兜底（池信息同源）
+        if (wedged)
+        {
+            gm_log("Watcher: MM pool lock wedged (idx=%u size=%u value=0x%02X) — deferring merge flow",
+                sp.index, sp.block_size, sp.value);
+            return;
+        }
+    }
 
     // Claim the event and run the whole merge flow. Analysis, the editor gate
     // (which fires only once a reload is imminent), the merge tool and the
@@ -430,7 +447,10 @@ void project_watcher_tick()
 //   4 needs-manual   — refused WITHOUT running anything or popping any UI;
 //                      a human must handle the IDE. detail 2 = unsaved
 //                      in-IDE edits present (the editor-gate prompts would
-//                      fire). detail 1 is unused (modal editors defer as 3:4
+//                      fire). detail 3 = Delphi MM pool lock wedged (an
+//                      internal heap lock was never released; restart the
+//                      IDE — %TEMP%\GMSave_MMBroken.txt carries the record).
+//                      detail 1 is unused (modal editors defer as 3:4
 //                      instead — closing one may clear the block on its own).
 //   5 not-watching   — no .gm80 project watched, or it changed under us
 //   6 failed         — reserved (flow ran but did not reload)
@@ -494,6 +514,20 @@ static void project_watcher_force_sync(uint32_t reqId)
         force_sync_report(reqId, 3, 4);
         return;
     }
+    // Delphi MM pool lock already wedged (mm_audit.h): running the flow would
+    // spin forever inside GM's own CAS loop. Refuse without touching anything.
+    {
+        mm_audit::StuckPool sp = {};
+        bool wedged = mm_audit::any_stuck_sustained(&sp);
+        if (!wedged) wedged = mm_audit::last_nonzero(&sp);
+        if (wedged)
+        {
+            gm_log("ForceSync: req=%u refused — MM pool lock wedged (idx=%u size=%u value=0x%02X)",
+                reqId, sp.index, sp.block_size, sp.value);
+            force_sync_report(reqId, 4, 3);
+            return;
+        }
+    }
     if (merge_flow_global_dirty())
     {
         force_sync_report(reqId, 4, 2);
@@ -525,6 +559,9 @@ static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     }
     if (msg == WM_TIMER && wp == kTimerId)
     {
+        // Pool-lock health first: read-only, nanoseconds — catches a wedged
+        // Delphi MM lock while the IDE is still idle (see mm_audit.h).
+        mm_audit::tick(g_flow_active);
         project_watcher_tick();
         return 0;
     }

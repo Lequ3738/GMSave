@@ -79,6 +79,7 @@
     <ClInclude Include="GMSave\merge_flow.h" />
     <ClInclude Include="GMSave\diff3.h" />
     <ClInclude Include="GMSave\dead_asset_check.h" />
+    <ClInclude Include="GMSave\mm_audit.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
@@ -92,6 +93,7 @@
     <ClCompile Include="GMSave\merge_flow.cpp" />
     <ClCompile Include="GMSave\diff3.cpp" />
     <ClCompile Include="GMSave\dead_asset_check.cpp" />
+    <ClCompile Include="GMSave\mm_audit.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

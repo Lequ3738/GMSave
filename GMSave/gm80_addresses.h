@@ -285,6 +285,17 @@ struct GM80ResourceGlobals {
 #define ADDR_FORMSARR_ROOMS       0x1E9298
 #define ADDR_FORMSCNT_ROOMS       0x1E92A4
 
+// ==== Delphi MM small-block pool table (pool-lock audit, mm_audit.cpp) ====
+// 小块池表 = 静态数组，池记录 32 字节步长（索引步 4，地址 = base + TABLE + 8*idx）；
+// 锁字节在记录 +0（合法值只有 0/未持有、1/持有，临界区微秒级），块尺寸 +2。
+// 表范围由尺寸类映射 byte_5EB5C0 的最大索引 208（+4/+8 尝试链）界定到 idx 212。
+// 任何锁字节长期非 0 且无释放者 ⇒ 下一次该池 alloc/free 在 GM 自己的 CAS 自旋
+// （free 0x401CFE / alloc 0x4019B3）里永久死循环 = 重载"未响应"（已实验证明）。
+// 中/大块路径另有一把全局锁 byte_5EB718（合法持有可到毫秒级）。
+#define ADDR_MM_POOL_TABLE        0x1E304C   // pool[idx=0]；pool_ptr = base + 0x1E304C + 8*idx
+#define ADDR_MM_POOL_COUNT        216        // 表槽位数（索引单位）；池索引 0..212 步 4
+#define ADDR_MM_GLOBAL_LOCK       0x1EB718   // byte：中/大块路径全局锁
+
 // ==== Standalone code editor ("Execute Code" action editor) ====
 // Window class TCodeForm (class-name strings @ VA 0x54A715/0x54A756, form
 // name "Action_Code"; IDB comment saved 2026-09-15). It blocks the main

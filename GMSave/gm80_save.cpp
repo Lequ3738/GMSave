@@ -2620,8 +2620,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         // A file write failed — do NOT advance the baseline, so the next save is
         // a full save that retries the failed file(s) instead of silently
         // skipping them (which would lose the change).
-        gm_log(
-            "SmartSave: I/O error during save — baseline NOT updated (next save full)");
+        gm_log("SmartSave: I/O error during save — baseline NOT updated (next save full)");
         return true;
     }
 

@@ -94,6 +94,42 @@ static std::wstring utf8_to_wide(const std::string& s)
     return w;
 }
 
+// base/remote are raw disk bytes while local is the IDE-memory export; the
+// load path's CP_ACP leg best-fits characters GBK cannot hold (µ U+00B5
+// encodes to A6 CC — μ U+03BC's code), so identical content compares unequal
+// and a pure external change can surface as change-vs-delete. Classify on
+// base/remote pushed through the same lens; apply still writes what it
+// already holds (FS_REMOTE skips, FS_LOCAL copies staging, the session copy
+// carries these fields). Not-valid-UTF-8 input returns unchanged — the load
+// path keeps raw bytes for those files too.
+static std::string through_ide_lens(const std::string& s)
+{
+    if (s.empty()) return s;
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
+        (int)s.size(), nullptr, 0);
+    if (wlen <= 0) return s;
+    std::wstring w(wlen, 0);
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(),
+        &w[0], wlen);
+    int alen = WideCharToMultiByte(CP_ACP, 0, w.c_str(), wlen, nullptr, 0,
+        nullptr, nullptr);
+    if (alen <= 0) return s;
+    std::string a(alen, 0);
+    WideCharToMultiByte(CP_ACP, 0, w.c_str(), wlen, &a[0], alen, nullptr,
+        nullptr);
+    int w2len = MultiByteToWideChar(CP_ACP, 0, a.c_str(), alen, nullptr, 0);
+    if (w2len <= 0) return s;
+    std::wstring w2(w2len, 0);
+    MultiByteToWideChar(CP_ACP, 0, a.c_str(), alen, &w2[0], w2len);
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, w2.c_str(), w2len, nullptr, 0,
+        nullptr, nullptr);
+    if (ulen <= 0) return s;
+    std::string u(ulen, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w2.c_str(), w2len, &u[0], ulen, nullptr,
+        nullptr);
+    return u;
+}
+
 // ==== File-kind classification ====
 
 static bool is_binary_rel(const std::wstring& rel)
@@ -812,6 +848,18 @@ static bool load_text_or_hash(MergeFile& mf, const fs::path& base,
     // renders our GBK-on-disk text as mojibake (2026-09-15 gameinfo.txt).
     if (!mf.binary)
         mf.enc = detect_encoding(!mf.remoteB.empty() ? mf.remoteB : mf.localB);
+    if (!mf.binary)
+    {
+        std::string nb = through_ide_lens(mf.baseB);
+        std::string nr = through_ide_lens(mf.remoteB);
+        if (nb != mf.baseB || nr != mf.remoteB)
+        {
+            gm_log("MergeFlow: IDE-lens normalized '%s'",
+                wide_to_utf8(mf.rel).c_str());
+            mf.baseB = std::move(nb);
+            mf.remoteB = std::move(nr);
+        }
+    }
     return true;
 }
 
