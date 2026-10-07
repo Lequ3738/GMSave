@@ -61,6 +61,13 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path);
 // progress form before displaying it.
 const std::string& gm80_save_last_error();
 
+// Whether the last gm80_save_to_path hit a file-write error. It still returns
+// true in that case (the smart-save baseline is merely not advanced), so any
+// caller that treats the target tree as authoritative — the merge flow's
+// staging save above all — must check this and abort instead of classifying
+// the write gaps as resource deletions.
+bool gm80_save_had_io_error();
+
 // Capture the resource tree's expanded-folder state into
 // <projDir>\cache\tree_state.yyd. Called at the end of every save and just
 // before a watcher-triggered reload so the tree isn't collapsed after

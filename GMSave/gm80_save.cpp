@@ -36,6 +36,11 @@ const std::string& gm80_save_last_error()
     return g_save_error;
 }
 
+bool gm80_save_had_io_error()
+{
+    return g_save_io_error;
+}
+
 // ==== Smart save state ====
 // A resource is re-written on save only when its Delphi timestamp is newer than
 // the last save (LAST_SAVE). Type name/index structure changes (add/delete/

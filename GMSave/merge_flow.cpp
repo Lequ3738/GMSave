@@ -22,6 +22,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "../Librarys/json.hpp" // nlohmann::json — manifest + decisions protocol
 namespace fs = std::filesystem;
@@ -358,9 +359,12 @@ static bool file_meta(const fs::path& p, unsigned long long& size, long long& mt
 // wrote has its hash recorded at write time, so neither a read nor a stat
 // probe is needed; only its text base copy may still have to be refreshed
 // (from a read-back — the file is in the NTFS cache we just filled).
-// Consumers that must keep holding: load_text_or_hash reads root\<rel> for
-// EVERY non-binary manifest entry, so any reused entry's copy is verified to
-// still exist before reuse (missing → fall through to a fresh read+copy).
+// Consumers that must keep holding: the base copy under root\<rel> is the
+// content diff3 diffs against and the session copy shows as the base side,
+// so any reused entry's copy is verified to still exist before reuse
+// (missing → fall through to a fresh read+copy). Unchanged files never read
+// it — the manifest hash stands in — so a missing copy would only surface
+// once that file changes.
 void merge_flow_snapshot_refresh(const std::wstring& projDir,
     const std::vector<Gm80WrittenFile>* written)
 {
@@ -744,6 +748,15 @@ static bool stage_save(const std::wstring& stagingDir)
     bool ok = stage_save_seh(base, stagingDir);
     gm80_save_progress_uninstall();
     gm80_save_set_force_full(false);
+    // A write error leaves the staging tree with gaps that the analysis would
+    // read as IDE-side deletions (apply then removes the real disk files), and
+    // gm80_save_to_path still reports success for it.
+    if (ok && gm80_save_had_io_error())
+    {
+        gm_log("MergeFlow: staging save had I/O errors — aborting instead of "
+               "classifying write gaps as deletions");
+        ok = false;
+    }
     if (!ok) gm_log("MergeFlow: staging save FAILED (%s)", gm80_save_last_error().c_str());
     return ok;
 }
@@ -768,8 +781,11 @@ struct MergeFile
     std::wstring rel;
     bool binary = false;
     bool hasBase = false, hasLocal = false, hasRemote = false;
+    // Disk (size, mtime) matched the manifest entry, so the disk file still
+    // holds the base content — remoteB can alias baseB instead of re-reading.
+    bool remoteIsBase = false;
     uint64_t hashBase = 0, hashLocal = 0, hashRemote = 0;
-    std::string baseB, localB, remoteB; // text only
+    std::string baseB, localB, remoteB; // text only, loaded on demand
     std::string enc = "utf-8";
     FileStatus status = FS_UNCHANGED;
     diff3::Result dres; // text three-way details
@@ -784,86 +800,93 @@ struct MergeFile
     long long diskMtime = 0;
 };
 
-static bool load_text_or_hash(MergeFile& mf, const fs::path& base,
-    const fs::path& localRoot, const fs::path& remoteRoot,
+// The three sides plus the metadata lookups every per-file decision
+// consults: enumeration result maps (existence and (size, mtime) without a
+// per-file stat) and the staging save's write journal (content hash without
+// a per-file read).
+struct CompareCtx
+{
+    fs::path base, local, remote;
+    const std::unordered_map<std::wstring, const DiskEntry*>* localByRel = nullptr;
+    const std::unordered_map<std::wstring, const DiskEntry*>* remoteByRel = nullptr;
+    const std::unordered_map<std::wstring, Gm80WrittenFile>* stagedByRel = nullptr;
+};
+
+// Per-file hashes for the three sides. Text contents are deliberately NOT
+// read here: the identical-bytes shortcut in classify_and_merge settles the
+// unchanged majority of a file-count-heavy project with zero reads, and only
+// files that actually differ pay for content (ensure_text_contents).
+//   local  — existence from the staging enumeration; hash from the write
+//            journal when its size matches the enumerated size, else read.
+//   remote — existence from the project enumeration; a (size, mtime) match
+//            against the manifest entry proves the base content still sits
+//            on disk (skip the read), any mismatch falls back to a read.
+//   base   — hash from the manifest entry; content read on demand.
+static void load_hashes(MergeFile& mf, const CompareCtx& cx,
     const SnapEntry* snapE)
 {
-    // local (staging)
-    fs::path lp = localRoot / mf.rel;
-    std::error_code ec;
-    if (fs::is_regular_file(lp, ec))
+    auto lit = cx.localByRel->find(mf.rel);
+    if (lit != cx.localByRel->end())
     {
         mf.hasLocal = true;
-        std::string d = read_bytes(lp);
-        mf.hashLocal = fnv1a(d);
-        if (!mf.binary) mf.localB = std::move(d);
+        auto jit = cx.stagedByRel->find(mf.rel);
+        if (jit != cx.stagedByRel->end() &&
+            jit->second.size == lit->second->size)
+            mf.hashLocal = jit->second.hash;
+        else
+            mf.hashLocal = fnv1a(read_bytes(cx.local / mf.rel));
     }
-    fs::path rp = remoteRoot / mf.rel;
-    bool remoteSkipped = false;
-    if (fs::is_regular_file(rp, ec))
+    auto rit = cx.remoteByRel->find(mf.rel);
+    if (rit != cx.remoteByRel->end())
     {
         mf.hasRemote = true;
-        // P0-style stat shortcut (2026-09-20): the snapshot entry records the
-        // source file's size + mtime ticks at refresh time and the hash of
-        // exactly that content (the root copy holds the same bytes). If the
-        // disk file still matches both, it IS the base content — skip the
-        // read. Any stat mismatch or failure falls back to the full read, so
-        // the shortcut only ever skips provably-identical files.
-        bool remoteIsBase = false;
-        if (snapE)
-        {
-            unsigned long long sz2 = 0;
-            long long mt2 = 0;
-            remoteIsBase = file_meta(rp, sz2, mt2) &&
-                sz2 == snapE->size && mt2 == snapE->mtime;
-        }
-        if (remoteIsBase)
+        if (snapE && rit->second->size == snapE->size &&
+            rit->second->mtime == snapE->mtime)
         {
             mf.hashRemote = snapE->hash;
-            remoteSkipped = true;
+            mf.remoteIsBase = true;
         }
         else
-        {
-            std::string d = read_bytes(rp);
-            mf.hashRemote = fnv1a(d);
-            if (!mf.binary) mf.remoteB = std::move(d);
-        }
+            mf.hashRemote = fnv1a(read_bytes(cx.remote / mf.rel));
     }
     if (snapE)
     {
         mf.hasBase = true;
         mf.hashBase = snapE->hash;
-        if (!mf.binary)
-        {
-            mf.baseB = read_bytes(base / mf.rel);
-            // Content-equal by the stat match; downstream comparisons, diff3
-            // and the tool's session copy all read these fields, so keep
-            // remoteB populated without a second disk read.
-            if (remoteSkipped) mf.remoteB = mf.baseB;
-        }
     }
+}
+
+// Reads the content that classify, diff3 and the session copy still need
+// once the identical-bytes shortcut failed. Absent sides stay empty; a
+// stat-matched remote aliases the base copy — the same bytes by the match,
+// no second read. Sole point where the encoding verdict and the IDE-lens
+// normalization are computed, so unchanged files never pay for either.
+static void ensure_text_contents(MergeFile& mf, const CompareCtx& cx)
+{
+    if (mf.binary) return;
+    if (mf.hasBase) mf.baseB = read_bytes(cx.base / mf.rel);
+    if (mf.hasRemote)
+        mf.remoteB = mf.remoteIsBase ? mf.baseB
+                                     : read_bytes(cx.remote / mf.rel);
+    if (mf.hasLocal) mf.localB = read_bytes(cx.local / mf.rel);
+
     // One encoding verdict per file, used by the tool for every side it
     // shows. Must NOT live in the clean-merge branch only: early-returning
     // classifications otherwise keep the "utf-8" default and the tool then
-    // renders our GBK-on-disk text as mojibake (2026-09-15 gameinfo.txt).
-    if (!mf.binary)
-        mf.enc = detect_encoding(!mf.remoteB.empty() ? mf.remoteB : mf.localB);
-    if (!mf.binary)
+    // renders our GBK-on-disk text as mojibake.
+    mf.enc = detect_encoding(!mf.remoteB.empty() ? mf.remoteB : mf.localB);
+    std::string nb = through_ide_lens(mf.baseB);
+    std::string nr = through_ide_lens(mf.remoteB);
+    if (nb != mf.baseB || nr != mf.remoteB)
     {
-        std::string nb = through_ide_lens(mf.baseB);
-        std::string nr = through_ide_lens(mf.remoteB);
-        if (nb != mf.baseB || nr != mf.remoteB)
-        {
-            gm_log("MergeFlow: IDE-lens normalized '%s'",
-                wide_to_utf8(mf.rel).c_str());
-            mf.baseB = std::move(nb);
-            mf.remoteB = std::move(nr);
-        }
+        gm_log("MergeFlow: IDE-lens normalized '%s'",
+            wide_to_utf8(mf.rel).c_str());
+        mf.baseB = std::move(nb);
+        mf.remoteB = std::move(nr);
     }
-    return true;
 }
 
-static void classify_and_merge(MergeFile& mf)
+static void classify_and_merge(MergeFile& mf, const CompareCtx& cx)
 {
     if (mf.binary)
     {
@@ -897,6 +920,19 @@ static void classify_and_merge(MergeFile& mf)
     }
 
     // ---- text ----
+    // Identical bytes on all three sides settle UNCHANGED with no reads:
+    // equal bytes normalize equally, so the content comparisons below cannot
+    // find a difference either. Everything else pays for content — the
+    // string checks stay authoritative for it because normalization (and
+    // with it the µ/μ phantom-difference silencing) only applies to raw
+    // bytes that differ.
+    if (mf.hasLocal && mf.hasRemote && mf.hasBase &&
+        mf.hashLocal == mf.hashBase && mf.hashRemote == mf.hashBase)
+    {
+        mf.status = FS_UNCHANGED;
+        return;
+    }
+    ensure_text_contents(mf, cx);
     if (mf.hasLocal && mf.hasRemote && mf.hasBase &&
         mf.localB == mf.baseB && mf.remoteB == mf.baseB)
     {
@@ -1245,20 +1281,45 @@ struct FlowState
 enum class AnalyzeRc { OK, STAGE_FAIL, TREE_SMALL };
 
 static AnalyzeRc merge_analyze(const std::wstring& projDir,
-    const fs::path& staging, FlowState& fs)
+    const fs::path& staging, FlowState& fs,
+    const std::vector<SnapEntry>* baseManifest)
 {
     GmPerfSpan _pf("merge.analyze");
     if (!stage_save(staging.wstring()))
         return AnalyzeRc::STAGE_FAIL;
     native_progress_step(45); // staging save is the long pole — mark it done
 
-    read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json", fs.snap);
+    // The caller parsed the manifest once for its own existence guard; both
+    // analysis passes reuse it — nothing writes the manifest while the flow
+    // runs, the post-save refresh only runs after the reload.
+    if (baseManifest) fs.snap = *baseManifest;
+    else read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json", fs.snap);
     fs.snapBy.clear();
     for (auto& e : fs.snap) fs.snapBy[e.rel] = &e;
 
+    GmPerfSpan _pf_cmp("merge.compare");
     std::vector<DiskEntry> localTree, remoteTree;
     enumerate_tree_meta(staging.wstring(), L"cache", localTree);
     enumerate_tree_meta(projDir, L"cache", remoteTree);
+
+    // Lookup views over the enumerations and the staging save's write
+    // journal: existence and hashes for the unchanged majority without any
+    // per-file stat or read.
+    std::unordered_map<std::wstring, const DiskEntry*> localByRel, remoteByRel;
+    localByRel.reserve(localTree.size());
+    remoteByRel.reserve(remoteTree.size());
+    for (auto& d : localTree) localByRel[d.rel] = &d;
+    for (auto& d : remoteTree) remoteByRel[d.rel] = &d;
+    std::unordered_map<std::wstring, Gm80WrittenFile> stagedByRel;
+    for (auto& w : gm80_save_written_files()) stagedByRel[w.rel] = w;
+
+    CompareCtx cx;
+    cx.base = snapshot_dir_of(projDir) / L"root";
+    cx.local = staging;
+    cx.remote = projDir;
+    cx.localByRel = &localByRel;
+    cx.remoteByRel = &remoteByRel;
+    cx.stagedByRel = &stagedByRel;
 
     // Guard: a staging tree far smaller than the snapshot means the staging
     // save skipped types anyway (a future smart-skip regression) — applying
@@ -1286,9 +1347,8 @@ static AnalyzeRc merge_analyze(const std::wstring& projDir,
         MergeFile mf;
         mf.rel = rel;
         mf.binary = is_binary_rel(rel);
-        load_text_or_hash(mf, snapshot_dir_of(projDir) / L"root", staging,
-            fs::path(projDir), fs.snapBy.count(rel) ? fs.snapBy[rel] : nullptr);
-        classify_and_merge(mf);
+        load_hashes(mf, cx, fs.snapBy.count(rel) ? fs.snapBy[rel] : nullptr);
+        classify_and_merge(mf, cx);
         if (++cmpDone % 256 == 0)
             native_progress_step(45 + (int)((35 * cmpDone) / cmpTotal));
         if (mf.status == FS_UNCHANGED) continue;
@@ -1417,33 +1477,33 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
     //    meaningless (every file would look like an all-sides rewrite with an
     //    empty base). Missing snapshot = first run after an upgrade or a failed
     //    snapshot write: re-baseline from the current disk and skip this round;
-    //    the next external change merges correctly.
+    //    the next external change merges correctly. Parsed once here and handed
+    //    to both analysis passes (the manifest is our own cache; nothing
+    //    rewrites it while the flow runs).
+    std::vector<SnapEntry> baseManifest;
+    if (!read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json",
+            baseManifest))
     {
-        std::vector<SnapEntry> probe;
-        if (!read_snapshot_manifest(
-                snapshot_dir_of(projDir) / L"manifest.json", probe))
-        {
-            gm_log("MergeFlow: no base snapshot — re-baselining from disk, "
-                   "skipping this round");
-            merge_flow_snapshot_refresh(projDir);
-            closeProgress();
-            MessageBoxW(gm80_prompt_owner(),
-                tr(L"No merge baseline was found for this project (first run "
-                   L"after an upgrade), so this external change was not applied.\r\n"
-                   L"The baseline has been created — make the external change "
-                   L"again to merge it.",
-                   L"未找到本工程的合并基线（升级后首次运行），本次外部更改未应用。\r\n"
-                   L"基线已创建——请重新进行一次外部更改即可完成合并。"),
-                L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
-            return false;
-        }
+        gm_log("MergeFlow: no base snapshot — re-baselining from disk, "
+               "skipping this round");
+        merge_flow_snapshot_refresh(projDir);
+        closeProgress();
+        MessageBoxW(gm80_prompt_owner(),
+            tr(L"No merge baseline was found for this project (first run "
+               L"after an upgrade), so this external change was not applied.\r\n"
+               L"The baseline has been created — make the external change "
+               L"again to merge it.",
+               L"未找到本工程的合并基线（升级后首次运行），本次外部更改未应用。\r\n"
+               L"基线已创建——请重新进行一次外部更改即可完成合并。"),
+            L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return false;
     }
 
     // Runs an analysis pass; on failure closes the progress form, shows the
     // matching error and leaves the flow (caller returns false).
     auto analyzeOrFail = [&](FlowState& s) -> bool
     {
-        switch (merge_analyze(projDir, staging, s))
+        switch (merge_analyze(projDir, staging, s, &baseManifest))
         {
         case AnalyzeRc::STAGE_FAIL:
             closeProgress();
