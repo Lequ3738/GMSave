@@ -323,9 +323,9 @@ static void dead_asset_check_run()
     if (dead.empty())
     {
         MessageBoxW(gm80_prompt_owner(),
-            tr(L"No dead assets found — every file in the resource folders is "
+            tr(L"No dead assets found: every file in the resource folders is "
                L"registered in index.yyd.",
-               L"未发现死资源——资源文件夹中的所有文件都已在 index.yyd 中注册。"),
+               L"未发现死资源：资源文件夹中的所有文件都已在 index.yyd 中注册。"),
             L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
         return;
     }
@@ -333,10 +333,10 @@ static void dead_asset_check_run()
     const size_t kMaxShown = 15;
     std::wstring msg = tr(
         L"These files are registered in neither index.yyd nor tree.yyd, so "
-        L"they never load. The files themselves are still on disk — delete "
+        L"they never load. The files themselves are still on disk. Delete "
         L"them manually or restore their registry lines:\r\n",
         L"以下文件未在 index.yyd / tree.yyd 中注册，不会被载入。文件本身仍"
-        L"在磁盘上——可手工删除，或恢复其注册行：\r\n");
+        L"在磁盘上。可手工删除，或恢复其注册行：\r\n");
     for (size_t i = 0; i < dead.size() && i < kMaxShown; i++)
         msg += L"\r\n" + dead[i];
     if (dead.size() > kMaxShown)

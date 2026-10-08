@@ -1767,9 +1767,9 @@ static void load_extensions(const fs::path& root)
         L"无法找到以下扩展包：\n\n");
     for (const std::string& m : missing)
         msg += ansi_to_wide(m) + L"\n";
-    msg += tr(L"\nInstall them in the IDE, then reopen the project — until then, "
+    msg += tr(L"\nInstall them in the IDE, then reopen the project. Until then, "
               L"code calling their functions will not compile.",
-        L"\n请在 IDE 中安装这些扩展包后重新打开工程——在此之前，调用其函数的代码无法编译。");
+        L"\n请在 IDE 中安装这些扩展包后重新打开工程。在此之前，调用其函数的代码无法编译。");
     // GM's progress form is fsStayOnTop while the load runs: MB_TOPMOST keeps
     // the box above it.
     MessageBoxW(gm80_prompt_owner(), msg.c_str(), L"Game Maker 8.0",

@@ -1491,10 +1491,10 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         MessageBoxW(gm80_prompt_owner(),
             tr(L"No merge baseline was found for this project (first run "
                L"after an upgrade), so this external change was not applied.\r\n"
-               L"The baseline has been created — make the external change "
+               L"The baseline has been created. Make the external change "
                L"again to merge it.",
                L"未找到本工程的合并基线（升级后首次运行），本次外部更改未应用。\r\n"
-               L"基线已创建——请重新进行一次外部更改即可完成合并。"),
+               L"基线已创建，请重新进行一次外部更改即可完成合并。"),
             L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
         return false;
     }
@@ -1860,7 +1860,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
             tr(L"Editor content changed while the merge was running, so the "
                L"reload was cancelled. It will retry automatically in a "
                L"moment.",
-               L"合并期间编辑器内容发生了变化，本次重载已取消——稍后将自动重试。"),
+               L"合并期间编辑器内容发生了变化，本次重载已取消。稍后将自动重试。"),
             L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
         return false;
     }
