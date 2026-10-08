@@ -357,6 +357,14 @@ static bool font_family_installed(const char* ansiFamily)
     return found;
 }
 
+// Quiet mode for unattended reloads (watcher tick, merge apply, MCP
+// force-sync): while set, load problems (missing extension packages /
+// fonts) are logged but shown no message box — a modal box would stall the
+// silent flow. Manual opens report them. Set around GM80_LoadRecentProject
+// in project_watcher_reload_project; consumed by verify_fonts and
+// load_extensions below.
+static bool g_load_quiet = false;
+
 // Font object +4 = sys_name (family name). Warn once per load about missing ones.
 static void verify_fonts()
 {
@@ -367,7 +375,7 @@ static void verify_fonts()
     // Same 0xFFFFFFFF "uninitialized dynamic array" sentinel guard as
     // editor_form_open / cache_vmts — dereferencing the sentinel is an AV.
     if (!arr || (uintptr_t)arr == 0xFFFFFFFF || cnt == 0 || cnt > 10000) return;
-    std::string missing;
+    std::vector<std::string> missing;
     for (uint32_t i = 0; i < cnt; i++)
     {
         uint32_t f = arr[i];
@@ -377,17 +385,22 @@ static void verify_fonts()
         uint32_t len = *(uint32_t*)(name - 4);
         if (len == 0 || len > 200) continue;
         std::string fam(name, len);
-        if (!font_family_installed(fam.c_str())) missing += "\n" + fam;
+        if (!font_family_installed(fam.c_str())) missing.push_back(fam);
     }
-    if (!missing.empty())
-    {
-        std::string msg = "Warning: this game uses the following fonts, which are "
-            "not installed:" +
-            missing;
-        gm_log("Font check: missing fonts%s", missing.c_str());
-        MessageBoxA(
-            gm80_prompt_owner(), msg.c_str(), "Game Maker 8.0", MB_OK | MB_ICONWARNING);
-    }
+    if (missing.empty()) return;
+    std::string listed;
+    for (size_t i = 0; i < missing.size(); i++)
+        listed += "\n" + missing[i];
+    gm_log("Font check: missing fonts%s", listed.c_str());
+    // Unattended reloads (watcher tick / merge apply / force-sync) log only —
+    // a modal box would stall the silent flow (same gate as load_extensions).
+    if (g_load_quiet) return;
+    std::wstring msg = tr(L"Warning: this game uses the following fonts, which "
+                          L"are not installed:",
+        L"警告：此游戏使用了以下未安装的字体：");
+    for (const std::string& f : missing) msg += L"\n" + ansi_to_wide(f);
+    MessageBoxW(gm80_prompt_owner(), msg.c_str(), L"Game Maker 8.0",
+        MB_OK | MB_ICONWARNING);
 }
 
 // Naked wrapper to call Delphi constructors with proper register convention.
@@ -1674,25 +1687,44 @@ static void load_included_files(const fs::path& root)
 }
 
 // ==== Load extensions (settings/extensions.txt → loaded flags) ====
-// GM 8.0 (verified sub_5A80A8 name lookup + sub_5A7FF0 loaded check +
-// sub_5A7910 init: SetLength(&0x6000BC, n) → dword_6000BC is a Delphi
-// dynamic array VARIABLE holding the element pointer):
+// GM 8.0 (verified GM80_LoadExtensions 0x5A7C34 + sub_5A80A8 name lookup +
+// sub_5A7FF0 loaded check + sub_5A7910 init: SetLength(&0x6000BC, n) →
+// dword_6000BC is a Delphi dynamic array VARIABLE holding the element pointer):
 //   0x1E9460 = extension object array (dynamic array), 0x1E9464 = count,
 //   0x2000BC = loaded flags (dynamic array of bytes)
-// Extension object: +4 = name (AnsiString). Same semantics as gm82save
-// load_extensions: match name → set loaded → GM shows it in the tree.
+// Extension object: +4 = name (AnsiString). Same semantics as gm82save.
+// Native order (GM80_LoadExtensions): clear EVERY loaded flag first, then set
+// the ones the project lists. The flags drive the extension tree, code
+// completion and the compiler's extension-function lookup (GM80_ExtFunc_*), so
+// a flag stale from the previously loaded project must not survive. A listed
+// name with no matching package loads nothing — native reports it there
+// ("无法找到扩展包" + name); load_extensions does the same, aggregated into one
+// box (g_load_quiet suppresses it on unattended reloads).
+void gm80_load_set_quiet(bool quiet)
+{
+    g_load_quiet = quiet;
+}
+
 static void load_extensions(const fs::path& root)
 {
-    std::string txt = read_file(root / "settings" / "extensions.txt");
-    if (txt.empty()) return;
     uint8_t* b = (uint8_t*)g_load_base;
     uint32_t cnt = *(uint32_t*)(b + 0x1E9464);
+    if (cnt > 1000) return; // corrupt/foreign state — don't guess
     uint32_t* arr = *(uint32_t**)(b + 0x1E9460);
     uint8_t* flags = *(uint8_t**)(b + 0x2000BC); // deref the dynamic array var!
-    // Sentinel guard: 0xFFFFFFFF = uninitialized Delphi dynamic array.
-    if (!arr || !flags || (uintptr_t)arr == 0xFFFFFFFF ||
-        (uintptr_t)flags == 0xFFFFFFFF || cnt == 0 || cnt > 1000)
-        return;
+    // Sentinel guard: 0xFFFFFFFF (and nil at count 0) = uninitialized Delphi
+    // dynamic array → never dereference. The table is then treated as empty,
+    // which also matches native behaviour: its lookup simply fails per name and
+    // every listed name is reported missing.
+    bool haveTable = cnt > 0 && arr && flags &&
+        (uintptr_t)arr != 0xFFFFFFFF && (uintptr_t)flags != 0xFFFFFFFF;
+    if (haveTable)
+        for (uint32_t i = 0; i < cnt; i++)
+            flags[i] = 0;
+
+    std::string txt = read_file(root / "settings" / "extensions.txt");
+    if (txt.empty()) return; // no extensions.txt yet → no extension loaded
+    std::vector<std::string> missing;
     std::istringstream ss(txt);
     std::string line;
     while (std::getline(ss, line))
@@ -1700,21 +1732,44 @@ static void load_extensions(const fs::path& root)
         if (line.empty()) continue;
         if (line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-        for (uint32_t i = 0; i < cnt; i++)
+        bool found = false;
+        if (haveTable)
         {
-            uint32_t obj = arr[i];
-            if (!obj) continue;
-            char* namePtr = *(char**)((uint8_t*)(uintptr_t)obj + 4);
-            if (!namePtr) continue;
-            uint32_t len = *(uint32_t*)(namePtr - 4);
-            if (len > 500) continue;
-            if (std::string(namePtr, len) == line)
+            for (uint32_t i = 0; i < cnt; i++)
             {
-                flags[i] = 1; // loaded flag
-                break;
+                uint32_t obj = arr[i];
+                if (!obj) continue;
+                char* namePtr = *(char**)((uint8_t*)(uintptr_t)obj + 4);
+                if (!namePtr) continue;
+                uint32_t len = *(uint32_t*)(namePtr - 4);
+                if (len > 500) continue;
+                if (std::string(namePtr, len) == line)
+                {
+                    flags[i] = 1; // loaded flag
+                    found = true;
+                    break;
+                }
             }
         }
+        if (!found && std::find(missing.begin(), missing.end(), line) == missing.end())
+            missing.push_back(line);
     }
+    if (missing.empty()) return;
+    std::string listed;
+    for (size_t i = 0; i < missing.size(); i++)
+        listed += (i ? ", " : "") + missing[i];
+    gm_log("Extensions: %u package(s) not installed: %s", (unsigned)missing.size(),
+        listed.c_str());
+    if (g_load_quiet) return;
+    std::wstring msg = tr(L"Cannot find the following extension packages:\n\n",
+        L"无法找到以下扩展包：\n\n");
+    for (const std::string& m : missing)
+        msg += ansi_to_wide(m) + L"\n";
+    msg += tr(L"\nInstall them in the IDE, then reopen the project — until then, "
+              L"code calling their functions will not compile.",
+        L"\n请在 IDE 中安装这些扩展包后重新打开工程——在此之前，调用其函数的代码无法编译。");
+    MessageBoxW(gm80_prompt_owner(), msg.c_str(), L"Game Maker 8.0",
+        MB_OK | MB_ICONWARNING);
 }
 
 // ==== Load trigger ====

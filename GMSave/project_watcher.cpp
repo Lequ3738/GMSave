@@ -14,6 +14,7 @@
 #include "pch.h"
 #include "project_watcher.h"
 #include "gm80_addresses.h"
+#include "gm80_load.h"
 #include "gm80_save.h"
 #include "merge_flow.h"
 #include "dead_asset_check.h"
@@ -281,6 +282,10 @@ void project_watcher_reload_project()
     if (!g_watch_path.empty())
         gm80_capture_tree_state(b, g_watch_path);
     gm_log("Watcher: reloading project '%s'", path);
+    // Unattended reload: keep load warnings (missing extension packages) in the
+    // log — a modal box here would stall the silent flow. A manual open reports
+    // them.
+    gm80_load_set_quiet(true);
     __asm {
         mov eax, pathVal
         xor ebx, ebx
@@ -289,6 +294,7 @@ void project_watcher_reload_project()
         mov ecx, fn
         call ecx
     }
+    gm80_load_set_quiet(false);
     gm_log("Watcher: reload returned");
 }
 

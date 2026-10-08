@@ -2231,10 +2231,16 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
         //   0x1E9460 = extension object array (dynamic array), 0x1E9464 = count,
         //   0x2000BC = loaded flags (dynamic array of bytes — deref the var!);
         //   extension object +4 = name
+        // Written on every save (empty file when nothing is loaded): the file IS
+        // the project's extension list, so unloading the last extension must
+        // clear it — a stale list would re-load the old packages on the next
+        // open. Native parity: the written list is exactly the current loaded
+        // set, so a package that was missing at load time drops out here too.
         uint32_t extCnt = *(uint32_t*)((uint8_t*)g_save_base + 0x1E9464);
         uint32_t* extArr = *(uint32_t**)((uint8_t*)g_save_base + 0x1E9460);
         uint8_t* extLoaded = *(uint8_t**)((uint8_t*)g_save_base + 0x2000BC);
-        if (extArr && extLoaded && extCnt > 0 && extCnt < 1000)
+        if (extArr && extLoaded && (uintptr_t)extArr != 0xFFFFFFFF &&
+            (uintptr_t)extLoaded != 0xFFFFFFFF && extCnt < 1000)
         {
             std::string exts;
             for (uint32_t i = 0; i < extCnt; i++)
@@ -2249,7 +2255,7 @@ bool gm80_save_to_path(void* gm_base, const std::wstring& path)
                     }
                 }
             }
-            if (!exts.empty()) wf(sub(L"settings\\extensions.txt"), exts);
+            wf(sub(L"settings\\extensions.txt"), exts);
         }
     }
 

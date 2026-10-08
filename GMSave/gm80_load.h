@@ -9,6 +9,12 @@ namespace fs = std::filesystem;
 // gm_base: GetModuleHandle(NULL) of GameMaker.exe
 bool gm80_load_project(void* gm_base, const std::wstring& path);
 
+// Background reloads (watcher tick, merge apply, force-sync) run unattended:
+// while quiet, load problems are logged but shown no message box — a modal
+// box would stall the silent flow. Manual opens report them. Set around
+// GM80_LoadRecentProject in project_watcher_reload_project.
+void gm80_load_set_quiet(bool quiet);
+
 // ==== Instance code-hash map (gm82save model) ====
 // instances.txt's 4th column is a stable 8-hex "hash" that names the instance's
 // creation-code file. The instance ID itself is GM's counter-based value and is
