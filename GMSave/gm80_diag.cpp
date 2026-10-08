@@ -50,6 +50,8 @@ void gm80_diag_show()
         more[63] = 0;
         msg += more;
     }
+    // GM's progress form is fsStayOnTop while a load runs (this box also shows
+    // on that path): MB_TOPMOST keeps it above the form.
     MessageBoxW(gm80_prompt_owner(), msg.c_str(), L"Game Maker 8.0",
-        MB_OK | MB_ICONWARNING);
+        MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }

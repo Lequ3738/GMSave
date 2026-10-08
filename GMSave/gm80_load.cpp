@@ -399,8 +399,10 @@ static void verify_fonts()
                           L"are not installed:",
         L"警告：此游戏使用了以下未安装的字体：");
     for (const std::string& f : missing) msg += L"\n" + ansi_to_wide(f);
+    // GM's progress form is fsStayOnTop while the load runs: MB_TOPMOST keeps
+    // the box above it.
     MessageBoxW(gm80_prompt_owner(), msg.c_str(), L"Game Maker 8.0",
-        MB_OK | MB_ICONWARNING);
+        MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
 
 // Naked wrapper to call Delphi constructors with proper register convention.
@@ -1768,8 +1770,10 @@ static void load_extensions(const fs::path& root)
     msg += tr(L"\nInstall them in the IDE, then reopen the project — until then, "
               L"code calling their functions will not compile.",
         L"\n请在 IDE 中安装这些扩展包后重新打开工程——在此之前，调用其函数的代码无法编译。");
+    // GM's progress form is fsStayOnTop while the load runs: MB_TOPMOST keeps
+    // the box above it.
     MessageBoxW(gm80_prompt_owner(), msg.c_str(), L"Game Maker 8.0",
-        MB_OK | MB_ICONWARNING);
+        MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
 
 // ==== Load trigger ====
@@ -3620,10 +3624,12 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     if (!metaRead && !metaFile.empty())
     {
         gm_log("Load: ABORT — metadata file exists but is unreadable");
+        // GM's progress form is fsStayOnTop while the load runs: MB_TOPMOST
+        // keeps this box above it.
         MessageBoxA(gm80_prompt_owner(),
             "The project's .gm80 metadata file exists but could not be read.\r\n"
             "The project was NOT loaded.",
-            "Game Maker 8.0", MB_OK | MB_ICONERROR);
+            "Game Maker 8.0", MB_OK | MB_ICONERROR | MB_TOPMOST);
         return false;
     }
     // Refuse files from a NEWER GMSave — the format may have changed and we'd
@@ -3636,7 +3642,8 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
             "(file version %u, this build supports %u).\r\n"
             "Please update GMSave to open it.",
             fileVersion, (uint32_t)GM80_VERSION);
-        MessageBoxA(gm80_prompt_owner(), buf, "Game Maker 8.0", MB_OK | MB_ICONERROR);
+        MessageBoxA(gm80_prompt_owner(), buf, "Game Maker 8.0",
+            MB_OK | MB_ICONERROR | MB_TOPMOST);
         return false;
     }
     }
