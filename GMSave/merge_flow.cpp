@@ -1714,7 +1714,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         // manifest.json for the tool
         {
             nlohmann::json j = nlohmann::json::object();
-            j["version"] = 1;
+            j["version"] = 2;
             j["files"] = nlohmann::json::array();
             for (auto& mf : s1.files)
             {
@@ -1731,15 +1731,39 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
                 e["encoding"] = mf.enc;
                 if (!mf.binary && !mf.dres.conflicts.empty())
                 {
+                    // Premerged document: the auto-merged text with every
+                    // conflict region holding its LOCAL block. The tool
+                    // splices the remote block over a region's m-span for
+                    // "use remote" choices, so clean hunks from BOTH sides
+                    // reach the final content — only true overlaps wait for
+                    // a decision. m coords count the premerged doc; each is
+                    // emitStart minus everything the earlier regions shrank.
+                    std::vector<std::string> l = diff3::split_lines(mf.localB);
+                    std::vector<std::string> pre;
+                    pre.reserve(mf.dres.lines.size());
                     nlohmann::json cs = nlohmann::json::array();
+                    size_t pos = 0, shrink = 0;
                     for (auto& c : mf.dres.conflicts)
                     {
+                        for (size_t k = pos; k < c.emitStart; k++)
+                            pre.push_back(mf.dres.lines[k]);
+                        pos = c.emitStart + c.emitLen;
+                        for (size_t k = 0; k < c.localLen; k++)
+                            pre.push_back(l[c.localStart + k]);
                         nlohmann::json cc = nlohmann::json::object();
                         cc["b"] = nlohmann::json::array({c.baseStart, c.baseLen});
                         cc["l"] = nlohmann::json::array({c.localStart, c.localLen});
                         cc["r"] = nlohmann::json::array({c.remoteStart, c.remoteLen});
+                        cc["m"] = nlohmann::json::array(
+                            {c.emitStart - shrink, c.localLen});
+                        shrink += c.emitLen - c.localLen;
                         cs.push_back(std::move(cc));
                     }
+                    for (size_t k = pos; k < mf.dres.lines.size(); k++)
+                        pre.push_back(mf.dres.lines[k]);
+                    nlohmann::json arr = nlohmann::json::array();
+                    for (auto& s : pre) arr.push_back(s);
+                    e["auto"] = std::move(arr);
                     e["conflicts"] = std::move(cs);
                 }
                 j["files"].push_back(std::move(e));

@@ -276,8 +276,16 @@ Result merge_lines(const std::vector<std::string>& base,
             auto flushSub = [&](size_t pEnd, size_t qEnd)
             {
                 if (pEnd == p && qEnd == q) return;
-                res.conflicts.push_back(
-                    {g0, g1 - g0, l0 + p, pEnd - p, r0 + q, qEnd - q});
+                Conflict c;
+                c.baseStart = g0;
+                c.baseLen = g1 - g0;
+                c.localStart = l0 + p;
+                c.localLen = pEnd - p;
+                c.remoteStart = r0 + q;
+                c.remoteLen = qEnd - q;
+                c.emitStart = res.lines.size();
+                c.emitLen = (pEnd - p) + (qEnd - q) + 3; // markers included
+                res.conflicts.push_back(c);
                 res.lines.push_back("<<<<<<< local");
                 for (size_t k = p; k < pEnd; k++) res.lines.push_back(oursP[k]);
                 res.lines.push_back("=======");
@@ -378,8 +386,16 @@ Result merge_keyed(const std::vector<std::string>& base,
                 for (auto& s : lL) res.lines.push_back(s);
             else
             {
-                res.conflicts.push_back({0, 0, firstOr0(lIdx), lL.size(),
-                    firstOr0(rIdx), rL.size()});
+                Conflict c;
+                c.baseStart = 0;
+                c.baseLen = 0;
+                c.localStart = firstOr0(lIdx);
+                c.localLen = lL.size();
+                c.remoteStart = firstOr0(rIdx);
+                c.remoteLen = rL.size();
+                c.emitStart = res.lines.size();
+                c.emitLen = lL.size() + rL.size(); // no markers in keyed output
+                res.conflicts.push_back(c);
                 for (auto& s : lL) res.lines.push_back(s);
                 for (auto& s : rL) res.lines.push_back(s); // both appended; tool decides
             }
@@ -390,9 +406,17 @@ Result merge_keyed(const std::vector<std::string>& base,
         if (rDel && !lChanged) return; // deleted remotely, untouched locally
         if (lDel && rChanged || rDel && lChanged)
         {
-            res.conflicts.push_back({firstOr0(bIdx), bL.size(), firstOr0(lIdx),
-                lL.size(), firstOr0(rIdx), rL.size()});
+            Conflict c;
+            c.baseStart = firstOr0(bIdx);
+            c.baseLen = bL.size();
+            c.localStart = firstOr0(lIdx);
+            c.localLen = lL.size();
+            c.remoteStart = firstOr0(rIdx);
+            c.remoteLen = rL.size();
+            c.emitStart = res.lines.size();
             // delete-vs-change: emit the surviving changed side for preview
+            c.emitLen = (lDel ? rL : lL).size();
+            res.conflicts.push_back(c);
             for (auto& s : (lDel ? rL : lL)) res.lines.push_back(s);
             return;
         }
@@ -406,8 +430,16 @@ Result merge_keyed(const std::vector<std::string>& base,
             for (auto& s : lL) res.lines.push_back(s);
         else
         {
-            res.conflicts.push_back({firstOr0(bIdx), bL.size(), firstOr0(lIdx),
-                lL.size(), firstOr0(rIdx), rL.size()});
+            Conflict c;
+            c.baseStart = firstOr0(bIdx);
+            c.baseLen = bL.size();
+            c.localStart = firstOr0(lIdx);
+            c.localLen = lL.size();
+            c.remoteStart = firstOr0(rIdx);
+            c.remoteLen = rL.size();
+            c.emitStart = res.lines.size();
+            c.emitLen = lL.size() + rL.size(); // no markers in keyed output
+            res.conflicts.push_back(c);
             for (auto& s : lL) res.lines.push_back(s);
             for (auto& s : rL) res.lines.push_back(s);
         }

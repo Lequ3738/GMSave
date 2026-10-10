@@ -2419,15 +2419,17 @@ static void parse_actions_into_event(void* ev, const std::string& body,
             pos, (end == std::string::npos) ? std::string::npos : end - pos);
         pos = (end == std::string::npos) ? b.size() : end + 3;
         std::string codeAfter;
-        if (end != std::string::npos)
+        if (end != std::string::npos && end + 3 <= b.size())
         {
-            size_t nl = b.find_first_not_of("\r\n", end + 3);
-            if (nl != std::string::npos)
-            {
-                size_t nextTok = b.find(ACTION_TOKEN, nl);
-                codeAfter = b.substr(nl,
-                    (nextTok == std::string::npos) ? std::string::npos : nextTok - nl);
-            }
+            // Code text runs verbatim to the next action token — leading blank
+            // lines are part of it. Trimming them here makes the IDE roundtrip
+            // drop them (staging save writes what memory holds), so a disk
+            // file with blank lines after an action block phantom-diffs as an
+            // IDE-side edit in the merge flow.
+            size_t nextTok = b.find(ACTION_TOKEN, end + 3);
+            codeAfter = b.substr(end + 3,
+                (nextTok == std::string::npos) ? std::string::npos
+                                               : nextTok - (end + 3));
         }
         void* act = event_add_action(ev);
         if (!act) continue;

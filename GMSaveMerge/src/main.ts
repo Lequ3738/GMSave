@@ -16,6 +16,9 @@ interface ConflictRange {
     b: [number, number];
     l: [number, number];
     r: [number, number];
+    // Region span in the premerged document (file.auto) — present from
+    // manifest version 2 on.
+    m?: [number, number];
 }
 interface ManifestFile {
     path: string;
@@ -23,6 +26,9 @@ interface ManifestFile {
     status: 'conflict' | 'auto' | 'local' | 'remote';
     encoding: string;
     conflicts?: ConflictRange[];
+    // Premerged document: auto-applied hunks from BOTH sides, every conflict
+    // region holding its local block. Version-2 manifests only.
+    auto?: string[];
 }
 interface Manifest {
     version: number;
@@ -40,6 +46,7 @@ interface FileState {
     localLines: string[];
     remoteLines: string[];
     baseLines: string[];
+    autoLines: string[];
 }
 
 let manifest: Manifest | null = null;
@@ -65,21 +72,26 @@ function splitLines(text: string): string[] {
     return lines;
 }
 
-// Compute the final content of a conflicted text file: start from the local
-// version; for every conflict resolved as "remote", splice the remote block
-// over the local block. Conflicts are applied in descending local-start order
-// so earlier splices never shift later ranges (all ranges index the ORIGINAL
-// local/remote line arrays).
+// Compute the final content of a conflicted text file: start from the
+// premerged document (file.auto — clean hunks from both sides already
+// applied, every conflict region holding its local block) and splice the
+// remote block over each region resolved as "remote". Regions are applied
+// in descending m-start order so earlier splices never shift later ranges.
+// Without a premerged document (manifest from an older DLL) the local
+// version is the base and ranges fall back to the local coordinates —
+// remote hunks outside conflict regions cannot be represented there.
 function computeResult(st: FileState): string {
     if (st.manual !== null) return st.manual;
-    const out = [...st.localLines];
+    const premerged = st.mf.auto !== undefined; // an EMPTY doc is legitimate
+    const out = [...(premerged ? st.autoLines : st.localLines)];
     const cs = st.mf.conflicts ?? [];
-    const order = cs.map((c, i) => ({ c, i })).sort((a, b) => b.c.l[0] - a.c.l[0]);
+    const start = (c: ConflictRange) => (premerged ? c.m ?? c.l : c.l)[0];
+    const order = cs.map((c, i) => ({ c, i })).sort((a, b) => start(b.c) - start(a.c));
     for (const { c, i } of order) {
         if (st.choices[i] !== 'remote') continue;
-        const [l0, lLen] = c.l;
+        const [m0, mLen] = premerged ? c.m ?? c.l : c.l;
         const [r0, rLen] = c.r;
-        out.splice(l0, lLen, ...st.remoteLines.slice(r0, r0 + rLen));
+        out.splice(m0, mLen, ...st.remoteLines.slice(r0, r0 + rLen));
     }
     return out.join('\r\n') + (out.length ? '\r\n' : '');
 }
@@ -447,6 +459,7 @@ document.getElementById('btn-cancel')!.addEventListener('click', () => finish(fa
             localLines: [],
             remoteLines: [],
             baseLines: [],
+            autoLines: mf.auto ?? [],
         });
     }
     const firstConflict = manifest.files.find((f) => f.status === 'conflict');

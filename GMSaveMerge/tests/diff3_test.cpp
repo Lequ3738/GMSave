@@ -254,6 +254,153 @@ static void test_xmerge_both_same_change()
     CHECK(res.lines == l, "changed line once");
 }
 
+// ==== Emission coordinates + premerged document (manifest v2 protocol) ====
+
+// Rebuild the premerged document the way merge_flow.cpp's session build does:
+// walk conflicts in emission order, replace [emitStart, emitStart+emitLen) in
+// Result.lines with the conflict's local block taken from `local`. Returns m
+// spans (region position/length in the premerged doc) per conflict.
+static std::vector<std::string> build_premerged(const Result& res,
+    const std::vector<std::string>& local,
+    std::vector<std::pair<size_t, size_t>>& mSpans)
+{
+    std::vector<std::string> out;
+    size_t pos = 0, shrink = 0;
+    for (auto& c : res.conflicts)
+    {
+        for (size_t k = pos; k < c.emitStart; k++) out.push_back(res.lines[k]);
+        pos = c.emitStart + c.emitLen;
+        for (size_t k = 0; k < c.localLen; k++)
+            out.push_back(local[c.localStart + k]);
+        mSpans.push_back({c.emitStart - shrink, c.localLen});
+        shrink += c.emitLen - c.localLen;
+    }
+    for (size_t k = pos; k < res.lines.size(); k++) out.push_back(res.lines[k]);
+    return out;
+}
+
+// The tool's computeResult: splice remote blocks over the conflicts whose
+// entry in chooseRemote is true, descending m-start order.
+static std::vector<std::string> tool_splice(const std::vector<std::string>& pre,
+    const std::vector<std::pair<size_t, size_t>>& mSpans, const Result& res,
+    const std::vector<std::string>& remote,
+    const std::vector<bool>& chooseRemote)
+{
+    std::vector<std::string> out = pre;
+    for (size_t i = mSpans.size(); i-- > 0;)
+    {
+        if (!chooseRemote[i]) continue;
+        auto& c = res.conflicts[i];
+        size_t m0 = mSpans[i].first, mLen = mSpans[i].second;
+        out.erase(out.begin() + m0, out.begin() + m0 + mLen);
+        for (size_t k = 0; k < c.remoteLen; k++)
+            out.insert(out.begin() + m0 + k, remote[c.remoteStart + k]);
+    }
+    return out;
+}
+
+static void test_emit_coords_line_merge()
+{
+    // local changes line 2 (clean local hunk) + line 6; remote changes line 4
+    // (clean remote hunk) + line 6 → one conflict, two clean hunks.
+    auto b = V({"h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8"});
+    auto l = V({"h1", "L2", "h3", "h4", "h5", "X6", "h7", "h8"});
+    auto r = V({"h1", "h2", "h3", "R4", "h5", "Y6", "h7", "h8"});
+    auto res = merge_lines(b, l, r);
+    CHECK(!res.clean(), "one conflict");
+    CHECK(res.conflicts.size() == 1, "single conflict group");
+    auto& c = res.conflicts[0];
+    CHECK(c.emitStart == 5, "emission starts after clean rows");
+    CHECK(c.emitLen == 5, "marker block = local+remote+3 markers");
+    CHECK(res.lines[c.emitStart] == "<<<<<<< local", "span opens at marker");
+
+    std::vector<std::pair<size_t, size_t>> m;
+    auto pre = build_premerged(res, l, m);
+    CHECK(pre == V({"h1", "L2", "h3", "R4", "h5", "X6", "h7", "h8"}),
+        "premerged takes both clean hunks + local at conflict");
+    CHECK(m.size() == 1 && m[0].first == 5 && m[0].second == 1, "m span");
+
+    auto allLocal = tool_splice(pre, m, res, r, {false});
+    CHECK(allLocal == pre, "all-local keeps premerged doc");
+    auto allRemote = tool_splice(pre, m, res, r, {true});
+    CHECK(allRemote == V({"h1", "L2", "h3", "R4", "h5", "Y6", "h7", "h8"}),
+        "all-remote = both clean hunks + remote at conflict");
+}
+
+static void test_emit_coords_refine_subblocks()
+{
+    // Shared row BEFORE the block (git case G shape): the lifted row sits
+    // outside the sub-block span.
+    {
+        auto b = V({"x"});
+        auto l = V({"x", "same", "ours"});
+        auto r = V({"x", "same", "theirs"});
+        auto res = merge_lines(b, l, r);
+        CHECK(res.conflicts.size() == 1, "one refined block");
+        auto& c = res.conflicts[0];
+        CHECK(c.emitStart == 2 && c.emitLen == 5, "span covers marker block");
+        CHECK(res.lines[2] == "<<<<<<< local", "span opens at marker");
+        std::vector<std::pair<size_t, size_t>> m;
+        auto pre = build_premerged(res, l, m);
+        CHECK(pre == l, "premerged equals local");
+        auto allRemote = tool_splice(pre, m, res, r, {true});
+        CHECK(allRemote == r, "all-remote equals remote");
+    }
+    // Shared row BETWEEN two blocks.
+    {
+        auto b = V({"x"});
+        auto l = V({"x", "ours1", "mid", "ours2"});
+        auto r = V({"x", "theirs1", "mid", "theirs2"});
+        auto res = merge_lines(b, l, r);
+        CHECK(res.conflicts.size() == 2, "mid row splits two blocks");
+        CHECK(res.conflicts[0].emitStart == 1 && res.conflicts[0].emitLen == 5,
+            "first block span (after stable row x)");
+        CHECK(res.conflicts[1].emitStart == 7 && res.conflicts[1].emitLen == 5,
+            "second block after shared row");
+        std::vector<std::pair<size_t, size_t>> m;
+        auto pre = build_premerged(res, l, m);
+        CHECK(pre == l, "premerged equals local");
+        auto allRemote = tool_splice(pre, m, res, r, {true, true});
+        CHECK(allRemote == r, "all-remote equals remote");
+    }
+}
+
+static void test_emit_coords_keyed()
+{
+    // remote edits k1 (clean) and k2 (conflicts with local's k2 edit).
+    auto b = V({"objA,0,0,k1,0", "objB,0,0,k2,0"});
+    auto l = V({"objA,0,0,k1,0", "objB,7,7,k2,0"});
+    auto r = V({"objA,5,5,k1,0", "objB,9,9,k2,0"});
+    auto res = merge_keyed(b, l, r, key_instances_csv4);
+    CHECK(!res.clean(), "k2 both-changed conflicts");
+    CHECK(res.conflicts.size() == 1, "one keyed conflict");
+    auto& c = res.conflicts[0];
+    CHECK(c.emitStart == 1 && c.emitLen == 2, "local+remote block appended");
+    std::vector<std::pair<size_t, size_t>> m;
+    auto pre = build_premerged(res, l, m);
+    CHECK(pre == V({"objA,5,5,k1,0", "objB,7,7,k2,0"}),
+        "premerged takes remote k1 + local k2");
+    auto allRemote = tool_splice(pre, m, res, r, {true});
+    CHECK(allRemote == r, "all-remote equals remote");
+}
+
+static void test_emit_coords_keyed_delete_vs_change()
+{
+    auto b = V({"a,0,0,k1,0"});
+    auto l = V({});             // local deleted
+    auto r = V({"a,9,9,k1,0"}); // remote changed
+    auto res = merge_keyed(b, l, r, key_instances_csv4);
+    CHECK(!res.clean(), "delete vs change conflicts");
+    auto& c = res.conflicts[0];
+    CHECK(c.localLen == 0 && c.emitLen == 1, "surviving side emitted");
+    std::vector<std::pair<size_t, size_t>> m;
+    auto pre = build_premerged(res, l, m);
+    CHECK(pre.empty(), "keep local (deleted) → empty doc");
+    CHECK(m.size() == 1 && m[0].first == 0 && m[0].second == 0, "empty m span");
+    auto allRemote = tool_splice(pre, m, res, r, {true});
+    CHECK(allRemote == r, "choosing remote reinserts the changed record");
+}
+
 int main()
 {
     test_split_join();
@@ -273,6 +420,10 @@ int main()
     test_keyed_tile_lines();
     test_keyed_index_rename();
     test_keyed_gbk_key();
+    test_emit_coords_line_merge();
+    test_emit_coords_refine_subblocks();
+    test_emit_coords_keyed();
+    test_emit_coords_keyed_delete_vs_change();
     if (g_fail)
     {
         printf("%d FAILURES\n", g_fail);

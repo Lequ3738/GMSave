@@ -7,11 +7,17 @@
 
 namespace diff3 {
 
-// A conflict region: line ranges in each of the three inputs (half-open).
+// A conflict region: line ranges in each of the three inputs (half-open),
+// plus where the region sits in Result.lines. Both emitters (line-level with
+// markers, keyed without) keep conflicts[] in emission order, so the merged
+// document minus conflict regions can be rebuilt by a single forward walk:
+// replace lines [emitStart, emitStart+emitLen) with the conflict's local
+// block (localLen lines) and every other line passes through unchanged.
 struct Conflict {
     size_t baseStart = 0, baseLen = 0;
     size_t localStart = 0, localLen = 0;
     size_t remoteStart = 0, remoteLen = 0;
+    size_t emitStart = 0, emitLen = 0;
 };
 
 struct Result {
