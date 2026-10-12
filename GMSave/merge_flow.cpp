@@ -495,6 +495,13 @@ bool merge_flow_disk_differs(const std::wstring& projDir)
     return disk.size() != byRel.size();
 }
 
+bool merge_flow_snapshot_exists(const std::wstring& projDir)
+{
+    std::vector<SnapEntry> snap;
+    return read_snapshot_manifest(snapshot_dir_of(projDir) / L"manifest.json",
+        snap);
+}
+
 // ==== Editor-window helpers ====
 
 static const struct
@@ -1408,35 +1415,48 @@ static bool close_editors_and_wait(int modalResult)
     return merge_flow_count_editor_windows() == 0;
 }
 
-bool merge_flow_run(const std::wstring& projDir, bool review)
+MergeFlowResult merge_flow_run(const std::wstring& projDir, bool review,
+    bool unattended)
 {
     GmPerfSpan _pf_total("merge.run");
+    // Single prompt sink for the whole flow: the unattended entry pops no
+    // dialogs (a modal box nobody answers would stall its polling loop
+    // forever); every refusal reaches the caller as a result status instead.
+    auto alert = [unattended](const wchar_t* text, UINT flags)
+    {
+        if (unattended) return;
+        MessageBoxW(gm80_prompt_owner(), text, L"Game Maker 8.0", flags);
+    };
     // Save-side guard: the watcher tick defers on standalone code editors,
     // but Ctrl+S reaches the save hook even while one blocks the main window
     // (MDI). Refuse politely — reloading now would corrupt the editor.
     if (merge_flow_code_editor_open())
     {
         gm_log("MergeFlow: standalone code editor open — refusing to run");
-        MessageBoxW(gm80_prompt_owner(),
-            tr(L"A standalone code editor window is open.\r\n"
+        alert(tr(L"A standalone code editor window is open.\r\n"
                L"The merge cannot run while it is open: reloading the project "
                L"now would corrupt that window.\r\n\r\n"
                L"Close the code editor window, then save again.",
                L"检测到独立的代码编辑窗口处于打开状态。\r\n"
                L"合并无法在它打开时运行：此时重载工程会损坏该窗口。\r\n\r\n"
                L"请先关闭代码编辑窗口，再重新保存。"),
-            L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-        return false;
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        return MergeFlowResult::NO_RELOAD;
     }
     // Cheap stat-level pre-check first: external tools that only touched
     // mtimes — or changed files and then reverted them — used to cost a full
     // staging save + prompt cycle only to reach a "nothing to do" verdict.
+    // "No difference" is only a verified verdict when a baseline exists at
+    // all: disk_differs reports false for a missing snapshot too (nothing
+    // known), and reporting that as nothing-to-do would silently swallow the
+    // external change — let the no-baseline branch below re-baseline instead.
     {
         GmPerfSpan _pf("merge.precheck");
-        if (!merge_flow_disk_differs(projDir))
+        if (!merge_flow_disk_differs(projDir) &&
+            merge_flow_snapshot_exists(projDir))
         {
             gm_log("MergeFlow: disk matches the base snapshot — nothing to do");
-            return false;
+            return MergeFlowResult::NOTHING_TO_DO;
         }
     }
 
@@ -1488,35 +1508,32 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
                "skipping this round");
         merge_flow_snapshot_refresh(projDir);
         closeProgress();
-        MessageBoxW(gm80_prompt_owner(),
-            tr(L"No merge baseline was found for this project (first run "
+        alert(tr(L"No merge baseline was found for this project (first run "
                L"after an upgrade), so this external change was not applied.\r\n"
                L"The baseline has been created. Make the external change "
                L"again to merge it.",
                L"未找到本工程的合并基线（升级后首次运行），本次外部更改未应用。\r\n"
                L"基线已创建，请重新进行一次外部更改即可完成合并。"),
-            L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
-        return false;
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return MergeFlowResult::REBASED;
     }
 
     // Runs an analysis pass; on failure closes the progress form, shows the
-    // matching error and leaves the flow (caller returns false).
+    // matching error and leaves the flow (caller reports NO_RELOAD).
     auto analyzeOrFail = [&](FlowState& s) -> bool
     {
         switch (merge_analyze(projDir, staging, s, &baseManifest))
         {
         case AnalyzeRc::STAGE_FAIL:
             closeProgress();
-            MessageBoxW(gm80_prompt_owner(),
-                tr(L"Cannot stage the current project state for merging.\r\n"
+            alert(tr(L"Cannot stage the current project state for merging.\r\n"
                    L"The project was NOT reloaded.",
                    L"无法为合并暂存当前工程状态。\r\n工程未重载。"),
-                L"Game Maker 8.0", MB_OK | MB_ICONERROR);
+                MB_OK | MB_ICONERROR);
             return false;
         case AnalyzeRc::TREE_SMALL:
             closeProgress();
-            MessageBoxW(gm80_prompt_owner(),
-                tr(L"The plugin's internal snapshot of the project state came out "
+            alert(tr(L"The plugin's internal snapshot of the project state came out "
                    L"incomplete (plugin bug).\r\n"
                    L"The merge was cancelled and NOTHING was changed.\r\n"
                    L"Saving the project once and retrying the external change "
@@ -1524,7 +1541,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
                    L"插件的工程状态内部快照不完整（插件 bug）。\r\n"
                    L"合并已取消，未更改任何内容。\r\n"
                    L"先保存一次工程，再重试外部更改，通常即可消除此问题。"),
-                L"Game Maker 8.0", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
             return false;
         case AnalyzeRc::OK: break;
         }
@@ -1535,7 +1552,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
     // whether a reload is imminent at all, and whether conflicts exist.
     int editorsAtStart = merge_flow_count_editor_windows();
     FlowState s1;
-    if (!analyzeOrFail(s1)) return false;
+    if (!analyzeOrFail(s1)) return MergeFlowResult::NO_RELOAD;
     if (s1.nothing_to_do())
     {
         // Nothing foreign after all (e.g. only mtimes moved): nothing to apply
@@ -1545,7 +1562,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         // gating on anyRemote alone used to skip it entirely (2026-09-15).
         gm_log("MergeFlow: no external difference found — nothing to do");
         closeProgress();
-        return false;
+        return MergeFlowResult::NOTHING_TO_DO;
     }
 
     // Editor gate — reached only when a reload is genuinely imminent, so the
@@ -1561,11 +1578,11 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         // Idempotent when nothing actually changed.
         showProgress(tr(L"Re-analyzing after editor changes",
             L"编辑器内容已应用，正在重新分析"), 4);
-        if (!analyzeOrFail(s1)) return false;
+        if (!analyzeOrFail(s1)) return MergeFlowResult::NO_RELOAD;
         if (s1.nothing_to_do())
         {
             closeProgress();
-            return false;
+            return MergeFlowResult::NOTHING_TO_DO;
         }
     }
     // FAST PATH — editors open, every one modeless, GM's dirty flags all
@@ -1634,7 +1651,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         if (r == IDCANCEL)
         {
             gm_log("MergeFlow: user cancelled at the editor gate");
-            return false;
+            return MergeFlowResult::NO_RELOAD;
         }
         // "Discard" exists only in the conflict variant (where the tool still
         // runs and can take the remote side per file); the clean variant's
@@ -1642,14 +1659,14 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         int modalResult = (s1.anyConflict && r == IDNO) ? 2 : 1;
         if (!close_editors_and_wait(modalResult))
         {
-            MessageBoxW(gm80_prompt_owner(),
-                tr(L"Some resource editor windows could not be closed "
+            gm_log("MergeFlow: editor windows refused to close — reload cancelled");
+            alert(tr(L"Some resource editor windows could not be closed "
                    L"automatically, so the reload was cancelled.\r\n"
                    L"Close them and make an external change again to retry.",
                    L"部分资源编辑器窗口无法自动关闭，重载已取消。\r\n"
                    L"请手动关闭它们，然后再次进行外部更改即可重试。"),
-                L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-            return false;
+                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+            return MergeFlowResult::NO_RELOAD;
         }
         // Freeing the modeless editors applies their content into the
         // resources (TScriptForm applies on destroy) and the modal epilogues
@@ -1660,13 +1677,13 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         // throw away just-applied script content.)
         showProgress(tr(L"Editors closed, re-analyzing",
                         L"编辑器已关闭，正在重新分析"), 4);
-        if (!analyzeOrFail(s1)) return false;
+        if (!analyzeOrFail(s1)) return MergeFlowResult::NO_RELOAD;
         if (s1.nothing_to_do())
         {
             // The applied content matched the disk exactly — nothing to
             // merge and no reload needed (memory already holds it).
             closeProgress();
-            return false;
+            return MergeFlowResult::NOTHING_TO_DO;
         }
     }
 
@@ -1774,28 +1791,35 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         std::wstring tool;
         if (!find_merge_tool(tool))
         {
-            // Fallback: list conflicts, keep local or cancel.
+            // Fallback: list conflicts, keep local or cancel. Unattended has
+            // nobody to answer — keep editing (no reload) rather than guess
+            // the discard decision on the user's behalf.
             std::wstring list;
             int n = 0;
             for (auto& mf : s1.files)
                 if (mf.status == FS_CONFLICT && n++ < 12)
                     list += L"\n  " + mf.rel;
-            int r = MessageBoxW(gm80_prompt_owner(),
-                ((ui_lang_chinese()
-                      ? L"未找到 GMSaveMerge.exe。冲突文件："
-                      : L"GMSaveMerge.exe was not found. Conflicting files:") +
-                 list +
-                 (ui_lang_chinese()
-                      ? L"\n\n是 = 保留我的版本并重载（这些文件的外部更改将被丢弃）\n"
-                        L"否 = 继续编辑（不重载）\n"
-                        L"（此模式下不会为你的文件创建备份。）"
-                      : L"\n\nYes = keep MY version and reload (external changes to "
-                        L"these files are discarded)\n"
-                        L"No = keep editing (no reload)\n"
-                        L"(Backup of your files is NOT made in this mode.)"))
-                    .c_str(),
-                L"Game Maker 8.0", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND);
-            if (r != IDYES) return false;
+            gm_log("MergeFlow: GMSaveMerge.exe not found — %s",
+                unattended ? "unattended, keeping IDE state"
+                           : "asking the user");
+            int r = IDNO;
+            if (!unattended)
+                r = MessageBoxW(gm80_prompt_owner(),
+                    ((ui_lang_chinese()
+                          ? L"未找到 GMSaveMerge.exe。冲突文件："
+                          : L"GMSaveMerge.exe was not found. Conflicting files:") +
+                     list +
+                     (ui_lang_chinese()
+                          ? L"\n\n是 = 保留我的版本并重载（这些文件的外部更改将被丢弃）\n"
+                            L"否 = 继续编辑（不重载）\n"
+                            L"（此模式下不会为你的文件创建备份。）"
+                          : L"\n\nYes = keep MY version and reload (external changes to "
+                            L"these files are discarded)\n"
+                            L"No = keep editing (no reload)\n"
+                            L"(Backup of your files is NOT made in this mode.)"))
+                        .c_str(),
+                    L"Game Maker 8.0", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND);
+            if (r != IDYES) return MergeFlowResult::NO_RELOAD;
             for (auto& mf : s1.files)
                 if (mf.status == FS_CONFLICT) decisions[mf.rel] = "local";
         }
@@ -1813,11 +1837,9 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
             {
                 if (main) EnableWindow(main, TRUE);
                 gm_log("MergeFlow: CreateProcess failed err=%u", GetLastError());
-                MessageBoxW(gm80_prompt_owner(),
-                    tr(L"Could not start the merge tool.",
-                       L"无法启动合并工具。"),
-                    L"Game Maker 8.0", MB_OK | MB_ICONERROR);
-                return false;
+                alert(tr(L"Could not start the merge tool.",
+                       L"无法启动合并工具。"), MB_OK | MB_ICONERROR);
+                return MergeFlowResult::NO_RELOAD;
             }
             DWORD code = wait_tool_with_pump(pi.hProcess);
             CloseHandle(pi.hThread);
@@ -1863,7 +1885,7 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
             if (!applied)
             {
                 gm_log("MergeFlow: user cancelled the merge — keeping IDE state");
-                return false;
+                return MergeFlowResult::NO_RELOAD;
             }
         }
     }
@@ -1880,13 +1902,12 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
                "aborting, will retry via the slow path");
         project_watcher_rearm_pending();
         closeProgress();
-        MessageBoxW(gm80_prompt_owner(),
-            tr(L"Editor content changed while the merge was running, so the "
+        alert(tr(L"Editor content changed while the merge was running, so the "
                L"reload was cancelled. It will retry automatically in a "
                L"moment.",
                L"合并期间编辑器内容发生了变化，本次重载已取消。稍后将自动重试。"),
-            L"Game Maker 8.0", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
-        return false;
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return MergeFlowResult::NO_RELOAD;
     }
     if (progressUp) native_progress_step(88);
     else showProgress(tr(L"Applying merge results",
@@ -1905,18 +1926,17 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
                "nothing written");
         project_watcher_rearm_pending();
         closeProgress();
-        MessageBoxW(gm80_prompt_owner(),
-            (std::wstring(tr(L"Project files were modified on disk while the "
-                             L"merge tool was open:",
-                             L"合并工具打开期间，以下工程文件又在磁盘上被修改了：")) +
-             movedList +
-             tr(L"\r\n\r\nThe merge was cancelled and NOTHING was written. "
-                L"It will restart automatically using the latest files.",
-                L"\r\n\r\n本次合并已取消，未写入任何内容；"
-                L"稍后将使用最新文件自动重新运行。"))
-                .c_str(),
-            L"Game Maker 8.0", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-        return false;
+        alert((std::wstring(tr(L"Project files were modified on disk while the "
+                               L"merge tool was open:",
+                               L"合并工具打开期间，以下工程文件又在磁盘上被修改了：")) +
+               movedList +
+               tr(L"\r\n\r\nThe merge was cancelled and NOTHING was written. "
+                  L"It will restart automatically using the latest files.",
+                  L"\r\n\r\n本次合并已取消，未写入任何内容；"
+                  L"稍后将使用最新文件自动重新运行。"))
+                  .c_str(),
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        return MergeFlowResult::NO_RELOAD;
     }
     if (rc != 0)
         gm_log("MergeFlow: apply had errors — reloading anyway (backups in session\\backup)");
@@ -1924,5 +1944,5 @@ bool merge_flow_run(const std::wstring& projDir, bool review)
         gm_log("MergeFlow: applied — reloading project");
 
     project_watcher_reload_project();
-    return true;
+    return MergeFlowResult::RELOADED;
 }

@@ -333,7 +333,8 @@ static void __stdcall do_gm80_save_if_needed()
             // both entry paths (this hook used to reload right under them).
             // After it returns the IDE holds the merged state — nothing left
             // to save for this Ctrl+S.
-            bool reloaded = merge_flow_run(g_gm80_save_path, false);
+            bool reloaded = merge_flow_run(g_gm80_save_path, false) ==
+                MergeFlowResult::RELOADED;
             // This hook stopped the watcher on entry and the flow only
             // restarts it through a successful reload. If we got here without
             // one (user cancelled, or the apply aborted because the disk

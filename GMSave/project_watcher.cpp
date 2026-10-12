@@ -464,7 +464,17 @@ void project_watcher_tick()
 //                      detail 1 is unused (modal editors defer as 3:4
 //                      instead — closing one may clear the block on its own).
 //   5 not-watching   — no .gm80 project watched, or it changed under us
-//   6 failed         — reserved (flow ran but did not reload)
+//   6 failed         — the flow RAN but did not reload: the disk may still
+//                      hold unapplied external changes, so this is NOT
+//                      "synced" and must not license a compile. Unlike 3 it
+//                      is not a retry-later signal either — report it to the
+//                      operator instead of re-syncing blindly. detail 1 = no
+//                      merge baseline existed; one was re-created from the
+//                      current disk and the round was skipped — redo the
+//                      external change and sync again to merge it. detail 0
+//                      = any other flow failure (the reason is in the GMSave
+//                      log). The flow pops no dialogs on this entry, so a
+//                      failed round never waits for a human.
 //
 // Unattended safety: the flow is allowed to proceed only when it is provably
 // silent. Zero dirty flags + no modal editor ⇒ IDE memory == base snapshot ⇒
@@ -548,10 +558,20 @@ static void project_watcher_force_sync(uint32_t reqId)
     g_flow_active = true;
     mm_audit::note_flow_active(true);
     InterlockedExchange(&g_pending_foreign, 0);
-    bool ok = merge_flow_run(g_watch_path, false);
+    MergeFlowResult r = merge_flow_run(g_watch_path, false, true);
     g_flow_active = false;
     mm_audit::note_flow_active(false);
-    force_sync_report(reqId, ok ? 1 : 2, 0);
+    // The unattended run pops no dialogs, so every non-reloaded outcome is a
+    // reportable status, never a pending prompt.
+    uint32_t status = 6, detail = 0;
+    switch (r)
+    {
+    case MergeFlowResult::RELOADED:      status = 1; break;
+    case MergeFlowResult::NOTHING_TO_DO: status = 2; break;
+    case MergeFlowResult::REBASED:       detail = 1; break;
+    case MergeFlowResult::NO_RELOAD:     break;
+    }
+    force_sync_report(reqId, status, detail);
 }
 
 // ==== Hidden timer window (main-thread polling, self-contained) ====

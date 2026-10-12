@@ -46,6 +46,27 @@
 - 该插件是单线程的，不支持多线程存储和读取 .gm80 项目。
 - 在调试时游戏的默认工作路径不同。gm82save 是 `项目.gm82` 文件夹里面，GMSave 是 `项目.gm80` 文件夹外面。
 
+## 外部代理同步协议（ForceSync）
+
+供外部工具（如 AI 编码代理的 MCP 服务器）在无人值守下触发一次"外部改动合并/重载"：
+
+- 向 IDE 进程的 `GMSave.Watcher` 隐藏窗口投递注册消息 `GMSave.ForceSync`（`wParam` = 请求 id）；
+- 结果写入命名文件映射 `Local\GMSave.SyncStatus.<pid>`（16 字节：magic `'GMS1'`、reqId、
+  status、detail），reqId 最后写入作为完成标记；映射不存在 = 部署的 GMSave 旧于此版本；
+- 此入口**不弹任何对话框**：会弹窗的状态（IDE 有未应用修改、模态窗、代码编辑器打开、
+  内存管理器卡死）直接拒绝并回报状态码。
+
+状态码（detail 见 `GMEnhance/mcp/server.mjs` 的 `SYNC_DETAIL` 与 GMSave 日志）：
+
+| status | 含义 |
+|---|---|
+| 1 | `reloaded`：合并流已跑完，工程已从磁盘重载 |
+| 2 | `nothing-to-do`：磁盘与基线快照真一致，可直接当"已同步" |
+| 3 | `deferred`：暂不能跑（流程占用/模态窗等），可稍后重试 |
+| 4 | `needs-manual`：需要人工处理（未保存修改/内存管理器卡死），拒绝执行 |
+| 5 | `not-watching`：没有受监视的 .gm80 工程 |
+| 6 | `failed`：合并流已运行但未重载——磁盘改动可能未生效，非顺延、勿盲目重试（detail 1 = 基线缺失已重建，重做一次外部更改即可合并） |
+
 ## 如何编译
 
 使用 Visual Studio 2022 进行编译，编译时平台选择 `x86`。

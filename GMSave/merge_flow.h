@@ -24,27 +24,56 @@ void merge_flow_snapshot_refresh(
     const std::wstring& projDir, const std::vector<Gm80WrittenFile>* written = nullptr);
 
 // True when any project file on disk differs from the snapshot (size/mtime
-// fast path, hash fallback). Used by the save-side conflict prompt.
+// fast path, hash fallback). Used by the save-side conflict prompt. With no
+// snapshot on file this returns false — an unknown, not a verified match.
 bool merge_flow_disk_differs(const std::wstring& projDir);
 
-// ==== The flow (main thread: the watcher tick, or the save-side hook) ====
-// v2 flow (2026-09-20): cheap stat pre-check → pass-1 analysis (the GATE,
-// taken with editor windows untouched) → FAST PATH: open editors that are
-// all modeless with GM's dirty flags (the title-'*' array) all zero have
-// nothing unapplied — the pass-1 staging is authoritative; no question, no
-// editor closing (the reload frees them): identical to the no-editors case,
-// one analysis → otherwise the editor gate (one MessageBox per variant;
-// "review the changes" is folded into the clean variant's 否 — no second
-// question anywhere; the conflict variant asks apply/discard of the
-// unapplied editor content, the tool doubles as the review) → pass-2
-// analysis ALWAYS follows the gate (freeing modeless editors applies their
-// content into the resources, so the staging may be stale; the stat
-// shortcut keeps it cheap) → merge tool for conflicts and reviews (its
+// True when a readable base snapshot manifest exists. merge_flow_run's
+// pre-check needs this tri-state split: without it, "disk_differs == false"
+// would fold the no-baseline case (a real problem — nothing can be merged)
+// into a verified nothing-to-do.
+bool merge_flow_snapshot_exists(const std::wstring& projDir);
+
+// ==== The flow (main thread: the watcher tick, the save-side hook, or the
+// unattended force-sync entry) ====
+// Cheap stat pre-check → pass-1 analysis (the GATE, taken with editor windows
+// untouched) → FAST PATH: open editors that are all modeless with GM's dirty
+// flags (the title-'*' array) all zero have nothing unapplied — the pass-1
+// staging is authoritative; no question, no editor closing (the reload frees
+// them): identical to the no-editors case, one analysis → otherwise the
+// editor gate (one prompt per variant; "review the changes" is folded into
+// the clean variant's 否 — no second question anywhere; the conflict variant
+// asks apply/discard of the unapplied editor content, the tool doubles as the
+// review) → pass-2 analysis ALWAYS follows the gate (freeing modeless editors
+// applies their content into the resources, so the staging may be stale; the
+// stat shortcut keeps it cheap) → merge tool for conflicts and reviews (its
 // confirm is the FINAL action; clean+unreviewed changes apply silently) →
 // apply + reload through GM80_LoadRecentProject, which retitles the
 // already-open native progress form in place. review=true opens the tool
-// even for clean merges. Returns true when the project was reloaded.
-bool merge_flow_run(const std::wstring& projDir, bool review);
+// even for clean merges.
+enum class MergeFlowResult
+{
+    RELOADED,      // applied and reloaded from disk
+    NOTHING_TO_DO, // disk matches the base snapshot, or the analysis found no
+                   // difference — IDE memory already equals the disk, so the
+                   // caller may treat this as "synced"
+    NO_RELOAD,     // the flow ran but ended without reloading: a stage/tool
+                   // failure, a user cancel, an aborted apply — the disk may
+                   // still hold unapplied external changes
+    REBASED,       // no baseline snapshot existed: one was re-created from the
+                   // current disk and this round was skipped — the external
+                   // change was NOT applied (redoing it merges it normally)
+};
+
+// Reporting a NO_RELOAD/REBASED round as NOTHING_TO_DO is what lets an
+// unattended caller compile a binary built from a half-stale project, so the
+// force-sync entry maps them to distinct statuses. Foreground callers (tick,
+// save hook) only need the RELOADED vs everything-else split.
+// `unattended` (the force-sync entry) pops no dialogs at all: its caller
+// polls a status block, and a modal box nobody answers would stall the loop
+// forever — every refusal stays in the log and the result status instead.
+MergeFlowResult merge_flow_run(const std::wstring& projDir, bool review,
+    bool unattended = false);
 
 // ==== Editor-window helpers (shared with the watcher tick) ====
 // One editor form instance per resource lives in the resource "forms" arrays.
