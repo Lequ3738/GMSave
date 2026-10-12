@@ -227,6 +227,9 @@ void project_watcher_start(const std::wstring& path)
     // main thread during a project load/save — never from DllMain, so creating a
     // window is safe (no loader lock).
     project_watcher_ensure_timer_window();
+    // Idempotent: the audit thread (MM tick + hang watchdog) lives for the whole
+    // process, independent of watcher stop/restart cycles.
+    mm_audit::start();
     // Main-menu entry for the dead-asset scan (idempotent; the main form
     // exists by now, which is why this can't run from DLL attach).
     dead_asset_check_ensure_menu();
@@ -423,9 +426,11 @@ void project_watcher_tick()
     // where needed (editor modal unwinds, the tool wait), so the old
     // cross-tick close-flow state machine is gone (2026-09-20).
     g_flow_active = true;
+    mm_audit::note_flow_active(true);
     InterlockedExchange(&g_pending_foreign, 0);
     merge_flow_run(g_watch_path, false);
     g_flow_active = false;
+    mm_audit::note_flow_active(false);
 }
 
 // ==== Force-sync entry for external agents (unattended) ====
@@ -541,9 +546,11 @@ static void project_watcher_force_sync(uint32_t reqId)
     }
     gm_log("ForceSync: req=%u running merge flow on '%S'", reqId, g_watch_path.c_str());
     g_flow_active = true;
+    mm_audit::note_flow_active(true);
     InterlockedExchange(&g_pending_foreign, 0);
     bool ok = merge_flow_run(g_watch_path, false);
     g_flow_active = false;
+    mm_audit::note_flow_active(false);
     force_sync_report(reqId, ok ? 1 : 2, 0);
 }
 
@@ -565,9 +572,8 @@ static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     }
     if (msg == WM_TIMER && wp == kTimerId)
     {
-        // Pool-lock health first: read-only, nanoseconds — catches a wedged
-        // Delphi MM lock while the IDE is still idle (see mm_audit.h).
-        mm_audit::tick(g_flow_active);
+        // mm_audit runs on its own background thread: a main-thread tick goes
+        // blind the moment the main thread stops pumping messages.
         project_watcher_tick();
         return 0;
     }
