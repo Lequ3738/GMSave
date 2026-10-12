@@ -495,6 +495,22 @@ static HANDLE g_sync_map = NULL;
 static GmSyncResultBlock* g_sync_view = NULL;
 static UINT g_msgForceSync = 0;
 
+// Status names for the log only — the wire format stays the 16-byte numeric
+// block; these exist so a log reader never has to consult the protocol table.
+static const char* force_sync_status_name(uint32_t status)
+{
+    switch (status)
+    {
+    case 1: return "reloaded";
+    case 2: return "nothing-to-do";
+    case 3: return "deferred";
+    case 4: return "needs-manual";
+    case 5: return "not-watching";
+    case 6: return "failed";
+    default: return "unknown";
+    }
+}
+
 static void force_sync_report(uint32_t reqId, uint32_t status, uint32_t detail)
 {
     if (g_sync_view)
@@ -503,7 +519,8 @@ static void force_sync_report(uint32_t reqId, uint32_t status, uint32_t detail)
         g_sync_view->detail = detail;
         InterlockedExchange((volatile LONG*)&g_sync_view->reqId, (LONG)reqId);
     }
-    gm_log("ForceSync: req=%u -> status=%u detail=%u", reqId, status, detail);
+    gm_log("ForceSync: req=%u -> status=%u (%s) detail=%u",
+        reqId, status, force_sync_status_name(status), detail);
 }
 
 // Runs on the main thread — the timer window's wndproc dispatches it, the
