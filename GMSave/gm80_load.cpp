@@ -6,6 +6,7 @@
 #include "project_watcher.h"
 #include "gm_log.h"
 #include "gm80_diag.h"
+#include "mm_audit.h"
 #include "i18n.h"
 #include <fstream>
 #include <sstream>
@@ -2029,10 +2030,31 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
         }
     });
 
-    // Load frames (PNG) into a raw Frame** array at +48
+    // Load frames (PNG) into sprite's frames array at +48.
+    // TSprite.frames is a Delphi dynamic array: GM80_Sprite_Create builds it
+    // with @DynArraySetLength and the destructor (sub_4F89C8) clears it with
+    // @DynArrayClear, which decrements the refcount at ptr-8 and FreeMem's
+    // ptr-8. A raw GetMem pointer lacks that header: the decrement corrupts
+    // adjacent heap memory, and when the dword happens to reach 0 the follow-up
+    // FreeMem(ptr-8) releases a bogus address — FastFreeMem then spins forever
+    // CAS-locking the fake block header. Build the array exactly like the
+    // native loader does.
     if (frameCount > 0 && frameCount < 10000)
     {
-        void** frames = (void**)delphi_alloc(frameCount * sizeof(void*));
+        uint8_t* b = glob_base();
+        uint32_t ti = *(uint32_t*)(b + 0xF84E0); // frames TypeInfo (off_4F84E0)
+        void* field = (uint8_t*)sp + 48;
+        uint32_t fnSetLen = (uint32_t)b + 0x6A38; // @DynArraySetLength
+        __asm
+        {
+            mov eax, field
+            mov edx, ti
+            mov ecx, 1
+            push frameCount
+            call fnSetLen
+            add esp, 4
+        }
+        void** frames = *(void***)field;
         uint32_t loaded = 0;
         for (uint32_t i = 0; i < frameCount; i++)
         {
@@ -2065,15 +2087,9 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
             set_obj_ptr(frame, 12, data);
             frames[loaded++] = frame;
         }
-        if (loaded > 0)
-        {
-            set_obj_ptr(sp, 48, frames);
-            set_obj_u32(sp, 4, loaded);
-        }
-        else
-        {
-            delphi_free(frames);
-        }
+        if (loaded > 0) set_obj_u32(sp, 4, loaded);
+        // loaded==0: the array stays all-null with frame_count 0; the
+        // destructor's @DynArrayClear frees it normally.
     }
 
     return sp;
@@ -3521,15 +3537,19 @@ static bool gm80_load_project_cpp(void* gm_base, const std::wstring& wpath)
 // objects that require unwinding (C2712).
 bool gm80_load_project(void* gm_base, const std::wstring& wpath)
 {
+    bool ok = false;
     __try
     {
-        return gm80_load_project_cpp(gm_base, wpath);
+        ok = gm80_load_project_cpp(gm_base, wpath);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         gm_log("Load: SEH exception 0x%X", GetExceptionCode());
-        return false;
+        ok = false;
     }
+    // 阶段标记只在加载进行中有效：留着会让空闲时的挂死取证指向已经结束的步骤。
+    mm_audit::note_stage("idle");
+    return ok;
 }
 
 static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
@@ -3681,6 +3701,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     gm_log("Load: triggers done");
 
     // 5. Load sounds
+    mm_audit::note_stage("load:sounds");
     gm_log("Loading sounds...");
     { GmPerfSpan _pf("load.sounds");
     load_assets_simple("sounds", load_sound, find_res("sounds"), root); }
@@ -3688,6 +3709,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     gm80_progress_step(10);
 
     // 6. Load sprites
+    mm_audit::note_stage("load:sprites");
     gm_log("Loading sprites...");
     { GmPerfSpan _pf("load.sprites");
     load_assets_simple("sprites", load_sprite_obj, find_res("sprites"), root); }
@@ -3709,6 +3731,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     gm80_progress_step(40);
 
     // 9. Load scripts
+    mm_audit::note_stage("load:scripts");
     gm_log("Loading scripts...");
     { GmPerfSpan _pf("load.scripts");
     load_assets_simple("scripts", load_script, find_res("scripts"), root); }
@@ -3740,6 +3763,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     g_action_names.fonts = load_names(root / "fonts" / "index.yyd");
     g_action_names.timelines = load_names(root / "timelines" / "index.yyd");
 
+    mm_audit::note_stage("load:objects");
     gm_log("Loading objects...");
     {
         GmPerfSpan _pf("load.objects");
@@ -3752,6 +3776,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     gm80_progress_step(70);
 
     // 12. Load rooms (needs object + background name context)
+    mm_audit::note_stage("load:rooms");
     gm_log("Loading rooms...");
     {
         GmPerfSpan _pf("load.rooms");
@@ -3764,6 +3789,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     gm80_progress_step(80);
 
     // 13. Resource tree (tree.yyd per type) — needed for the IDE to display assets
+    mm_audit::note_stage("load:trees");
     gm_log("Loading resource trees...");
     {
         GmPerfSpan _pf("load.trees");
