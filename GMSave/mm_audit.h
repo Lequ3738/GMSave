@@ -54,4 +54,8 @@ void start();
 // 流程进行中标志，仅供巡检日志的 flow_active 字段；主线程在流程进出处同步。
 void note_flow_active(bool active);
 
+// 记录当前所处的流程阶段（字符串字面量，静态存储期），供挂死取证标注。
+// 挂死时主线程已停止推进，最后写入的阶段即挂死点所在区间。
+void note_stage(const char* stage);
+
 } // namespace mm_audit

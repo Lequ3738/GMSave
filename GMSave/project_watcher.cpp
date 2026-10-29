@@ -285,6 +285,10 @@ void project_watcher_reload_project()
     if (!g_watch_path.empty())
         gm80_capture_tree_state(b, g_watch_path);
     gm_log("Watcher: reloading project '%s'", path);
+    // 阶段标记给挂死取证用：GM80_LoadRecentProject 内部依次是进度窗、读文件、
+    // InitializeProject、LoadProject（我们的钩子在这里接手，逐类型标记见
+    // gm80_load.cpp）。挂死时读到的最后一个标记即卡住的那一段。
+    mm_audit::note_stage("reload:GM80_LoadRecentProject");
     // Unattended reload: keep load warnings (missing extension packages) in the
     // log — a modal box here would stall the silent flow. A manual open reports
     // them.
@@ -298,6 +302,7 @@ void project_watcher_reload_project()
         call ecx
     }
     gm80_load_set_quiet(false);
+    mm_audit::note_stage("idle");
     gm_log("Watcher: reload returned");
 }
 
