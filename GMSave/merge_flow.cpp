@@ -863,11 +863,164 @@ static void load_hashes(MergeFile& mf, const CompareCtx& cx,
     }
 }
 
+// CRLF and lone CR → LF. The IDE export always writes CRLF while external
+// tools write LF; byte compares must swallow that difference or identical
+// content classifies as a local modification — phantom conflicts on the
+// deleted-side, and silent LF→CRLF rewrites of files the IDE never touched.
+static void normalize_eol(std::string& s)
+{
+    if (s.find('\r') == std::string::npos) return;
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        if (s[i] != '\r')
+            out += s[i];
+        else if (i + 1 < s.size() && s[i + 1] == '\n')
+            ; // CR of a CRLF pair: the LF passes through on the next round
+        else
+            out += '\n';
+    }
+    s = std::move(out);
+}
+
+// Event blocks carry no ordering semantics: the object layout stores one
+// array per event type and the loader routes blocks by their "#define " name,
+// so the same content in any block order loads identically. The IDE-lens
+// export still emits blocks in a fixed type order (gm80_save loops evType
+// 0..11) while external writers append blocks in edit-history order — the
+// order-only difference used to surface as a local modification and pop the
+// three-way merge window on every external change to such a file. Sorting the
+// blocks canonically on all sides swallows the difference.
+//
+// The split rule is the loader's own: any line starting with "#define " is a
+// boundary, so the canonicalizer can never partition a file differently than
+// the load path does. Lines are kept verbatim (terminators included), making
+// the transform byte-preserving and idempotent. Keys: object events sort by
+// event type (the same 12-name table the load/save sides use), then numeric
+// suffix, with Collision/Trigger name suffixes sorted as strings; timeline
+// moments ("#define <step>") sort numerically; unrecognized defines keep
+// stable order ahead of everything.
+static bool is_event_block_file(const std::wstring& rel)
+{
+    if (rel.size() <= 4 ||
+        _wcsicmp(rel.c_str() + rel.size() - 4, L".gml") != 0)
+        return false;
+    return rel.rfind(L"objects\\", 0) == 0 || rel.rfind(L"timelines\\", 0) == 0;
+}
+
+static void canonicalize_event_blocks(std::string& s)
+{
+    static const char* evNames[] = {"Create", "Destroy", "Alarm", "Step",
+        "Collision", "Keyboard", "Mouse", "Other", "Draw", "KeyPress",
+        "KeyRelease", "Trigger"};
+    if (s.find("#define ") == std::string::npos) return;
+
+    struct Blk
+    {
+        int type; // -1 unrecognized, 0..11 event types, 12 timeline moment
+        bool suffixIsNum;
+        long long num;
+        std::string suffix;
+        std::string bytes;
+    };
+    std::vector<Blk> blocks;
+    // Line starts only — the loader treats a line as a boundary when it
+    // BEGINS with "#define "; a match mid-line (string/comment content) is
+    // just code and must stay inside its block.
+    std::vector<std::pair<size_t, size_t>> lines; // [start, end) w/ terminator
+    for (size_t p = 0; p < s.size();)
+    {
+        size_t eol = s.find('\n', p);
+        size_t next = (eol == std::string::npos) ? s.size() : eol + 1;
+        lines.emplace_back(p, next);
+        p = next;
+    }
+    size_t firstDef = lines.size();
+    for (size_t i = 0; i < lines.size(); i++)
+    {
+        if (s.compare(lines[i].first, 8, "#define ") == 0)
+        {
+            firstDef = i;
+            break;
+        }
+    }
+    if (firstDef == lines.size()) return;
+    std::string head = s.substr(0, lines[firstDef].first);
+
+    auto key_for = [&](const std::string& defLine)
+    {
+        Blk k = {-1, false, 0, std::string(), std::string()};
+        std::string tok = defLine.substr(8); // after "#define "
+        while (!tok.empty() &&
+               (tok.back() == '\r' || tok.back() == '\n' || tok.back() == ' '))
+            tok.pop_back();
+        if (tok.empty()) return k;
+        // Bare number = timeline moment step.
+        if (tok.find_first_not_of("0123456789") == std::string::npos)
+        {
+            k.type = 12;
+            k.suffixIsNum = true;
+            k.num = atoll(tok.c_str());
+            return k;
+        }
+        size_t us = tok.find_last_of('_');
+        std::string base = (us == std::string::npos) ? tok : tok.substr(0, us);
+        std::string sfx = (us == std::string::npos) ? "" : tok.substr(us + 1);
+        for (int i = 0; i < 12; i++)
+        {
+            if (base != evNames[i]) continue;
+            k.type = i;
+            if (!sfx.empty() &&
+                sfx.find_first_not_of("0123456789") == std::string::npos &&
+                sfx.size() <= 9)
+            {
+                k.suffixIsNum = true;
+                k.num = atoll(sfx.c_str());
+            }
+            else
+            {
+                k.suffix = sfx;
+            }
+            return k;
+        }
+        return k;
+    };
+
+    for (size_t i = firstDef; i < lines.size();)
+    {
+        Blk b = key_for(s.substr(lines[i].first, lines[i].second - lines[i].first));
+        size_t j = i + 1;
+        for (; j < lines.size(); j++)
+            if (s.compare(lines[j].first, 8, "#define ") == 0) break;
+        b.bytes = s.substr(lines[i].first, lines[j - 1].second - lines[i].first);
+        blocks.push_back(std::move(b));
+        i = j;
+    }
+
+    std::stable_sort(blocks.begin(), blocks.end(),
+        [](const Blk& a, const Blk& b)
+    {
+        if (a.type != b.type) return a.type < b.type;
+        if (a.suffixIsNum != b.suffixIsNum) return a.suffixIsNum;
+        if (a.suffixIsNum) return a.num < b.num;
+        return a.suffix < b.suffix;
+    });
+
+    std::string out = std::move(head);
+    out.reserve(s.size());
+    for (auto& b : blocks) out += b.bytes;
+    s = std::move(out);
+}
+
 // Reads the content that classify, diff3 and the session copy still need
 // once the identical-bytes shortcut failed. Absent sides stay empty; a
 // stat-matched remote aliases the base copy — the same bytes by the match,
-// no second read. Sole point where the encoding verdict and the IDE-lens
-// normalization are computed, so unchanged files never pay for either.
+// no second read. Sole point where the encoding verdict and the IDE-lens /
+// EOL / event-block-order normalizations are computed, so unchanged files
+// never pay for either. Apply never consumes these fields: writes come from
+// the staging tree, diff results, or session decisions, so normalization
+// stays display- and comparison-only.
 static void ensure_text_contents(MergeFile& mf, const CompareCtx& cx)
 {
     if (mf.binary) return;
@@ -890,6 +1043,15 @@ static void ensure_text_contents(MergeFile& mf, const CompareCtx& cx)
             wide_to_utf8(mf.rel).c_str());
         mf.baseB = std::move(nb);
         mf.remoteB = std::move(nr);
+    }
+    normalize_eol(mf.baseB);
+    normalize_eol(mf.remoteB);
+    normalize_eol(mf.localB);
+    if (is_event_block_file(mf.rel))
+    {
+        canonicalize_event_blocks(mf.baseB);
+        canonicalize_event_blocks(mf.remoteB);
+        canonicalize_event_blocks(mf.localB);
     }
 }
 
@@ -1188,7 +1350,33 @@ static int apply_decisions(const std::wstring& projDir, const fs::path& session,
                     fs::copy_options::overwrite_existing, ec);
         };
 
-        if (a.skip) continue;
+        if (a.skip)
+        {
+            // Pure external change: the disk already holds the content, but
+            // an external writer may have laid its event blocks out in its
+            // own order. Rewriting the canonicalized RAW disk bytes (not the
+            // lens/EOL-normalized remoteB — those normalizations are
+            // comparison-only and must not bake into files) converges the
+            // block order without touching content; the reload right after
+            // parses the same file either way, and the refreshed snapshot
+            // picks the canonical bytes up as the new base.
+            if (mf.status == FS_REMOTE && !mf.binary &&
+                is_event_block_file(mf.rel))
+            {
+                std::string raw = read_bytes(disk);
+                if (!raw.empty())
+                {
+                    std::string canon = raw;
+                    canonicalize_event_blocks(canon);
+                    if (canon != raw)
+                    {
+                        backupDisk();
+                        if (!write_bytes(disk, canon)) ok = false;
+                    }
+                }
+            }
+            continue;
+        }
         if (a.wantDelete)
         {
             backupDisk();
@@ -1287,6 +1475,25 @@ struct FlowState
 
 enum class AnalyzeRc { OK, STAGE_FAIL, TREE_SMALL };
 
+// Length of the leading '///' doc-comment line, 0 when absent. Resource
+// files restate their name in that line, so a rename rewrites it while the
+// body stays identical.
+static size_t doc_header_len(const std::string& s)
+{
+    if (s.rfind("///", 0) != 0) return 0;
+    size_t nl = s.find('\n');
+    return (nl == std::string::npos) ? s.size() : nl + 1;
+}
+
+// Rename equivalence for the pairing pass: equal after skipping a leading
+// /// line — and only when BOTH sides carry one; otherwise strict equality.
+static bool rename_content_equal(const std::string& a, const std::string& b)
+{
+    size_t ha = doc_header_len(a), hb = doc_header_len(b);
+    if (ha && hb) return a.compare(ha, std::string::npos, b, hb) == 0;
+    return a == b;
+}
+
 static AnalyzeRc merge_analyze(const std::wstring& projDir,
     const fs::path& staging, FlowState& fs,
     const std::vector<SnapEntry>* baseManifest)
@@ -1347,6 +1554,11 @@ static AnalyzeRc merge_analyze(const std::wstring& projDir,
 
     fs.files.clear();
     fs.anyLocal = fs.anyRemote = fs.anyConflict = false;
+    // Pure disk deletions (IDE untouched), kept aside for rename pairing —
+    // they classify as nothing-to-write but still witness a disk-side rename
+    // when a matching brand-new file shows up.
+    std::vector<MergeFile> goneLocal;
+    size_t deletedCount = 0; // FS_DELETED entries — they never enter files
     const size_t cmpTotal = all.size();
     size_t cmpDone = 0;
     for (auto& rel : all)
@@ -1366,6 +1578,8 @@ static AnalyzeRc merge_analyze(const std::wstring& projDir,
             // 2026-09-15: skipping these entirely left a pure external delete
             // with nothing to do (flag-wise), and the flow silently returned.
             fs.anyRemote = true;
+            deletedCount++;
+            if (mf.hasLocal) goneLocal.push_back(std::move(mf));
             continue;
         }
         if (mf.status == FS_DELETE_LOCAL)
@@ -1381,6 +1595,103 @@ static AnalyzeRc merge_analyze(const std::wstring& projDir,
             mf.diskMtime);
         fs.files.push_back(std::move(mf));
     }
+
+    // ==== Disk-side rename pairing ====
+    // A rename on disk reads as "X gone from the project tree + Y brand-new".
+    // Unpaired, an IDE edit to X turns into a delete-vs-change conflict while
+    // Y applies as an unrelated file. Pair X/Y on content (the /// header
+    // line exempt) and re-point the analysis of X onto Y, so the IDE side
+    // travels across the rename: clean three-way → Y holds the merged text;
+    // overlaps → the conflict card moves onto Y with X's sides rebased in.
+    std::vector<size_t> conflictX, newOnDiskY;
+    for (size_t i = 0; i < fs.files.size(); i++)
+    {
+        const MergeFile& m = fs.files[i];
+        if (m.binary) continue;
+        if (m.status == FS_CONFLICT && m.hasBase && m.hasLocal && !m.hasRemote)
+            conflictX.push_back(i);
+        else if (m.status == FS_REMOTE && !m.hasBase && !m.hasLocal)
+            newOnDiskY.push_back(i);
+    }
+    std::set<size_t> pairedY;
+    std::vector<size_t> consumedX;
+    for (size_t xi : conflictX)
+    {
+        MergeFile& x = fs.files[xi];
+        for (size_t yi : newOnDiskY)
+        {
+            if (pairedY.count(yi)) continue;
+            MergeFile& y = fs.files[yi];
+            if (!rename_content_equal(x.baseB, y.remoteB)) continue;
+            pairedY.insert(yi);
+            consumedX.push_back(xi);
+            // "Keep local" on Y must resolve to X's IDE content — stage the
+            // raw staging bytes (canonical CRLF) under Y's path.
+            std::error_code copyEc;
+            fs::copy_file(staging / x.rel, staging / y.rel,
+                fs::copy_options::overwrite_existing, copyEc);
+            TextMode tm = text_mode_for(y.rel);
+            std::vector<std::string> b = diff3::split_lines(x.baseB);
+            std::vector<std::string> l = diff3::split_lines(x.localB);
+            std::vector<std::string> r = diff3::split_lines(y.remoteB);
+            switch (tm)
+            {
+            case TM_KEYED_CSV4:
+                y.dres = diff3::merge_keyed(b, l, r, diff3::key_instances_csv4);
+                break;
+            case TM_KEYED_LINE:
+                y.dres = diff3::merge_keyed(b, l, r, diff3::key_whole_line);
+                break;
+            default:
+                y.dres = diff3::merge_lines(b, l, r);
+                break;
+            }
+            y.hasBase = true;
+            y.baseB = x.baseB;
+            y.hasLocal = true;
+            y.localB = x.localB;
+            y.resultB = diff3::join_lines(y.dres.lines, "\r\n");
+            y.status = y.dres.clean() ? FS_AUTO : FS_CONFLICT;
+            gm_log("MergeFlow: rename on disk '%s' -> '%s' (%s)",
+                wide_to_utf8(x.rel).c_str(), wide_to_utf8(y.rel).c_str(),
+                y.dres.clean() ? "IDE edits carried, clean merge"
+                               : "IDE edits overlap — conflict on the new path");
+            break;
+        }
+    }
+    for (const auto& g : goneLocal)
+    {
+        if (g.binary) continue;
+        for (size_t yi : newOnDiskY)
+        {
+            if (pairedY.count(yi)) continue;
+            if (!rename_content_equal(g.baseB, fs.files[yi].remoteB)) continue;
+            pairedY.insert(yi);
+            gm_log("MergeFlow: rename on disk '%s' -> '%s' (accepted)",
+                wide_to_utf8(g.rel).c_str(),
+                wide_to_utf8(fs.files[yi].rel).c_str());
+            break;
+        }
+    }
+    std::sort(consumedX.begin(), consumedX.end(), std::greater<size_t>());
+    for (size_t xi : consumedX) fs.files.erase(fs.files.begin() + xi);
+    // Pairing can dissolve conflicts (X consumed) or create them on Y —
+    // recompute the flags the flow gates on.
+    fs.anyLocal = fs.anyRemote = fs.anyConflict = false;
+    for (const auto& m : fs.files)
+    {
+        switch (m.status)
+        {
+        case FS_LOCAL:
+        case FS_AUTO: fs.anyLocal = true; break;
+        case FS_REMOTE:
+        case FS_DELETE_LOCAL: fs.anyRemote = true; break;
+        case FS_CONFLICT: fs.anyConflict = true; break;
+        default: break;
+        }
+    }
+    if (deletedCount > 0) fs.anyRemote = true;
+
     gm_log("MergeFlow: %zu changed files (conflicts=%d local=%d remote=%d)",
         fs.files.size(), (int)fs.anyConflict, (int)fs.anyLocal,
         (int)fs.anyRemote);
