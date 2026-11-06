@@ -172,6 +172,69 @@ static std::string read_file(const fs::path& p)
     fclose(f);
     return r;
 }
+
+// Is this line an event/moment section header? The loader accepts a header
+// only when "#define " starts the line; leading invisible characters must not
+// silently demote the line to body text — that makes the whole section vanish
+// without a warning. Deliberately narrow: only space/tab/NUL and the UTF-8 BOM
+// are skipped, so a mid-line "#define " inside a string literal stays code.
+static bool is_define_line(const std::string& line)
+{
+    size_t i = 0;
+    while (i < line.size())
+    {
+        unsigned char c = (unsigned char)line[i];
+        if (c == 0xEF && i + 2 < line.size() && (unsigned char)line[i + 1] == 0xBB &&
+            (unsigned char)line[i + 2] == 0xBF)
+        {
+            i += 3; // UTF-8 BOM that survived the read (e.g. mid-file paste)
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\0')
+        {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    return line.compare(i, 8, "#define ") == 0;
+}
+
+// UTF-8 BOM (EF BB BF) at the head of a TEXT file must be stripped before any
+// line-oriented parsing: the object/timeline .gml loader splits sections with
+// `line.find("#define ") == 0`, and "\xEF\xBB\xBF#define Create_0" does not
+// begin with "#define " — the whole first event body then falls into the
+// pre-header body, curName stays empty, and flushSection drops it. The write
+// side rebuilds the file from the in-memory object, so the event is gone from
+// disk too, BOM included. That is exactly the objCampfire Create_0 loss
+// (2026-11-06: a BOM-bearing file entered the project via 98a9269).
+// NEVER call this on binary payloads (PNG, audio, settings icons): a text BOM
+// check would corrupt the leading bytes. Use read_file_raw for those.
+static void strip_utf8_bom(std::string& s)
+{
+    if (s.size() >= 3 && (unsigned char)s[0] == 0xEF &&
+        (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+        s.erase(0, 3);
+}
+
+// Text-file read: BOM stripped so every parser sees a clean first line.
+static std::string read_text_file(const fs::path& p)
+{
+    std::string r = read_file(p);
+    size_t before = r.size();
+    strip_utf8_bom(r);
+    if (r.size() != before)
+        gm_log("load: stripped UTF-8 BOM from %s", p.string().c_str());
+    return r;
+}
+
+// Binary payload read (PNG frames, audio data, splash/icon images, includes):
+// bytes are consumed by decoders and stored verbatim, so the BOM must survive
+// untouched. Explicit name so a future reader cannot mistake it for text.
+static std::string read_file_raw(const fs::path& p)
+{
+    return read_file(p);
+}
 static bool file_exists(const fs::path& p)
 {
     return fs::exists(p);
@@ -806,7 +869,7 @@ static std::map<uint32_t, std::set<std::string>> g_tree_state; // kind → expan
 static void load_tree_state(const fs::path& root)
 {
     g_tree_state.clear();
-    std::string txt = read_file(root / "cache" / "tree_state.yyd");
+    std::string txt = read_text_file(root / "cache" / "tree_state.yyd");
     if (txt.empty()) return;
     uint32_t curKind = 0;
     std::set<std::string>* cur = nullptr;
@@ -951,7 +1014,7 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
 {
     if (names.empty()) return;
     auto treePath = root / dirName / "tree.yyd";
-    std::string txt = read_file(treePath);
+    std::string txt = read_text_file(treePath);
     if (txt.empty())
     {
         // No tree.yyd (older .gm80 files saved before sounds got tree.yyd):
@@ -1095,7 +1158,7 @@ static void load_resource_tree(const std::vector<std::string>& names, int kind,
 static void load_image_file_core(
     const fs::path& root, const char* fname, uint32_t globOff, uint32_t imgCls)
 {
-    std::string data = read_file(root / "settings" / fname);
+    std::string data = read_file_raw(root / "settings" / fname);
     if (data.empty()) return;
     uint8_t* base = (uint8_t*)g_load_base;
     // TMemoryStream (same class chain as GM's Outer: off_4EA854 → 0x4EA8A0)
@@ -1157,7 +1220,7 @@ static void load_image_file_core(
 // TIcon variant — same but the icon ctor (0x435F68, class ref off_42D248).
 static void load_icon_file(const fs::path& root, const char* fname, uint32_t globOff)
 {
-    std::string data = read_file(root / "settings" / fname);
+    std::string data = read_file_raw(root / "settings" / fname);
     if (data.empty()) return;
     uint8_t* base = (uint8_t*)g_load_base;
     uint32_t streamCls = *(uint32_t*)(base + 0xEA854);
@@ -1246,7 +1309,7 @@ static void load_icon_file_safe(const fs::path& root, const char* fname, uint32_
 static void load_settings(const fs::path& root)
 {
     fs::path settPath = root / "settings" / "settings.txt";
-    std::string txt = read_file(settPath);
+    std::string txt = read_text_file(settPath);
     if (txt.empty()) return;
 
     // Offsets corrected 2026-08-02 from GM80_SaveSettings/LoadSettings:
@@ -1358,7 +1421,7 @@ static void load_settings(const fs::path& root)
         }
         if (!metaFile.empty())
         {
-            std::string meta = read_file(metaFile);
+            std::string meta = read_text_file(metaFile);
             parse_kv(meta,
                 [&](auto& k, auto& v)
             {
@@ -1389,7 +1452,7 @@ static void load_settings(const fs::path& root)
 
     // Load constants
     fs::path constPath = root / "settings" / "constants.txt";
-    std::string constants = read_file(constPath);
+    std::string constants = read_text_file(constPath);
     if (!constants.empty())
     {
         std::vector<std::string> names, values;
@@ -1526,7 +1589,7 @@ static void restore_gameinfo_color(uint8_t* b, uint32_t color)
 static void load_gameinfo(const fs::path& root)
 {
     uint8_t* b = (uint8_t*)g_load_base;
-    std::string txt = read_file(root / "settings" / "gameinfo.txt");
+    std::string txt = read_text_file(root / "settings" / "gameinfo.txt");
     if (!txt.empty())
     {
         parse_kv(txt,
@@ -1557,7 +1620,7 @@ static void load_gameinfo(const fs::path& root)
         });
     }
     // F1 help text (RichEdit content) from settings/gameinfo.rtf.
-    std::string rtf = read_file(root / "settings" / "gameinfo.rtf");
+    std::string rtf = read_file_raw(root / "settings" / "gameinfo.rtf");
     if (!rtf.empty())
         restore_richtext(b, (const uint8_t*)rtf.data(), (uint32_t)rtf.size());
 }
@@ -1601,7 +1664,7 @@ static void* make_memory_stream(const std::string& data)
 // +28 export_setting, +32 export_folder, +36 overwrite, +37 free, +38 remove.
 static void load_included_files(const fs::path& root)
 {
-    std::string idx = read_file(root / "datafiles" / "index.yyd");
+    std::string idx = read_text_file(root / "datafiles" / "index.yyd");
     if (idx.empty()) return;
     std::vector<std::string> names;
     std::istringstream ss(idx);
@@ -1646,7 +1709,7 @@ static void load_included_files(const fs::path& root)
             mov f, eax
         }
         if (!f || f == (void*)cls) continue;
-        std::string meta = read_file(root / "datafiles" / (names[i] + ".txt"));
+        std::string meta = read_text_file(root / "datafiles" / (names[i] + ".txt"));
         bool stored = false, overwrite = false, freeMem = false, removeAtEnd = false;
         uint32_t exportSetting = 0;
         std::string exportFolder;
@@ -1672,7 +1735,7 @@ static void load_included_files(const fs::path& root)
         *(uint8_t*)((uint8_t*)f + 36) = overwrite ? 1 : 0;
         *(uint8_t*)((uint8_t*)f + 37) = freeMem ? 1 : 0;
         *(uint8_t*)((uint8_t*)f + 38) = removeAtEnd ? 1 : 0;
-        std::string content = read_file(root / "datafiles" / "include" / names[i]);
+        std::string content = read_file_raw(root / "datafiles" / "include" / names[i]);
         if (stored && !content.empty())
         {
             *(uint8_t*)((uint8_t*)f + 12) = 1; // data_exists
@@ -1725,7 +1788,7 @@ static void load_extensions(const fs::path& root)
         for (uint32_t i = 0; i < cnt; i++)
             flags[i] = 0;
 
-    std::string txt = read_file(root / "settings" / "extensions.txt");
+    std::string txt = read_text_file(root / "settings" / "extensions.txt");
     if (txt.empty()) return; // no extensions.txt yet → no extension loaded
     std::vector<std::string> missing;
     std::istringstream ss(txt);
@@ -1782,8 +1845,8 @@ static void* load_trigger(const std::string& name, const fs::path& trigDir)
 {
     fs::path txtPath = trigDir / (name + ".txt");
     fs::path gmlPath = trigDir / (name + ".gml");
-    std::string txt = read_file(txtPath);
-    std::string gml = read_file(gmlPath);
+    std::string txt = read_text_file(txtPath);
+    std::string gml = read_text_file(gmlPath);
 
     const ResInfo* ri = find_res("triggers");
     if (!ri) return nullptr;
@@ -1815,7 +1878,7 @@ static void* load_trigger(const std::string& name, const fs::path& trigDir)
 static void* load_script(const std::string& name, const fs::path& scriptDir)
 {
     fs::path gmlPath = scriptDir / (name + ".gml");
-    std::string gml = read_file(gmlPath);
+    std::string gml = read_text_file(gmlPath);
 
     const ResInfo* ri = find_res("scripts");
     if (!ri) return nullptr;
@@ -1834,7 +1897,7 @@ static void* load_script(const std::string& name, const fs::path& scriptDir)
 static void* load_font(const std::string& name, const fs::path& fontDir)
 {
     fs::path txtPath = fontDir / (name + ".txt");
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     const ResInfo* ri = find_res("fonts");
     if (!ri) return nullptr;
@@ -1877,7 +1940,7 @@ static void* load_font(const std::string& name, const fs::path& fontDir)
 static void* load_sound(const std::string& name, const fs::path& sndDir)
 {
     fs::path txtPath = sndDir / (name + ".txt");
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     const ResInfo* ri = find_res("sounds");
     if (!ri) return nullptr;
@@ -1918,7 +1981,7 @@ static void* load_sound(const std::string& name, const fs::path& sndDir)
         fs::path audioPath = sndDir / (name + "." + extClean);
         if (file_exists(audioPath))
         {
-            std::string audioData = read_file(audioPath);
+            std::string audioData = read_file_raw(audioPath);
             if (!audioData.empty())
             {
                 void* ms = make_delphi_stream(
@@ -1944,7 +2007,7 @@ struct DelphiFrame
 static bool load_frame_png(
     const fs::path& pngPath, uint32_t& width, uint32_t& height, std::vector<uint8_t>& out)
 {
-    std::string bytes = read_file(pngPath);
+    std::string bytes = read_file_raw(pngPath);
     if (bytes.empty()) return false;
 
     int w = 0, h = 0, comp = 0;
@@ -1981,7 +2044,7 @@ static void* load_sprite_obj(const std::string& name, const fs::path& spriteDir)
 
     fs::path subDir = spriteDir / name;
     fs::path txtPath = subDir / "sprite.txt";
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     uint32_t sp_vmt = get_real_vmt(ri->arrObjOff, ri->vmtRva);
     void* sp = delphi_ctor(sp_vmt, (uint32_t)glob_base() + ri->ctorRva);
@@ -2108,7 +2171,7 @@ static void* load_bg_obj(const std::string& name, const fs::path& bgDir)
     if (!ri) return nullptr;
 
     fs::path txtPath = bgDir / (name + ".txt");
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     uint32_t bg_vmt = get_real_vmt(ri->arrObjOff, ri->vmtRva);
     void* bg = delphi_ctor(bg_vmt, (uint32_t)g_load_base + ri->ctorRva);
@@ -2183,7 +2246,7 @@ static void* load_path_obj(const std::string& name, const fs::path& pathDir)
     fs::path subDir = pathDir / name;
     fs::path txtPath = subDir / "path.txt";
     fs::path ptsPath = subDir / "points.txt";
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     void* pp = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!pp) return nullptr;
@@ -2208,7 +2271,7 @@ static void* load_path_obj(const std::string& name, const fs::path& pathDir)
 
     // Load points into a Delphi dynamic array at +4
     // (header [refcount][length] then 24-byte points: x,y,speed as doubles)
-    std::string pts = read_file(ptsPath);
+    std::string pts = read_text_file(ptsPath);
     if (!pts.empty())
     {
         uint32_t ptCount = 0;
@@ -2705,7 +2768,7 @@ static void* load_object(const std::string& name, const fs::path& objDir,
     fs::path subDir = objDir / name;
     fs::path txtPath = objDir /
         (name + ".txt"); // flat layout (gm82save: set_extension("txt"))
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     void* obj = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!obj) return nullptr;
@@ -2734,7 +2797,7 @@ static void* load_object(const std::string& name, const fs::path& objDir,
 
     // Events from <name>.gml (save side writes flat objects/<name>.gml)
     fs::path gmlPath = objDir / (name + ".gml");
-    std::string gml = read_file(gmlPath);
+    std::string gml = read_text_file(gmlPath);
     if (gml.empty()) return obj;
 
     // Split into #define sections
@@ -2749,7 +2812,7 @@ static void* load_object(const std::string& name, const fs::path& objDir,
         };
     while (std::getline(gss, line))
     {
-        if (line.find("#define ") == 0)
+        if (is_define_line(line))
         {
             flushSection();
             curName = line;
@@ -2809,7 +2872,7 @@ static void* load_timeline(const std::string& name, const fs::path& tlDir)
     if (!ri) return nullptr;
 
     fs::path gmlPath = tlDir / (name + ".gml");
-    std::string gml = read_file(gmlPath);
+    std::string gml = read_text_file(gmlPath);
 
     void* tl = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!tl) return nullptr;
@@ -2837,7 +2900,7 @@ static void* load_timeline(const std::string& name, const fs::path& tlDir)
         };
     while (std::getline(ss, line))
     {
-        if (line.find("#define ") == 0)
+        if (is_define_line(line))
         {
             flushMoment();
             curTime = (uint32_t)p_u32(line.substr(8));
@@ -2902,7 +2965,7 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
 
     fs::path subDir = roomDir / name;
     fs::path txtPath = subDir / "room.txt";
-    std::string txt = read_file(txtPath);
+    std::string txt = read_text_file(txtPath);
 
     void* rm = make_obj_with_arr(ri->arrObjOff, ri->vmtRva, ri->ctorRva);
     if (!rm) return nullptr;
@@ -3041,7 +3104,7 @@ static void* load_room_obj(const std::string& name, const fs::path& roomDir,
     // Room.creation_code which sits after the 8 views at 300+8*56=748).
     {
         fs::path codePath = subDir / "code.gml";
-        std::string code = read_file(codePath);
+        std::string code = read_text_file(codePath);
         if (!code.empty()) set_obj_str(rm, 748, load_gml(code));
     }
 
@@ -3118,7 +3181,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
     // ==== Instances (instances.txt) ====
     {
         fs::path instPath = subDir / "instances.txt";
-        std::string instTxt = read_file(instPath);
+        std::string instTxt = read_text_file(instPath);
         if (!instTxt.empty())
         {
             struct InstRow
@@ -3190,7 +3253,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                         if (rows[i].hasCode && !rows[i].hash.empty())
                         {
                             fs::path codePath = subDir / (rows[i].hash + ".gml");
-                            std::string code = read_file(codePath);
+                            std::string code = read_text_file(codePath);
                             if (!code.empty())
                                 *(char**)(inst + 16) = make_delphi_str(load_gml(code));
                         }
@@ -3207,7 +3270,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
     // +24 height, +28 depth, +32 id, +36 locked(byte)
     {
         fs::path layersPath = subDir / "layers.txt";
-        std::string layersTxt = read_file(layersPath);
+        std::string layersTxt = read_text_file(layersPath);
         if (!layersTxt.empty())
         {
             std::vector<std::array<int32_t, 10> > tiles; // x,y,bg,u,v,w,h,depth,id,locked
@@ -3220,7 +3283,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
                 if (depthLine.back() == '\r') depthLine.pop_back();
                 if (depthLine.empty()) continue;
                 fs::path layerFile = subDir / (depthLine + ".txt");
-                std::string layerTxt = read_file(layerFile);
+                std::string layerTxt = read_text_file(layerFile);
                 std::istringstream tss(layerTxt);
                 std::string tline;
                 while (std::getline(tss, tline))
@@ -3278,7 +3341,7 @@ static void load_room_instances(void* rm, const fs::path& subDir,
 static std::vector<std::string> load_names(const fs::path& idxPath)
 {
     std::vector<std::string> out;
-    std::string idx = read_file(idxPath);
+    std::string idx = read_text_file(idxPath);
     if (idx.empty()) return out;
     std::istringstream ss(idx);
     std::string line;
@@ -3608,7 +3671,7 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
             entry.path().filename().string().find(".gm80") != std::string::npos)
         {
             metaFile = entry.path();
-            std::string meta = read_file(entry.path());
+            std::string meta = read_text_file(entry.path());
             if (!meta.empty())
             {
                 metaRead = true;
