@@ -1733,9 +1733,13 @@ MergeFlowResult merge_flow_run(const std::wstring& projDir, bool review,
     // Single prompt sink for the whole flow: the unattended entry pops no
     // dialogs (a modal box nobody answers would stall its polling loop
     // forever); every refusal reaches the caller as a result status instead.
+    // An active quiet lease silences the alert the same way: the flow can also
+    // be entered from the interactive entry points (watcher tick, Ctrl+S) while
+    // an external agent drives the session, and none of those may block.
     auto alert = [unattended](const wchar_t* text, UINT flags)
     {
         if (unattended) return;
+        if (gm80_ui_quiet()) { gm80_ui_suppressed(5); return; }
         MessageBoxW(gm80_prompt_owner(), text, L"Game Maker 8.0", flags);
     };
     // Save-side guard: the watcher tick defers on standalone code editors,
@@ -1915,6 +1919,16 @@ MergeFlowResult merge_flow_run(const std::wstring& projDir, bool review,
     if (editorsNow > 0 && !editorsClean)
     {
         closeProgress();
+        // Last-resort gate: the unattended entry and an active quiet lease
+        // must never reach the question below. Editors with unapplied
+        // content make the outcome ambiguous, so refuse and report instead.
+        if (unattended || gm80_ui_quiet())
+        {
+            gm_log("MergeFlow: editor gate blocked — %u editor(s) with "
+                   "unapplied content, UI suppressed", (unsigned)editorsNow);
+            gm80_ui_suppressed(5);
+            return MergeFlowResult::NO_RELOAD;
+        }
         int r;
         if (s1.anyConflict)
         {
@@ -2104,17 +2118,19 @@ MergeFlowResult merge_flow_run(const std::wstring& projDir, bool review,
         {
             // Fallback: list conflicts, keep local or cancel. Unattended has
             // nobody to answer — keep editing (no reload) rather than guess
-            // the discard decision on the user's behalf.
+            // the discard decision on the user's behalf. A quiet lease means
+            // the same thing: the deciding human is not at the keyboard.
             std::wstring list;
             int n = 0;
             for (auto& mf : s1.files)
                 if (mf.status == FS_CONFLICT && n++ < 12)
                     list += L"\n  " + mf.rel;
+            bool ask = !unattended && !gm80_ui_quiet();
+            if (!ask) gm80_ui_suppressed(5);
             gm_log("MergeFlow: GMSaveMerge.exe not found — %s",
-                unattended ? "unattended, keeping IDE state"
-                           : "asking the user");
+                ask ? "asking the user" : "unattended/quiet, keeping IDE state");
             int r = IDNO;
-            if (!unattended)
+            if (ask)
                 r = MessageBoxW(gm80_prompt_owner(),
                     ((ui_lang_chinese()
                           ? L"未找到 GMSaveMerge.exe。冲突文件："

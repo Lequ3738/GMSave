@@ -1,6 +1,7 @@
 // File watcher for .gm80 projects — IDE-style external-change handling
 // (silent reload when the user hasn't made changes; Yes/No prompt on conflict)
 #pragma once
+#include <cstdint>
 #include <string>
 
 // Start watching a project directory recursively (stops any previous watch).
@@ -46,3 +47,20 @@ bool project_watcher_is_running();
 // back to the foreground window). Share ONE implementation across all plugin
 // message boxes so the dialog stays in front of the IDE and disables it.
 HWND gm80_prompt_owner();
+
+// Quiet lease: while active, every user-visible prompt is replaced by a log
+// line plus a counter bump, so an external agent driving the IDE never faces
+// a modal box. Granted by the "GMSave.SetQuiet" window message (wParam = lease
+// ms, 0 = clear) or by the GMSAVE_QUIET_MS environment variable at startup.
+bool gm80_ui_quiet();
+
+// Grant the startup lease from GMSAVE_QUIET_MS. Called from ide_hooks_install
+// so the very first project load is already covered — the hidden window and its
+// message channel are created later, on the first project_watcher_start.
+void project_watcher_init_quiet_from_env();
+
+// Record one suppressed prompt of `kind` (1 = save disk-differs choice,
+// 2 = save failure box, 3 = load diagnostics summary, 4 = load fatal error box,
+// 5 = merge editor gate) and bump the suppression counter the external agent
+// polls.
+void gm80_ui_suppressed(uint32_t kind);

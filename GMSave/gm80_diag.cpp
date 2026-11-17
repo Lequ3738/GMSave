@@ -1,7 +1,8 @@
 #include "pch.h"
 #include "gm80_diag.h"
+#include "gm_log.h"
 #include "i18n.h"
-#include "project_watcher.h" // gm80_prompt_owner
+#include "project_watcher.h" // gm80_prompt_owner, gm80_ui_quiet
 #include <set>
 #include <string>
 #include <vector>
@@ -36,6 +37,16 @@ bool gm80_diag_any()
 void gm80_diag_show()
 {
     if (g_diag.empty()) return;
+    // Quiet lease: a modal summary would stall an agent-driven save/load.
+    // Log every entry instead and let the caller poll the suppression counter.
+    // Note the narrow printf here: %s = narrow, %S = wide.
+    if (gm80_ui_quiet())
+    {
+        for (size_t i = 0; i < g_diag.size(); i++)
+            gm_log("Load diag: %S", g_diag[i].c_str());
+        gm80_ui_suppressed(3);
+        return;
+    }
     const size_t kMaxShown = 15;
     std::wstring msg = tr(L"Issues found during this operation:",
                           L"本次操作中发现以下问题：");

@@ -301,6 +301,19 @@ static void __stdcall do_gm80_save_if_needed()
     if (diskDiffers)
     {
         gm_log("Save: external changes detected on disk");
+        // Quiet lease (external agent driving the IDE): a box nobody answers
+        // would stall the save hook forever. Refuse without writing and let
+        // the agent poll the sync block instead.
+        if (gm80_ui_quiet())
+        {
+            gm_log("Save: refused — external changes on disk while UI suppressed");
+            gm80_ui_suppressed(1);
+            // This hook stopped the watcher on entry — re-arm it, or external
+            // changes stay undetected until the next save.
+            if (!project_watcher_is_running())
+                project_watcher_start(g_gm80_save_path);
+            return;
+        }
         // MessageBox caps this prompt at three choices — "review first" is a
         // watcher-gate feature. The tool still opens here whenever the merge
         // carries conflicts, which covers the cases worth inspecting.
@@ -399,7 +412,12 @@ static void __stdcall do_gm80_save_if_needed()
     if (!ok)
     {
         const std::string& err = gm80_save_last_error();
-        if (!err.empty())
+        if (gm80_ui_quiet())
+        {
+            gm_log("Save: failed — %s (UI suppressed)", err.c_str());
+            gm80_ui_suppressed(2);
+        }
+        else if (!err.empty())
         {
             std::string msg = "Cannot save project:\r\n" + err +
                 ".\r\n"
@@ -981,6 +999,10 @@ bool ide_hooks_install(HMODULE gm_base)
     hook_comdlg32_iat(gm_base);
     // "Check for dead assets" entry in the IDE's Scripts menu.
     dead_asset_check_install(base);
+    // GMSAVE_QUIET_MS must land before the first project load, whose diagnostic
+    // summary would otherwise pop a box in an agent-driven session. Only a
+    // volatile write — the window and message channel stay lazy below.
+    project_watcher_init_quiet_from_env();
     // NOTE: the file watcher's hidden timer window is created lazily on the
     // first project_watcher_start (project load / save), NOT here — creating a
     // window inside DllMain (loader lock held) is unsafe.

@@ -3709,26 +3709,43 @@ static bool gm80_load_project_inner(void* gm_base, const std::wstring& wpath)
     if (!metaRead && !metaFile.empty())
     {
         gm_log("Load: ABORT — metadata file exists but is unreadable");
-        // GM's progress form is fsStayOnTop while the load runs: MB_TOPMOST
-        // keeps this box above it.
-        MessageBoxA(gm80_prompt_owner(),
-            "The project's .gm80 metadata file exists but could not be read.\r\n"
-            "The project was NOT loaded.",
-            "Game Maker 8.0", MB_OK | MB_ICONERROR | MB_TOPMOST);
+        if (gm80_ui_quiet())
+        {
+            gm_log("Load: metadata unreadable (UI suppressed)");
+            gm80_ui_suppressed(4);
+        }
+        else
+        {
+            // GM's progress form is fsStayOnTop while the load runs: MB_TOPMOST
+            // keeps this box above it.
+            MessageBoxA(gm80_prompt_owner(),
+                "The project's .gm80 metadata file exists but could not be read.\r\n"
+                "The project was NOT loaded.",
+                "Game Maker 8.0", MB_OK | MB_ICONERROR | MB_TOPMOST);
+        }
         return false;
     }
     // Refuse files from a NEWER GMSave — the format may have changed and we'd
     // misread it (gm82save parity: rejects a newer gm82_version).
     if (fileVersion > GM80_VERSION)
     {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-            "This project was saved with a newer version of GMSave "
-            "(file version %u, this build supports %u).\r\n"
-            "Please update GMSave to open it.",
-            fileVersion, (uint32_t)GM80_VERSION);
-        MessageBoxA(gm80_prompt_owner(), buf, "Game Maker 8.0",
-            MB_OK | MB_ICONERROR | MB_TOPMOST);
+        if (gm80_ui_quiet())
+        {
+            gm_log("Load: file version %u > supported %u (UI suppressed)",
+                fileVersion, (uint32_t)GM80_VERSION);
+            gm80_ui_suppressed(4);
+        }
+        else
+        {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "This project was saved with a newer version of GMSave "
+                "(file version %u, this build supports %u).\r\n"
+                "Please update GMSave to open it.",
+                fileVersion, (uint32_t)GM80_VERSION);
+            MessageBoxA(gm80_prompt_owner(), buf, "Game Maker 8.0",
+                MB_OK | MB_ICONERROR | MB_TOPMOST);
+        }
         return false;
     }
     }

@@ -22,6 +22,7 @@
 #include "i18n.h"
 #include "mm_audit.h"
 #include <windows.h>
+#include <cstdlib>
 #include <string>
 
 // ==== Shared state ====
@@ -450,7 +451,8 @@ void project_watcher_tick()
 // system-wide), finds this process's hidden "GMSave.Watcher" window by pid,
 // PostMessages the id in wParam, then polls a small named file mapping
 //
-//     Local\GMSave.SyncStatus.<pid>   (16 bytes: magic 'GMS1', reqId, status, detail)
+//     Local\GMSave.SyncStatus.<pid>   (28 bytes: magic 'GMS1', reqId, status,
+//                                     detail, caps, uiKind, uiSeq)
 //
 // until reqId matches its own (written last, as the commit marker). The
 // mapping doubles as the capability probe: no mapping ⇒ deployed GMSave
@@ -486,6 +488,13 @@ void project_watcher_tick()
 // every difference is remote-only ⇒ the fast path auto-applies with no
 // prompt and no conflict tool, guaranteed. Any other state refuses with a
 // status instead of surfacing a dialog nobody will answer.
+//
+// Quiet lease ("GMSave.SetQuiet", wParam = lease ms, 0 = clear): capabilities
+// are advertised as caps bit0 in the block above. While the lease runs, the
+// prompts that force-sync's own gating cannot rule out (Ctrl+S hitting
+// external disk changes, a failed save, load diagnostics, fatal load errors,
+// the merge editor gate) are suppressed to a log line plus a uiSeq bump, so a
+// driving agent can poll instead of blocking on a box. See gm80_ui_quiet.
 #pragma pack(push, 4)
 struct GmSyncResultBlock
 {
@@ -493,15 +502,101 @@ struct GmSyncResultBlock
     volatile uint32_t reqId;  // written LAST: its match is the completion signal
     volatile uint32_t status;
     volatile uint32_t detail;
+    uint32_t caps;                                  // bit0 = SetQuiet lease
+    volatile uint32_t uiKind;                       // last suppressed UI kind
+    volatile uint32_t uiSeq;                        // suppression counter
 };
 #pragma pack(pop)
+static_assert(sizeof(GmSyncResultBlock) == 28,
+    "wire format: 7 uint32 fields, caller reads fixed offsets");
 static const uint32_t kSyncMagic = 0x47534D31; // 'GMS1'
+static const uint32_t kSyncCapQuiet = 1;       // caps bit0: SetQuiet supported
 static HANDLE g_sync_map = NULL;
 static GmSyncResultBlock* g_sync_view = NULL;
 static UINT g_msgForceSync = 0;
+static UINT g_msgSetQuiet = 0;
 
-// Status names for the log only — the wire format stays the 16-byte numeric
-// block; these exist so a log reader never has to consult the protocol table.
+// ==== Quiet lease ====
+// While a lease is active every user-visible prompt is replaced by a log line
+// and a counter bump (see gm80_ui_suppressed), so an external agent driving the
+// IDE never faces a modal box that nobody answers. Granted by the
+// "GMSave.SetQuiet" registered message (wParam = lease ms, 0 = clear) or by
+// GMSAVE_QUIET_MS at startup; manual use never sets either, so the interactive
+// behaviour is unchanged.
+//
+// Expiry is an absolute 32-bit tick compared with wrap-safe subtraction. Both
+// the deadline and the comparison stay 32 bits on purpose: a volatile 64-bit
+// read is not atomic in a 32-bit process and could tear between the halves.
+static volatile LONG g_quiet_until = 0;
+// Suppression bookkeeping kept outside the mapping: a suppression can happen
+// before the channel exists (the very first project load runs ahead of the
+// first project_watcher_start, which is what creates the mapping). Seeding the
+// mapping from these when it is created keeps the counter monotonic.
+static volatile LONG g_ui_kind = 0;
+static volatile LONG g_ui_seq = 0;
+
+bool gm80_ui_quiet()
+{
+    LONG until = g_quiet_until;
+    // 0 is the "no lease" sentinel, not a timestamp: GetTickCount() passes
+    // 2^31 after ~24.8 days of uptime, after which the subtraction below would
+    // read the sentinel as a deadline in the future.
+    if (until == 0) return false;
+    return (LONG)(GetTickCount() - (DWORD)until) < 0;
+}
+
+void gm80_ui_suppressed(uint32_t kind)
+{
+    InterlockedExchange(&g_ui_kind, (LONG)kind);
+    InterlockedIncrement(&g_ui_seq);
+    if (g_sync_view)
+    {
+        InterlockedExchange((volatile LONG*)&g_sync_view->uiKind, (LONG)kind);
+        InterlockedExchange((volatile LONG*)&g_sync_view->uiSeq, g_ui_seq);
+    }
+    gm_log("UI: suppressed kind=%u (quiet lease)", kind);
+}
+
+// Lease in milliseconds, 0 = clear immediately.
+static void set_quiet_lease(uint32_t ms)
+{
+    if (ms == 0)
+    {
+        InterlockedExchange(&g_quiet_until, 0);
+        gm_log("Quiet: lease cleared");
+        return;
+    }
+    // A lease this long would sit more than 2^31 ahead of the current tick and
+    // the wrap-safe comparison would read it as already expired: clamp to the
+    // longest deadline the 32-bit form can represent.
+    if (ms > 0x7FFFFFFFu) ms = 0x7FFFFFFFu;
+    DWORD until = GetTickCount() + ms;
+    // A deadline of 0 would collide with the "no lease" sentinel.
+    if (until == 0) until = 1;
+    InterlockedExchange(&g_quiet_until, (LONG)until);
+    gm_log("Quiet: lease granted for %u ms", ms);
+}
+
+void project_watcher_init_quiet_from_env()
+{
+    // GMSAVE_QUIET_MS covers the window a launcher cannot reach with a message:
+    // a new process starts loading its project before the agent knows its pid,
+    // so the first load — the one that reports diagnostics — would otherwise
+    // pop boxes. Reading a variable and setting one volatile LONG is
+    // loader-safe, so this runs from ide_hooks_install (DllMain); anything that
+    // creates the hidden window must stay lazy.
+    wchar_t msBuf[32];
+    DWORD n = GetEnvironmentVariableW(L"GMSAVE_QUIET_MS", msBuf, 32);
+    if (n > 0 && n < 32)
+    {
+        msBuf[n] = 0;
+        unsigned long ms = std::wcstoul(msBuf, NULL, 10);
+        if (ms > 0) set_quiet_lease((uint32_t)ms);
+    }
+}
+
+// Status names for the log only — the wire format stays the numeric block
+// above; these exist so a log reader never has to consult the protocol table.
 static const char* force_sync_status_name(uint32_t status)
 {
     switch (status)
@@ -612,6 +707,11 @@ static LRESULT CALLBACK watcher_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         project_watcher_force_sync((uint32_t)wp);
         return 0;
     }
+    if (g_msgSetQuiet && msg == g_msgSetQuiet)
+    {
+        set_quiet_lease((uint32_t)wp);
+        return 0;
+    }
     if (msg == WM_TIMER && wp == kTimerId)
     {
         // mm_audit runs on its own background thread: a main-thread tick goes
@@ -636,6 +736,7 @@ void project_watcher_ensure_timer_window()
     // agent's capability probe and result block). Created once, on the main
     // thread, together with the window — both live until process exit.
     g_msgForceSync = RegisterWindowMessageW(L"GMSave.ForceSync");
+    g_msgSetQuiet = RegisterWindowMessageW(L"GMSave.SetQuiet");
     if (!g_sync_map)
     {
         const std::wstring mapName =
@@ -648,10 +749,17 @@ void project_watcher_ensure_timer_window()
                 g_sync_map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
             if (g_sync_view)
             {
-                g_sync_view->magic = kSyncMagic;
                 g_sync_view->reqId = 0;
                 g_sync_view->status = 0;
                 g_sync_view->detail = 0;
+                g_sync_view->caps = kSyncCapQuiet;
+                // Carry over suppressions that happened before the channel
+                // existed (first load reports diagnostics ahead of this).
+                g_sync_view->uiKind = (uint32_t)g_ui_kind;
+                g_sync_view->uiSeq = (uint32_t)g_ui_seq;
+                // Published LAST: a caller that sees the magic is then also
+                // guaranteed to see the capability fields above.
+                g_sync_view->magic = kSyncMagic;
             }
         }
         gm_log("Watcher: sync mapping '%S' %s", mapName.c_str(),
